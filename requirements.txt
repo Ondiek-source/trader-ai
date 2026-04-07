@@ -34,6 +34,12 @@ joblib>=1.3.0
 # -- Environment management ---------------------------------------------------
 python-dotenv>=1.0.0
 
+# -- Quotex unofficial API (for reading trade results) -------------------------
+# Install from GitHub (PyPI version may be outdated):
+#   pip install git+https://github.com/cleitonleonel/pyquotex.git
+# Or try PyPI: pip install quotexapi
+quotexapi
+
 # stdlib only (no extra packages needed):
 #   asyncio, threading, queue, logging, lzma, struct, json, hmac, hashlib
 #   http.server (result callback receiver)
