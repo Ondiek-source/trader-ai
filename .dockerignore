@@ -1,0 +1,19 @@
+# Root-level agent-generated duplicates (src/ is the canonical source)
+*.py
+*.md
+
+# Secrets
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model artifacts (mounted at runtime or built inside container)
+models/
+
+# Dev tools
+.vscode/
+.idea/
+.git/

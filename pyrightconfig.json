@@ -1,0 +1,10 @@
+{
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "extraPaths": ["src"],
+  "include": ["src"],
+  "exclude": ["**/__pycache__"],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "warning",
+  "typeCheckingMode": "basic"
+}
