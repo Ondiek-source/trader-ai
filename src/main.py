@@ -24,7 +24,7 @@ import os
 import queue
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # ── JSON structured logging ────────────────────────────────────────────────────
 
@@ -66,7 +66,7 @@ from features import compute_features, get_feature_columns, resample_to_1min
 from model import MartingaleTracker, ModelManager
 from signals import create_orchestrator
 from webhook import WebhookSender, WebhookError
-from quotex_reader import ResultReceiver, run_result_receiver
+from quotex_reader import QuotexReader, run_quotex_reader
 from reporter import DiscordReporter, TelegramBot, scheduled_report_loop
 
 logger = logging.getLogger("main")
@@ -119,6 +119,7 @@ async def signal_task(
     webhook_sender: WebhookSender,
     storage: StorageManager,
     config,
+    quotex_reader: QuotexReader | None = None,
 ) -> None:
     """
     Main signal generation loop — evaluates on every completed 1-minute bar.
@@ -216,14 +217,23 @@ async def signal_task(
                     "latency_ms": result.get("latency_ms"),
                 }
             )
+            # Register with quotex reader so result can be matched at expiry
+            if quotex_reader is not None:
+                signal_id = f"{pair}_{tick.timestamp.isoformat()}"
+                expiry_time = tick.timestamp + timedelta(seconds=config.expiry_seconds)
+                quotex_reader.register_pending(
+                    signal_id,
+                    {"pair": pair, "direction": prediction.get("direction", "UP"), **payload},
+                    expiry_time,
+                )
         except WebhookError as exc:
             logger.error({"event": "webhook_failed", "error": str(exc), "pair": pair})
 
 
-async def feedback_task(result_receiver: ResultReceiver, orchestrator, model_manager, storage) -> None:
+async def feedback_task(quotex_reader: QuotexReader, orchestrator, model_manager, storage) -> None:
     """Consume trade results and feed them back to orchestrator + storage."""
     while True:
-        result = await result_receiver.get_result(timeout=1.0)
+        result = await quotex_reader.get_result(timeout=1.0)
         if result is None:
             continue
 
@@ -375,7 +385,13 @@ async def main() -> None:
     )
 
     webhook_sender = WebhookSender(url=config.webhook_url, secret=config.webhook_secret)
-    result_receiver = ResultReceiver(port=getattr(config, "result_callback_port", 8080))
+    quotex_reader = QuotexReader(
+        email=getattr(config, "quotex_email", ""),
+        password=getattr(config, "quotex_password", ""),
+        practice_mode=config.practice_mode,
+    )
+    if getattr(config, "quotex_read_results", False):
+        await quotex_reader.connect()
 
     discord = DiscordReporter(webhook_url=getattr(config, "discord_webhook_url", ""))
     telegram: TelegramBot | None = None
@@ -397,12 +413,12 @@ async def main() -> None:
         asyncio.create_task(
             supervised(
                 "signal",
-                lambda: signal_task(stream, model_manager, orchestrator, webhook_sender, storage, config),
+                lambda: signal_task(stream, model_manager, orchestrator, webhook_sender, storage, config, quotex_reader),
             )
         ),
-        asyncio.create_task(supervised("result_server", lambda: run_result_receiver(result_receiver))),
+        asyncio.create_task(supervised("quotex_reader", lambda: run_quotex_reader(quotex_reader))),
         asyncio.create_task(
-            supervised("feedback", lambda: feedback_task(result_receiver, orchestrator, model_manager, storage))
+            supervised("feedback", lambda: feedback_task(quotex_reader, orchestrator, model_manager, storage))
         ),
         asyncio.create_task(supervised("health", lambda: health_task(stream, orchestrator))),
     ]
@@ -428,7 +444,7 @@ async def main() -> None:
         for task in tasks:
             task.cancel()
         stream.stop()
-        result_receiver.stop()
+        await quotex_reader.disconnect()
         model_manager.save(MODEL_SAVE_PATH)
         storage.force_flush if hasattr(storage, "force_flush") else None
         logger.info({"event": "shutdown_complete"})

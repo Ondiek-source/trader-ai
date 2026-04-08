@@ -5,22 +5,22 @@ Uses pyquotex (cleitonleonel/pyquotex) unofficial WebSocket API.
 Install: pip install git+https://github.com/cleitonleonel/pyquotex.git
 
 CONFIRMED API (from pyquotex source / research):
-  - Quotex(email, password, lang="en")
-  - await client.connect() → (bool, reason_str)
-  - client.change_account("PRACTICE" | "REAL")
-  - await client.get_balance() → float
-  - Direction strings: "call" (UP/buy) | "put" (DOWN/sell)
-  - Asset format: "EURUSD_otc" (OTC, 24/7) | "EURUSD" (market hours)
+    - Quotex(email, password, lang="en")
+    - await client.connect() → (bool, reason_str)
+    - client.change_account("PRACTICE" | "REAL")
+    - await client.get_balance() → float
+    - Direction strings: "call" (UP/buy) | "put" (DOWN/sell)
+    - Asset format: "EURUSD_otc" (OTC, 24/7) | "EURUSD" (market hours)
 
 UNCONFIRMED (needs live introspection — raw logs will reveal):
-  - Trade history method name (get_history / get_closed_deals / etc.)
-  - WebSocket trade-close message schema field names
+    - Trade history method name (get_history / get_closed_deals / etc.)
+    - WebSocket trade-close message schema field names
 
 Strategy (no trade ID available — our bot places trades, not us):
-  1. Balance-delta: monitor account balance; change at expiry = trade result.
-  2. WebSocket introspection: log ALL messages from client.api for schema discovery.
-  3. Time-windowed match: at expiry+2s, scan buffered WS messages for
-     the asset+direction that matches our pending signal.
+    1. Balance-delta: monitor account balance; change at expiry = trade result.
+    2. WebSocket introspection: log ALL messages from client.api for schema discovery.
+    3. Time-windowed match: at expiry+2s, scan buffered WS messages for
+    the asset+direction that matches our pending signal.
 """
 
 from __future__ import annotations
@@ -48,16 +48,17 @@ DIRECTION_TO_QUOTEX = {"UP": "call", "DOWN": "put"}
 QUOTEX_TO_DIRECTION = {"call": "UP", "put": "DOWN"}
 
 # ── Library import ─────────────────────────────────────────────────────────────
+_QuotexClient: Any = None  # replaced at import time if library is present
+QUOTEX_LIB_AVAILABLE = False
 try:
-    from quotexapi.stable_api import Quotex as _QuotexClient
+    from quotexapi.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
     QUOTEX_LIB_AVAILABLE = True
 except ImportError:
-    _QuotexClient = None  # type: ignore
-    QUOTEX_LIB_AVAILABLE = False
+    pass
     logger.warning(
         {"event": "quotexapi_not_installed",
-         "install": "pip install git+https://github.com/cleitonleonel/pyquotex.git",
-         "impact": "Trade result reading disabled — results must be submitted manually via /result endpoint"}
+            "install": "pip install git+https://github.com/cleitonleonel/pyquotex.git",
+            "impact": "Trade result reading disabled — results must be submitted manually via /result endpoint"}
     )
 
 
@@ -66,8 +67,8 @@ class QuotexReader:
     Connects to Quotex WebSocket and reads closed trade results.
 
     Two complementary detection strategies run in parallel:
-      A) Balance-delta: reliable signal that *some* trade closed.
-      B) WebSocket stream: richer data (asset, direction, profit).
+        A) Balance-delta: reliable signal that *some* trade closed.
+        B) WebSocket stream: richer data (asset, direction, profit).
 
     Both are correlated against pending signals using expiry time window.
     """
@@ -196,7 +197,7 @@ class QuotexReader:
         Background task: runs forever.
         - Polls balance every BALANCE_POLL_INTERVAL seconds.
         - At expiry + RESULT_BUFFER_SECONDS, attempts to match a result
-          to each pending signal using balance-delta + WS message scan.
+        - to each pending signal using balance-delta + WS message scan.
         - Puts matched results onto self._result_queue.
         """
         balance_task = asyncio.create_task(self._balance_monitor())
@@ -228,7 +229,7 @@ class QuotexReader:
                         "signal_id": signal_id,
                         "pair": data["signal"].get("pair"),
                         "message": "No matching trade found after 3 attempts. "
-                                   "Review [QUOTEX_RAW_MSG] logs to improve _parse_ws_message().",
+                                    "Review [QUOTEX_RAW_MSG] logs to improve _parse_ws_message().",
                     })
 
             # Clean up resolved entries older than 60s
@@ -326,7 +327,7 @@ class QuotexReader:
                 # Check asset match
                 msg_asset = str(parsed.get("asset", "")).upper()
                 if not any(candidate in msg_asset or msg_asset in candidate
-                           for candidate in asset_candidates):
+                            for candidate in asset_candidates):
                     continue
 
                 # Check direction match (optional — match on asset+time if direction unknown)
@@ -409,7 +410,7 @@ class QuotexReader:
         return result_candidates
 
     async def _try_history_methods(
-        self, pair: str, direction: str, expiry_time: datetime
+        self, pair: str, direction: str, _expiry_time: datetime  # noqa: ARG002
     ) -> dict | None:
         """
         Try all history/result methods discovered on the client object.
@@ -451,7 +452,7 @@ class QuotexReader:
                                 "raw_preview": str(raw)[:600],
                             })
                             # Try to extract result from response
-                            result = self._extract_from_history(raw, pair, direction, expiry_time)
+                            result = self._extract_from_history(raw, pair, direction)
                             if result:
                                 return result
                             break
@@ -463,14 +464,13 @@ class QuotexReader:
         return None
 
     def _extract_from_history(
-        self, raw: Any, pair: str, direction: str, expiry_time: datetime
+        self, raw: Any, pair: str, direction: str
     ) -> dict | None:
         """Extract a matching trade from a history response of unknown schema."""
         if raw is None:
             return None
 
         asset_candidates = {a.upper() for a in PAIR_TO_ASSETS.get(pair, [])}
-        window = timedelta(seconds=30)
 
         def _check_item(item: Any) -> dict | None:
             if not isinstance(item, dict):

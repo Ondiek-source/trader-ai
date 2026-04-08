@@ -2,7 +2,7 @@
 webhook.py — Webhook signal delivery.
 
 Sends the EXACT payload the Quotex trading bot expects:
-  {"side": "buy"|"sell", "symbol": "EURUSD", "key": "Ondiek"}
+    {"side": "buy"|"sell", "symbol": "EURUSD", "key": "Ondiek"}
 
 Nothing extra is added. The payload is passed through as-is.
 
@@ -53,7 +53,7 @@ class WebhookSender:
         POST payload to webhook URL.
 
         Returns:
-          {success: bool, status_code: int | None, latency_ms: float, attempts: int}
+            {success: bool, status_code: int | None, latency_ms: float, attempts: int}
 
         Raises WebhookError if all attempts fail.
         """

@@ -2,22 +2,22 @@
 model.py — Multi-model binary classifier with walk-forward validation.
 
 Model candidates:
-  - LightGBM      (primary, fast, handles tabular well)
-  - XGBoost       (ensemble member)
-  - RandomForest  (sklearn, baseline)
-  - LSTM          (PyTorch, sequence model on last 30 bars)
-  - Transformer   (PyTorch, lightweight encoder on last 30 bars)
+    - LightGBM      (primary, fast, handles tabular well)
+    - XGBoost       (ensemble member)
+    - RandomForest  (sklearn, baseline)
+    - LSTM          (PyTorch, sequence model on last 30 bars)
+    - Transformer   (PyTorch, lightweight encoder on last 30 bars)
 
 Per-indicator confidence: each of the 10 indicators in features.py has its
 historical accuracy tracked; the highest-confidence indicator+model combo wins.
 
 Martingale awareness:
-  - MartingaleTracker raises the confidence threshold after each loss.
-  - ModelManager.predict() checks the dynamic threshold before returning a signal.
+    - MartingaleTracker raises the confidence threshold after each loss.
+    - ModelManager.predict() checks the dynamic threshold before returning a signal.
 
 Walk-forward validation:
-  - Chronological train/test splits (no data leakage).
-  - Expanding window, 30-day steps.
+    - Chronological train/test splits (no data leakage).
+    - Expanding window, 30-day steps.
 """
 
 from __future__ import annotations
@@ -33,17 +33,25 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, brier_score_loss, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.preprocessing import StandardScaler
 
 try:
     import lightgbm as lgb
+
     LGBM_AVAILABLE = True
 except ImportError:
     LGBM_AVAILABLE = False
 
 try:
     import xgboost as xgb
+
     XGB_AVAILABLE = True
 except ImportError:
     XGB_AVAILABLE = False
@@ -51,6 +59,7 @@ except ImportError:
 try:
     import torch
     import torch.nn as nn
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -59,12 +68,13 @@ from features import get_feature_columns, get_indicator_feature_groups, compute_
 
 logger = logging.getLogger(__name__)
 
-SEQ_LEN = 30           # lookback bars for LSTM / Transformer
+SEQ_LEN = 30  # lookback bars for LSTM / Transformer
 EXPIRY_OPTIONS = [60, 120, 300]
 MIN_TRAIN_BARS = 5_000  # minimum 1-min bars needed for meaningful training (~3.5 days)
 
 
 # ── Expiry Optimizer ──────────────────────────────────────────────────────────
+
 
 class ExpiryOptimizer:
     """
@@ -107,11 +117,14 @@ class ExpiryOptimizer:
                 y_tr, y_te = y[:split], y[split:]
 
                 from sklearn.preprocessing import StandardScaler
+
                 scaler = StandardScaler()
                 X_tr = scaler.fit_transform(X_tr)
                 X_te = scaler.transform(X_te)
 
-                rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42, n_jobs=-1)
+                rf = RandomForestClassifier(
+                    n_estimators=100, max_depth=6, random_state=42, n_jobs=-1
+                )
                 rf.fit(X_tr, y_tr)
                 proba = rf.predict_proba(X_te)[:, 1]
                 # Only count "confident" predictions (≥ 0.60) to simulate real signal filter
@@ -119,13 +132,24 @@ class ExpiryOptimizer:
                 if confident_mask.sum() < 20:
                     win_rate = accuracy_score(y_te, (proba >= 0.5).astype(int))
                 else:
-                    win_rate = accuracy_score(y_te[confident_mask], (proba[confident_mask] >= 0.5).astype(int))
+                    win_rate = accuracy_score(
+                        y_te[confident_mask], (proba[confident_mask] >= 0.5).astype(int)
+                    )
 
                 results[expiry] = round(float(win_rate), 4)
-                logger.info({"event": "expiry_test", "pair": pair, "expiry_seconds": expiry, "win_rate": results[expiry]})
+                logger.info(
+                    {
+                        "event": "expiry_test",
+                        "pair": pair,
+                        "expiry_seconds": expiry,
+                        "win_rate": results[expiry],
+                    }
+                )
 
             except Exception as exc:
-                logger.warning({"event": "expiry_test_failed", "expiry": expiry, "error": str(exc)})
+                logger.warning(
+                    {"event": "expiry_test_failed", "expiry": expiry, "error": str(exc)}
+                )
 
         self._results[pair] = results
         if results:
@@ -156,38 +180,39 @@ class ExpiryOptimizer:
 
 # ── Market Regime Detector ────────────────────────────────────────────────────
 
+
 class RegimeDetector:
     """
     Classifies current market microstructure into one of four regimes
     and selects which indicator group is most effective in that regime.
 
     Regimes:
-      trending_up     — strong directional momentum, expanding range
-      trending_down   — same but downward
-      ranging         — oscillating, tight range, mean-reverting
-      volatile        — wide spread, chaotic, elevated ATR
+        trending_up     — strong directional momentum, expanding range
+        trending_down   — same but downward
+        ranging         — oscillating, tight range, mean-reverting
+        volatile        — wide spread, chaotic, elevated ATR
 
     Indicator affinity per regime (from backtesting research):
-      trending_*  → EMA cross, MACD, Momentum are most predictive
-      ranging     → RSI, Stochastic, Williams %R, Bollinger Bands
-      volatile    → ATR-gated signals only; CCI, volume momentum
+        trending_*  → EMA cross, MACD, Momentum are most predictive
+        ranging     → RSI, Stochastic, Williams %R, Bollinger Bands
+        volatile    → ATR-gated signals only; CCI, volume momentum
     """
 
     REGIME_INDICATOR_AFFINITY: dict[str, list[str]] = {
-        "trending_up":   ["ema_cross", "macd", "momentum", "volume_momentum"],
+        "trending_up": ["ema_cross", "macd", "momentum", "volume_momentum"],
         "trending_down": ["ema_cross", "macd", "momentum", "volume_momentum"],
-        "ranging":       ["rsi", "stochastic", "williams_r", "bollinger"],
-        "volatile":      ["cci", "volume_momentum", "atr"],
+        "ranging": ["rsi", "stochastic", "williams_r", "bollinger"],
+        "volatile": ["cci", "volume_momentum", "atr"],
     }
 
     def detect(self, feature_row: pd.Series) -> str:
         """Classify the current bar into a market regime."""
         try:
-            atr_pct   = float(feature_row.get("atr_pct", 0.001))
-            momentum  = float(feature_row.get("momentum", 0.0))
-            bb_bw     = float(feature_row.get("bb_bandwidth", 0.01))
-            ema_cross = float(feature_row.get("ema_cross", 0.0))
-            rsi       = float(feature_row.get("rsi", 50.0))
+            atr_pct = float(feature_row.get("atr_pct") or 0.001)
+            momentum = float(feature_row.get("momentum") or 0.0)
+            bb_bw = float(feature_row.get("bb_bandwidth") or 0.01)
+            ema_cross = float(feature_row.get("ema_cross") or 0.0)
+            rsi = float(feature_row.get("rsi") or 50.0)
 
             # Volatile: wide ATR relative to price
             if atr_pct > 0.003:
@@ -207,17 +232,20 @@ class RegimeDetector:
             return "ranging"
 
     def preferred_indicators(self, regime: str) -> list[str]:
-        return self.REGIME_INDICATOR_AFFINITY.get(regime, list(get_indicator_feature_groups().keys()))
+        return self.REGIME_INDICATOR_AFFINITY.get(
+            regime, list(get_indicator_feature_groups().keys())
+        )
 
 
 # ── Martingale Tracker ────────────────────────────────────────────────────────
+
 
 class MartingaleTracker:
     """
     Tracks consecutive losses and progressively raises the confidence threshold.
 
     Threshold formula:
-      current = base_threshold + (streak × step_size), capped at max_threshold.
+        current = base_threshold + (streak × step_size), capped at max_threshold.
 
     A win OR reaching max_streak resets the streak to 0.
     """
@@ -273,12 +301,19 @@ class MartingaleTracker:
 
 # ── PyTorch models ────────────────────────────────────────────────────────────
 
-class _LSTMModel(nn.Module if TORCH_AVAILABLE else object):
-    def __init__(self, n_features: int, hidden: int = 64, layers: int = 2, dropout: float = 0.2):
+_NNBase: type = nn.Module if TORCH_AVAILABLE else object  # type: ignore[assignment]
+
+
+class _LSTMModel(_NNBase):  # type: ignore[misc]
+    def __init__(
+        self, n_features: int, hidden: int = 64, layers: int = 2, dropout: float = 0.2
+    ):
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch not available")
         super().__init__()
-        self.lstm = nn.LSTM(n_features, hidden, num_layers=layers, batch_first=True, dropout=dropout)
+        self.lstm = nn.LSTM(
+            n_features, hidden, num_layers=layers, batch_first=True, dropout=dropout
+        )
         self.fc = nn.Linear(hidden, 1)
         self.sigmoid = nn.Sigmoid()
 
@@ -287,15 +322,25 @@ class _LSTMModel(nn.Module if TORCH_AVAILABLE else object):
         return self.sigmoid(self.fc(out[:, -1, :])).squeeze(1)
 
 
-class _TransformerModel(nn.Module if TORCH_AVAILABLE else object):
-    def __init__(self, n_features: int, d_model: int = 64, nhead: int = 4, layers: int = 2, dropout: float = 0.1):
+class _TransformerModel(_NNBase):  # type: ignore[misc]
+    def __init__(
+        self,
+        n_features: int,
+        d_model: int = 64,
+        nhead: int = 4,
+        layers: int = 2,
+        dropout: float = 0.1,
+    ):
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch not available")
         super().__init__()
         self.input_proj = nn.Linear(n_features, d_model)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
         self.fc = nn.Linear(d_model, 1)
@@ -370,6 +415,7 @@ def _make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
 
 # ── Walk-forward validation ───────────────────────────────────────────────────
 
+
 def walk_forward_evaluate(
     feature_df: pd.DataFrame,
     model_name: str,
@@ -421,18 +467,28 @@ def walk_forward_evaluate(
                 }
             )
         except Exception as exc:
-            logger.warning({"event": "wf_fold_failed", "model": model_name, "error": str(exc)})
+            logger.warning(
+                {"event": "wf_fold_failed", "model": model_name, "error": str(exc)}
+            )
 
         train_end = test_end
 
     if not fold_metrics:
         return {}
     means = {k: float(np.mean([m[k] for m in fold_metrics])) for k in fold_metrics[0]}
-    logger.info({"event": "walk_forward_complete", "model": model_name, "folds": len(fold_metrics), "metrics": means})
+    logger.info(
+        {
+            "event": "walk_forward_complete",
+            "model": model_name,
+            "folds": len(fold_metrics),
+            "metrics": means,
+        }
+    )
     return means
 
 
 # ── Per-indicator accuracy tracker ───────────────────────────────────────────
+
 
 class IndicatorAccuracyTracker:
     """
@@ -446,7 +502,9 @@ class IndicatorAccuracyTracker:
 
     def update(self, indicator: str, correct: bool) -> None:
         current = self._accuracy.get(indicator, 0.55)
-        self._accuracy[indicator] = current * (1 - self._alpha) + float(correct) * self._alpha
+        self._accuracy[indicator] = (
+            current * (1 - self._alpha) + float(correct) * self._alpha
+        )
 
     def get_confidence_weight(self, indicator: str) -> float:
         return self._accuracy.get(indicator, 0.55)
@@ -457,14 +515,15 @@ class IndicatorAccuracyTracker:
 
 # ── Main ModelManager ─────────────────────────────────────────────────────────
 
+
 class ModelManager:
     """
     Trains, evaluates, and serves predictions from multiple ML models.
 
     Usage:
-      mgr = ModelManager(config, martingale_tracker)
-      mgr.train(pair, expiry_seconds, feature_df)
-      signal = mgr.predict(pair, expiry_seconds, feature_row)
+        mgr = ModelManager(config, martingale_tracker)
+        mgr.train(pair, expiry_seconds, feature_df)
+        signal = mgr.predict(pair, expiry_seconds, feature_row)
     """
 
     def __init__(self, config, martingale_tracker: MartingaleTracker) -> None:
@@ -503,11 +562,17 @@ class ModelManager:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         if len(df) < 200:
-            logger.warning({"event": "insufficient_data_for_training", "pair": pair, "rows": len(df)})
+            logger.warning(
+                {
+                    "event": "insufficient_data_for_training",
+                    "pair": pair,
+                    "rows": len(df),
+                }
+            )
             return {}
 
-        X = df[self._feature_cols].values
-        y = df["label"].values
+        X = df[self._feature_cols].to_numpy(dtype=np.float64)
+        y = df["label"].to_numpy(dtype=np.float64)
 
         # Fit scaler on training data
         scaler = StandardScaler()
@@ -521,16 +586,27 @@ class ModelManager:
         if LGBM_AVAILABLE:
             try:
                 lgbm_model = lgb.LGBMClassifier(
-                    n_estimators=300, learning_rate=0.05, max_depth=6,
-                    num_leaves=31, subsample=0.8, colsample_bytree=0.8,
-                    random_state=42, verbose=-1
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    max_depth=6,
+                    num_leaves=31,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    verbose=-1,
                 )
                 lgbm_model.fit(X_scaled, y)
                 trained["lightgbm"] = lgbm_model
                 wf_metrics["lightgbm"] = walk_forward_evaluate(
-                    df, "lightgbm",
-                    lambda: lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, verbose=-1, random_state=42),
-                    self._feature_cols
+                    df,
+                    "lightgbm",
+                    lambda: lgb.LGBMClassifier(
+                        n_estimators=200,
+                        learning_rate=0.05,
+                        verbose=-1,
+                        random_state=42,
+                    ),
+                    self._feature_cols,
                 )
             except Exception as exc:
                 logger.warning({"event": "lgbm_train_failed", "error": str(exc)})
@@ -539,16 +615,29 @@ class ModelManager:
         if XGB_AVAILABLE:
             try:
                 xgb_model = xgb.XGBClassifier(
-                    n_estimators=300, learning_rate=0.05, max_depth=5,
-                    subsample=0.8, colsample_bytree=0.8,
-                    use_label_encoder=False, eval_metric="logloss", verbosity=0, random_state=42
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    max_depth=5,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    use_label_encoder=False,
+                    eval_metric="logloss",
+                    verbosity=0,
+                    random_state=42,
                 )
                 xgb_model.fit(X_scaled, y)
                 trained["xgboost"] = xgb_model
                 wf_metrics["xgboost"] = walk_forward_evaluate(
-                    df, "xgboost",
-                    lambda: xgb.XGBClassifier(n_estimators=200, verbosity=0, random_state=42, use_label_encoder=False, eval_metric="logloss"),
-                    self._feature_cols
+                    df,
+                    "xgboost",
+                    lambda: xgb.XGBClassifier(
+                        n_estimators=200,
+                        verbosity=0,
+                        random_state=42,
+                        use_label_encoder=False,
+                        eval_metric="logloss",
+                    ),
+                    self._feature_cols,
                 )
             except Exception as exc:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
@@ -561,9 +650,12 @@ class ModelManager:
             rf_model.fit(X_scaled, y)
             trained["randomforest"] = rf_model
             wf_metrics["randomforest"] = walk_forward_evaluate(
-                df, "randomforest",
-                lambda: RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42),
-                self._feature_cols
+                df,
+                "randomforest",
+                lambda: RandomForestClassifier(
+                    n_estimators=100, max_depth=6, random_state=42
+                ),
+                self._feature_cols,
             )
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
@@ -572,7 +664,7 @@ class ModelManager:
         if TORCH_AVAILABLE and len(X_scaled) >= SEQ_LEN + 50:
             try:
                 X_seq = _make_sequences(X_scaled, SEQ_LEN)
-                y_seq = y[SEQ_LEN - 1:]
+                y_seq = y[SEQ_LEN - 1 :]
                 lstm = _LSTMModel(n_features=len(self._feature_cols))
                 lstm = _train_pytorch_model(lstm, X_seq, y_seq)
                 trained["lstm"] = lstm
@@ -584,7 +676,7 @@ class ModelManager:
         if TORCH_AVAILABLE and len(X_scaled) >= SEQ_LEN + 50:
             try:
                 X_seq = _make_sequences(X_scaled, SEQ_LEN)
-                y_seq = y[SEQ_LEN - 1:]
+                y_seq = y[SEQ_LEN - 1 :]
                 transformer = _TransformerModel(n_features=len(self._feature_cols))
                 transformer = _train_pytorch_model(transformer, X_seq, y_seq)
                 trained["transformer"] = transformer
@@ -597,7 +689,9 @@ class ModelManager:
 
         # Initialize indicator tracker
         if pair not in self._indicator_tracker:
-            self._indicator_tracker[pair] = IndicatorAccuracyTracker(list(self._indicator_groups.keys()))
+            self._indicator_tracker[pair] = IndicatorAccuracyTracker(
+                list(self._indicator_groups.keys())
+            )
 
         self._last_train_counts[pair] = self._result_counts.get(pair, 0)
         logger.info(
@@ -611,13 +705,15 @@ class ModelManager:
         )
         return wf_metrics
 
-    def predict(self, pair: str, expiry_seconds: int, feature_row: pd.Series) -> dict | None:
+    def predict(
+        self, pair: str, expiry_seconds: int, feature_row: pd.Series
+    ) -> dict | None:
         """
         Generate a signal for (pair, expiry_seconds) using the best available model.
 
         Returns None if:
-          - No models trained for this pair/expiry
-          - Best confidence < martingale_tracker.current_threshold
+            - No models trained for this pair/expiry
+            - Best confidence < martingale_tracker.current_threshold
         """
         models = self._models.get(pair, {}).get(expiry_seconds)
         if not models:
@@ -647,7 +743,13 @@ class ModelManager:
                 prob = float(mdl.predict_proba(feat_scaled)[0, 1])
                 model_probs[model_name] = prob
             except Exception as exc:
-                logger.debug({"event": "model_predict_error", "model": model_name, "error": str(exc)})
+                logger.debug(
+                    {
+                        "event": "model_predict_error",
+                        "model": model_name,
+                        "error": str(exc),
+                    }
+                )
 
         if not model_probs:
             return None
@@ -676,12 +778,20 @@ class ModelManager:
                 continue
             # Use the mean of columns for the indicator
             ind_feat = feature_row.reindex(available_cols).fillna(0.0).values
-            ind_feat_full = feature_row.reindex(self._feature_cols).fillna(0.0).values.reshape(1, -1)
+            ind_feat_full = (
+                feature_row.reindex(self._feature_cols)
+                .fillna(0.0)
+                .values.reshape(1, -1)
+            )
             ind_feat_scaled = scaler.transform(ind_feat_full)
 
             try:
                 # Use the best tabular model for indicator-level signal
-                tabular_model = models.get("lightgbm") or models.get("xgboost") or models.get("randomforest")
+                tabular_model = (
+                    models.get("lightgbm")
+                    or models.get("xgboost")
+                    or models.get("randomforest")
+                )
                 if tabular_model is None:
                     continue
                 ind_prob = float(tabular_model.predict_proba(ind_feat_scaled)[0, 1])
@@ -689,7 +799,11 @@ class ModelManager:
                 ind_confidence = 0.5 + abs(ind_prob - 0.5)
 
                 # Weight by historical accuracy × regime affinity boost
-                base_weight = indicator_tracker.get_confidence_weight(indicator) if indicator_tracker else 0.55
+                base_weight = (
+                    indicator_tracker.get_confidence_weight(indicator)
+                    if indicator_tracker
+                    else 0.55
+                )
                 # Indicators aligned with current market regime get a 1.5× boost
                 regime_multiplier = 1.5 if indicator in preferred else 1.0
                 weight = base_weight * regime_multiplier
@@ -700,7 +814,9 @@ class ModelManager:
                     "raw_prob": round(ind_prob, 4),
                 }
                 key = ind_direction
-                weighted_votes[key] = weighted_votes.get(key, 0.0) + (ind_confidence * weight)
+                weighted_votes[key] = weighted_votes.get(key, 0.0) + (
+                    ind_confidence * weight
+                )
 
             except Exception:
                 pass
@@ -709,10 +825,20 @@ class ModelManager:
         if weighted_votes:
             consensus_direction = max(weighted_votes, key=lambda k: weighted_votes[k])
             total_weight = sum(weighted_votes.values())
-            consensus_confidence = weighted_votes[consensus_direction] / total_weight if total_weight > 0 else 0.5
+            consensus_confidence = (
+                weighted_votes[consensus_direction] / total_weight
+                if total_weight > 0
+                else 0.5
+            )
             # Blend model confidence with indicator consensus (70/30)
-            final_direction = best_direction if best_confidence >= consensus_confidence else consensus_direction
-            final_confidence = round(0.70 * best_confidence + 0.30 * consensus_confidence, 4)
+            final_direction = (
+                best_direction
+                if best_confidence >= consensus_confidence
+                else consensus_direction
+            )
+            final_confidence = round(
+                0.70 * best_confidence + 0.30 * consensus_confidence, 4
+            )
         else:
             final_direction = best_direction
             final_confidence = round(best_confidence, 4)
@@ -747,9 +873,16 @@ class ModelManager:
 
         # Append to rolling prediction audit log
         log = self._prediction_log.setdefault(pair, [])
-        log.append({"ts": result["timestamp"], "direction": final_direction, "confidence": final_confidence, "regime": regime})
+        log.append(
+            {
+                "ts": result["timestamp"],
+                "direction": final_direction,
+                "confidence": final_confidence,
+                "regime": regime,
+            }
+        )
         if len(log) > self._max_log_size:
-            self._prediction_log[pair] = log[-self._max_log_size:]
+            self._prediction_log[pair] = log[-self._max_log_size :]
 
         logger.info(
             {
@@ -765,7 +898,9 @@ class ModelManager:
         )
         return result
 
-    def update_indicator_accuracy(self, pair: str, indicator: str, correct: bool) -> None:
+    def update_indicator_accuracy(
+        self, pair: str, indicator: str, correct: bool
+    ) -> None:
         """Called after a trade result is known to update indicator accuracy."""
         tracker = self._indicator_tracker.get(pair)
         if tracker:
@@ -809,4 +944,6 @@ class ModelManager:
         self._indicator_tracker = payload.get("indicator_tracker", {})
         self._result_counts = payload.get("result_counts", {})
         self._last_train_counts = payload.get("last_train_counts", {})
-        logger.info({"event": "models_loaded", "path": path, "pairs": list(self._models.keys())})
+        logger.info(
+            {"event": "models_loaded", "path": path, "pairs": list(self._models.keys())}
+        )

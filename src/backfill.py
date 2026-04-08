@@ -5,14 +5,14 @@ Downloads .bi5 (LZMA-compressed binary) tick files from Dukascopy's public CDN
 and writes them to Azure Blob Storage via storage.StorageManager.
 
 Dukascopy URL pattern:
-  https://datafeed.dukascopy.com/datafeed/{INSTRUMENT}/{YEAR}/{MONTH:02d}/{DAY:02d}/{HOUR:02d}h_ticks.bi5
+    https://datafeed.dukascopy.com/datafeed/{INSTRUMENT}/{YEAR}/{MONTH:02d}/{DAY:02d}/{HOUR:02d}h_ticks.bi5
 
 Binary record format (20 bytes per tick, big-endian):
-  int32  — milliseconds from hour start
-  int32  — ask * 100000
-  int32  — bid * 100000
-  float32 — ask volume
-  float32 — bid volume
+    int32  — milliseconds from hour start
+    int32  — ask * 100000
+    int32  — bid * 100000
+    float32 — ask volume
+    float32 — bid volume
 
 Skips already-downloaded blobs. Rate-limited to 0.1 s between requests.
 """
@@ -59,7 +59,9 @@ def _build_url(instrument: str, year: int, month: int, day: int, hour: int) -> s
     return f"{CDN_BASE}/{instrument}/{year}/{month - 1:02d}/{day:02d}/{hour:02d}h_ticks.bi5"
 
 
-def _decode_bi5(data: bytes, instrument: str, year: int, month: int, day: int, hour: int) -> pd.DataFrame:
+def _decode_bi5(
+    data: bytes, instrument: str, year: int, month: int, day: int, hour: int
+) -> pd.DataFrame:
     """
     Decompress and decode a .bi5 file into a DataFrame.
 
@@ -107,11 +109,13 @@ def _decode_bi5(data: bytes, instrument: str, year: int, month: int, day: int, h
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    df = df[df["bid"] > 0].reset_index(drop=True)  # filter corrupt rows
-    return df
+    df = df[df["bid"] > 0].reset_index(drop=True)  # type: ignore[assignment]
+    return df  # type: ignore[return-value]
 
 
-def _hour_range(start: date, end: date) -> Generator[tuple[int, int, int, int], None, None]:
+def _hour_range(
+    start: date, end: date
+) -> Generator[tuple[int, int, int, int], None, None]:
     """Yield (year, month, day, hour) for every hour in [start, end)."""
     current = datetime(start.year, start.month, start.day, 0, 0, 0, tzinfo=timezone.utc)
     end_dt = datetime(end.year, end.month, end.day, 0, 0, 0, tzinfo=timezone.utc)
@@ -124,7 +128,13 @@ def _blob_path_for_hour(pair: str, year: int, month: int) -> str:
     return f"data/{pair}/{year}-{month:02d}.parquet"
 
 
-async def backfill_pair(pair: str, start_date: date, end_date: date, storage, session: requests.Session | None = None) -> None:
+async def backfill_pair(
+    pair: str,
+    start_date: date,
+    end_date: date,
+    storage,
+    session: requests.Session | None = None,
+) -> None:
     """
     Download Dukascopy tick history for `pair` between start_date and end_date.
     Writes to storage via storage.write_raw_parquet() per monthly partition.
@@ -173,7 +183,15 @@ async def backfill_pair(pair: str, start_date: date, end_date: date, storage, se
                 df["pair"] = pair
                 monthly_frames.setdefault(key, []).append(df)
                 logger.debug(
-                    {"event": "hour_downloaded", "pair": pair, "year": year, "month": month, "day": day, "hour": hour, "rows": len(df)}
+                    {
+                        "event": "hour_downloaded",
+                        "pair": pair,
+                        "year": year,
+                        "month": month,
+                        "day": day,
+                        "hour": hour,
+                        "rows": len(df),
+                    }
                 )
             time.sleep(REQUEST_DELAY)
 
@@ -191,7 +209,11 @@ async def backfill_pair(pair: str, start_date: date, end_date: date, storage, se
     # Write collected data to storage
     for (year, month), frames in monthly_frames.items():
         combined = pd.concat(frames, ignore_index=True)
-        combined = combined.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        combined = (
+            combined.sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .reset_index(drop=True)
+        )
         blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
         storage.write_raw_parquet(blob_path, combined)
         logger.info(

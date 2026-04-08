@@ -5,9 +5,9 @@ All indicators implemented in pure pandas/numpy — no ta-lib dependency.
 Produces a feature DataFrame ready for ML training and live inference.
 
 Workflow:
-  1. resample_to_1min(tick_df)     → 1-minute OHLCV bars
-  2. compute_features(tick_df, expiry_seconds) → full feature + label DataFrame
-  3. get_feature_columns()         → list of feature column names (no label cols)
+    1. resample_to_1min(tick_df)     → 1-minute OHLCV bars
+    2. compute_features(tick_df, expiry_seconds) → full feature + label DataFrame
+    3. get_feature_columns()         → list of feature column names (no label cols)
 """
 
 from __future__ import annotations
@@ -23,17 +23,18 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 SESSION_BOUNDS = {
-    "london": (7, 16),    # UTC hours [start, end)
+    "london": (7, 16),  # UTC hours [start, end)
     "new_york": (12, 21),
     "tokyo": (0, 9),
     "london_ny_overlap": (12, 16),
 }
 
-MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]   # seconds
-TICK_VELOCITY_WINDOWS_S = [5, 10, 30]     # seconds for rolling tick count
+MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]  # seconds
+TICK_VELOCITY_WINDOWS_S = [5, 10, 30]  # seconds for rolling tick count
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
 
 def resample_to_1min(tick_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -48,14 +49,13 @@ def resample_to_1min(tick_df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("timestamp").set_index("timestamp")
     df["mid"] = (df["bid"] + df["ask"]) / 2
 
-    ohlcv = df["mid"].resample("1min").ohlc()
-    ohlcv.columns = ["open", "high", "low", "close"]
+    ohlcv: pd.DataFrame = df["mid"].resample("1min").ohlc()  # type: ignore[assignment]
+    ohlcv.columns = pd.Index(["open", "high", "low", "close"])
     ohlcv["volume"] = df["mid"].resample("1min").count()
     ohlcv["spread_mean"] = df["spread"].resample("1min").mean()
     ohlcv["spread_max"] = df["spread"].resample("1min").max()
     ohlcv["mid"] = df["mid"].resample("1min").last()
-    ohlcv = ohlcv.dropna(subset=["close"]).reset_index()
-    ohlcv = ohlcv.rename(columns={"timestamp": "timestamp"})
+    ohlcv = ohlcv.dropna(subset=["close"]).reset_index()  # type: ignore[assignment]
     return ohlcv
 
 
@@ -64,12 +64,12 @@ def compute_features(tick_df: pd.DataFrame, expiry_seconds: int = 60) -> pd.Data
     Build a full feature + label DataFrame from raw tick data.
 
     Steps:
-      1. Resample to 1-min bars
-      2. Compute all technical indicators
-      3. Add session / time features
-      4. Add tick-level aggregated features (velocity, spread z-score, imbalance, momentum)
-      5. Generate binary label (1 = price up at T + expiry_bars, 0 = down)
-      6. Drop NaN rows that cannot form a complete label or feature window
+        1. Resample to 1-min bars
+        2. Compute all technical indicators
+        3. Add session / time features
+        4. Add tick-level aggregated features (velocity, spread z-score, imbalance, momentum)
+        5. Generate binary label (1 = price up at T + expiry_bars, 0 = down)
+        6. Drop NaN rows that cannot form a complete label or feature window
 
     Returns a DataFrame ready for ML. Label column: 'label'.
     """
@@ -122,15 +122,25 @@ def get_feature_columns() -> list[str]:
         # RSI
         "rsi",
         # MACD
-        "macd", "macd_signal", "macd_hist",
+        "macd",
+        "macd_signal",
+        "macd_hist",
         # Bollinger Bands
-        "bb_upper", "bb_lower", "bb_mid", "bb_pct_b", "bb_bandwidth",
+        "bb_upper",
+        "bb_lower",
+        "bb_mid",
+        "bb_pct_b",
+        "bb_bandwidth",
         # EMA crossover
-        "ema_fast", "ema_slow", "ema_cross",
+        "ema_fast",
+        "ema_slow",
+        "ema_cross",
         # Stochastic
-        "stoch_k", "stoch_d",
+        "stoch_k",
+        "stoch_d",
         # ATR
-        "atr", "atr_pct",
+        "atr",
+        "atr_pct",
         # Williams %R
         "williams_r",
         # CCI
@@ -140,14 +150,24 @@ def get_feature_columns() -> list[str]:
         # Volume momentum
         "vol_momentum",
         # Session features
-        "hour_of_day", "day_of_week",
-        "session_london", "session_new_york", "session_tokyo",
-        "session_london_ny_overlap", "is_high_volatility_session",
+        "hour_of_day",
+        "day_of_week",
+        "session_london",
+        "session_new_york",
+        "session_tokyo",
+        "session_london_ny_overlap",
+        "is_high_volatility_session",
         # Tick-level aggregated features
-        "spread_zscore", "spread_mean_reversion",
-        "tick_velocity_5s", "tick_velocity_10s", "tick_velocity_30s",
-        "price_momentum_1s", "price_momentum_5s", "price_momentum_15s",
-        "price_momentum_30s", "price_momentum_60s",
+        "spread_zscore",
+        "spread_mean_reversion",
+        "tick_velocity_5s",
+        "tick_velocity_10s",
+        "tick_velocity_30s",
+        "price_momentum_1s",
+        "price_momentum_5s",
+        "price_momentum_15s",
+        "price_momentum_30s",
+        "price_momentum_60s",
     ]
 
 
@@ -163,18 +183,24 @@ def get_indicator_feature_groups() -> dict[str, list[str]]:
         "williams_r": ["williams_r"],
         "cci": ["cci"],
         "momentum": ["momentum"],
-        "volume_momentum": ["vol_momentum", "tick_velocity_5s", "tick_velocity_10s", "tick_velocity_30s"],
+        "volume_momentum": [
+            "vol_momentum",
+            "tick_velocity_5s",
+            "tick_velocity_10s",
+            "tick_velocity_30s",
+        ],
     }
 
 
 # ── Technical indicator implementations (pure pandas/numpy) ───────────────────
 
+
 def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+    return series.ewm(span=period, adjust=False).mean()  # type: ignore[return-value]
 
 
 def _sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=1).mean()
+    return series.rolling(window=period, min_periods=1).mean()  # type: ignore[return-value]
 
 
 def _add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
@@ -189,7 +215,9 @@ def _add_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return df
 
 
-def _add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+def _add_macd(
+    df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.DataFrame:
     ema_fast = _ema(df["close"], fast)
     ema_slow = _ema(df["close"], slow)
     df["macd"] = ema_fast - ema_slow
@@ -198,7 +226,9 @@ def _add_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9)
     return df
 
 
-def _add_bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
+def _add_bollinger_bands(
+    df: pd.DataFrame, period: int = 20, std_dev: float = 2.0
+) -> pd.DataFrame:
     sma = _sma(df["close"], period)
     std = df["close"].rolling(window=period, min_periods=1).std()
     df["bb_mid"] = sma
@@ -218,7 +248,9 @@ def _add_ema_crossover(df: pd.DataFrame, fast: int = 9, slow: int = 21) -> pd.Da
     return df
 
 
-def _add_stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> pd.DataFrame:
+def _add_stochastic(
+    df: pd.DataFrame, k_period: int = 14, d_period: int = 3
+) -> pd.DataFrame:
     low_min = df["low"].rolling(window=k_period, min_periods=1).min()
     high_max = df["high"].rolling(window=k_period, min_periods=1).max()
     denom = (high_max - low_min).replace(0, np.nan)
@@ -256,7 +288,9 @@ def _add_williams_r(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 def _add_cci(df: pd.DataFrame, period: int = 20) -> pd.DataFrame:
     tp = (df["high"] + df["low"] + df["close"]) / 3
     sma_tp = tp.rolling(window=period, min_periods=1).mean()
-    mad = tp.rolling(window=period, min_periods=1).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    mad = tp.rolling(window=period, min_periods=1).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
     df["cci"] = (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
     df["cci"] = df["cci"].fillna(0.0)
     return df
@@ -267,7 +301,9 @@ def _add_momentum(df: pd.DataFrame, period: int = 10) -> pd.DataFrame:
     return df
 
 
-def _add_volume_momentum(df: pd.DataFrame, short_period: int = 5, long_period: int = 20) -> pd.DataFrame:
+def _add_volume_momentum(
+    df: pd.DataFrame, short_period: int = 5, long_period: int = 20
+) -> pd.DataFrame:
     short_vol = df["volume"].rolling(window=short_period, min_periods=1).mean()
     long_vol = df["volume"].rolling(window=long_period, min_periods=1).mean()
     df["vol_momentum"] = (short_vol - long_vol) / long_vol.replace(0, np.nan)
@@ -276,23 +312,25 @@ def _add_volume_momentum(df: pd.DataFrame, short_period: int = 5, long_period: i
 
 
 def _add_session_features(df: pd.DataFrame) -> pd.DataFrame:
-    if not hasattr(df.index, "hour"):
-        # index is not DatetimIndex — try converting
-        try:
-            idx = pd.DatetimeIndex(df.index)
-        except Exception:
-            df["hour_of_day"] = 12
-            df["day_of_week"] = 0
-            for col in ["session_london", "session_new_york", "session_tokyo",
-                        "session_london_ny_overlap", "is_high_volatility_session"]:
-                df[col] = 0
-            return df
-    else:
-        idx = df.index
+    # Always convert to DatetimeIndex for reliable .hour / .dayofweek access
+    try:
+        idx = pd.DatetimeIndex(df.index)
+    except Exception:
+        for col in [
+            "hour_of_day",
+            "day_of_week",
+            "session_london",
+            "session_new_york",
+            "session_tokyo",
+            "session_london_ny_overlap",
+            "is_high_volatility_session",
+        ]:
+            df[col] = 0
+        return df
 
-    hour = idx.hour
+    hour = idx.hour.to_numpy()
     df["hour_of_day"] = hour
-    df["day_of_week"] = idx.dayofweek
+    df["day_of_week"] = idx.dayofweek.to_numpy()
 
     lo_s, lo_e = SESSION_BOUNDS["london"]
     ny_s, ny_e = SESSION_BOUNDS["new_york"]
@@ -313,10 +351,18 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
     and join them to the 1-min bar DataFrame.
     """
     if tick_df.empty:
-        for col in ["spread_zscore", "spread_mean_reversion",
-                    "tick_velocity_5s", "tick_velocity_10s", "tick_velocity_30s",
-                    "price_momentum_1s", "price_momentum_5s", "price_momentum_15s",
-                    "price_momentum_30s", "price_momentum_60s"]:
+        for col in [
+            "spread_zscore",
+            "spread_mean_reversion",
+            "tick_velocity_5s",
+            "tick_velocity_10s",
+            "tick_velocity_30s",
+            "price_momentum_1s",
+            "price_momentum_5s",
+            "price_momentum_15s",
+            "price_momentum_30s",
+            "price_momentum_60s",
+        ]:
             bars[col] = 0.0
         return bars
 
@@ -327,7 +373,9 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
 
     # Spread z-score on 60-second rolling window
     spread_roll = tk["spread"].rolling("60s")
-    tk["spread_zscore"] = (tk["spread"] - spread_roll.mean()) / spread_roll.std().replace(0, np.nan)
+    tk["spread_zscore"] = (
+        tk["spread"] - spread_roll.mean()
+    ) / spread_roll.std().replace(0, np.nan)
     tk["spread_mean_reversion"] = tk["spread"] - spread_roll.mean()
 
     # Tick velocity: count ticks per second in rolling windows
@@ -335,7 +383,8 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
     tick_count_1s = tk["mid"].resample("1s").count()
     for w in TICK_VELOCITY_WINDOWS_S:
         col = f"tick_velocity_{w}s"
-        tk[col] = tick_count_1s.rolling(w, min_periods=1).sum().reindex(tk.index, method="ffill").fillna(0)
+        velocity = tick_count_1s.rolling(w, min_periods=1).sum()
+        tk[col] = velocity.reindex(tk.index, method="ffill").fillna(0)  # type: ignore[call-arg]
 
     # Price momentum over multiple windows
     for w in MOMENTUM_WINDOWS_S:
@@ -343,21 +392,39 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
         tk[col] = tk["mid"].diff(periods=max(1, w))
 
     # Resample all tick features to 1-min (use last value per bar)
-    tick_features_1min = tk[
-        ["spread_zscore", "spread_mean_reversion",
-         "tick_velocity_5s", "tick_velocity_10s", "tick_velocity_30s",
-         "price_momentum_1s", "price_momentum_5s", "price_momentum_15s",
-         "price_momentum_30s", "price_momentum_60s"]
-    ].resample("1min").last()
+    tick_features_1min = (
+        tk[
+            [
+                "spread_zscore",
+                "spread_mean_reversion",
+                "tick_velocity_5s",
+                "tick_velocity_10s",
+                "tick_velocity_30s",
+                "price_momentum_1s",
+                "price_momentum_5s",
+                "price_momentum_15s",
+                "price_momentum_30s",
+                "price_momentum_60s",
+            ]
+        ]
+        .resample("1min")
+        .last()
+    )
 
     bars = bars.join(tick_features_1min, how="left")
 
     # Fill any NaNs from join
     tick_feature_cols = [
-        "spread_zscore", "spread_mean_reversion",
-        "tick_velocity_5s", "tick_velocity_10s", "tick_velocity_30s",
-        "price_momentum_1s", "price_momentum_5s", "price_momentum_15s",
-        "price_momentum_30s", "price_momentum_60s",
+        "spread_zscore",
+        "spread_mean_reversion",
+        "tick_velocity_5s",
+        "tick_velocity_10s",
+        "tick_velocity_30s",
+        "price_momentum_1s",
+        "price_momentum_5s",
+        "price_momentum_15s",
+        "price_momentum_30s",
+        "price_momentum_60s",
     ]
     bars[tick_feature_cols] = bars[tick_feature_cols].fillna(0.0)
     return bars
@@ -365,7 +432,10 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
 
 # ── Live feature extraction for a single bar ──────────────────────────────────
 
-def extract_live_features(recent_bars: pd.DataFrame, recent_ticks: pd.DataFrame | None = None) -> pd.Series | None:
+
+def extract_live_features(
+    recent_bars: pd.DataFrame, recent_ticks: pd.DataFrame | None = None
+) -> pd.Series | None:
     """
     Extract a single feature row from the most recent 1-min bars.
     Used during live inference — requires at least 30 bars of history.
@@ -373,12 +443,21 @@ def extract_live_features(recent_bars: pd.DataFrame, recent_ticks: pd.DataFrame 
     Returns a pd.Series with feature values, or None if insufficient data.
     """
     if len(recent_bars) < 30:
-        logger.debug({"event": "insufficient_bars_for_live_features", "count": len(recent_bars)})
+        logger.debug(
+            {"event": "insufficient_bars_for_live_features", "count": len(recent_bars)}
+        )
         return None
 
     tick_df = recent_ticks if recent_ticks is not None else pd.DataFrame()
     try:
-        feature_df = compute_features(recent_bars if "timestamp" in recent_bars.columns else recent_bars.reset_index(), expiry_seconds=60)
+        feature_df = compute_features(
+            (
+                recent_bars
+                if "timestamp" in recent_bars.columns
+                else recent_bars.reset_index()
+            ),
+            expiry_seconds=60,
+        )
         if feature_df.empty:
             return None
         feature_cols = get_feature_columns()
