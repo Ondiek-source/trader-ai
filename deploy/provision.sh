@@ -26,7 +26,7 @@ ACI_CPU=2
 ACI_MEMORY=4
 
 VM_NAME="trader-bot-vm"
-VM_SIZE="Standard_B2ms"      # 2 vCPU, 8 GB RAM — cheapest 8GB Windows option
+VM_SIZE="Basic_A2"           # 2 vCPU, 3.5 GB RAM — cheapest available in uksouth (~$60/mo)
 VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
 VM_ADMIN_PASS="TraderAI-2024xAz"
