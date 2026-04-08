@@ -26,7 +26,8 @@ ACI_CPU=2
 ACI_MEMORY=4
 
 VM_NAME="trader-bot-vm"
-VM_SIZE="Standard_D2s_v3"    # 2 vCPU, 8 GB RAM — confirmed available in swedencentral
+VM_LOCATION="southafricanorth"  # VM in South Africa — Quotex accessible from here
+VM_SIZE="Standard_D2s_v3"    # 2 vCPU, 8 GB RAM
 VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
 VM_ADMIN_PASS="TraderAI-2024xAz"
@@ -127,7 +128,7 @@ else
   az vm create \
     --name "$VM_NAME" \
     --resource-group "$RESOURCE_GROUP" \
-    --location "$LOCATION" \
+    --location "$VM_LOCATION" \
     --image "$VM_IMAGE" \
     --size "$VM_SIZE" \
     --admin-username "$VM_ADMIN_USER" \
