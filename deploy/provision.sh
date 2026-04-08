@@ -26,7 +26,25 @@ ACI_CPU=2
 ACI_MEMORY=4
 
 VM_NAME="trader-bot-vm"
-VM_SIZE="Basic_A2"           # 2 vCPU, 3.5 GB RAM — cheapest available in uksouth (~$60/mo)
+# Auto-discover cheapest available Windows-compatible VM with >= 2 vCPU in uksouth
+# Preference order: cheapest burstable/general purpose options
+VM_SIZE=""
+for candidate in Standard_A2_v2 Standard_D2s_v3 Standard_D2s_v4 Standard_D2s_v5 Standard_D2as_v4 Standard_D2as_v5 Basic_A2 Standard_A2; do
+  RESTRICTED=$(az vm list-skus \
+    --location "$LOCATION" \
+    --resource-type virtualMachines \
+    --query "[?name=='${candidate}'].restrictions[].reasonCode" \
+    --output tsv 2>/dev/null || true)
+  if [[ -z "$RESTRICTED" ]]; then
+    VM_SIZE="$candidate"
+    echo "  Auto-selected VM size: $VM_SIZE"
+    break
+  fi
+done
+if [[ -z "$VM_SIZE" ]]; then
+  echo "ERROR: Could not find an available VM size in $LOCATION. Check Azure quota."
+  exit 1
+fi
 VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
 VM_ADMIN_PASS="TraderAI-2024xAz"
