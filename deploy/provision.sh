@@ -42,7 +42,7 @@ VM_SIZE="Standard_B2ms"          # 2 vCPU, 8 GB RAM — comfortably above 6 GB m
 VM_IMAGE="Win2022Datacenter"
 VM_ADMIN_USER="traderadmin"
 # Strong random password
-VM_ADMIN_PASS="TraderAI$(openssl rand -hex 8)Az"
+VM_ADMIN_PASS="TraderAI2024xAz"
 
 echo ""
 echo "=========================================="
@@ -144,8 +144,7 @@ else
     --size "$VM_SIZE" \
     --admin-username "$VM_ADMIN_USER" \
     --admin-password "$VM_ADMIN_PASS" \
-    --public-ip-sku Standard \
-    --output none
+    --public-ip-sku Standard
 
   az vm open-port \
     --name "$VM_NAME" \
