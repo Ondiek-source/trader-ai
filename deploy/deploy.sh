@@ -33,6 +33,16 @@ source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── Ensure required providers are registered ──────────────────────────────────
+for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do
+  STATE=$(az provider show --namespace "$provider" --query registrationState --output tsv 2>/dev/null || echo "NotRegistered")
+  if [[ "$STATE" != "Registered" ]]; then
+    echo "Registering $provider (one-time, ~1 minute)..."
+    az provider register --namespace "$provider" --wait
+    echo "      Done."
+  fi
+done
+
 echo ""
 echo "=========================================="
 echo "  Trader AI — Deploy to Azure Container Instance"
