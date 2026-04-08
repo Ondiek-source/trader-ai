@@ -300,22 +300,28 @@ class TelegramBot:
 
 async def scheduled_report_loop(
     bot: TelegramBot,
-    orchestrator,
-    interval_minutes: int = 60,
+    _orchestrator: Any = None,
+    _interval_minutes: int = 60,
 ) -> None:
     """
-    Sends a session report every interval_minutes.
-    Also sends a final report when the session window ends.
+    Sends a daily session report at 23:58 UTC, Monday–Friday only.
+    Sleeps in 30-second ticks and fires when the clock hits 23:58.
     """
+    last_sent_date: str = ""
     while True:
-        await asyncio.sleep(interval_minutes * 60)
+        await asyncio.sleep(30)
         try:
-            status = orchestrator.get_status()
-            session = status.get("session", {})
-            if not session.get("is_active", True) or session.get("target_reached", False):
-                bot.send_report()
-                logger.info({"event": "session_end_report_sent"})
-            else:
-                bot.send_report()
+            now = datetime.now(timezone.utc)
+            # 0=Monday … 4=Friday
+            if now.weekday() > 4:
+                continue
+            if now.hour != 23 or now.minute != 58:
+                continue
+            today = now.strftime("%Y-%m-%d")
+            if today == last_sent_date:
+                continue  # already sent today
+            last_sent_date = today
+            bot.send_report()
+            logger.info({"event": "daily_report_sent", "date": today})
         except Exception as exc:
             logger.warning({"event": "scheduled_report_error", "error": str(exc)})
