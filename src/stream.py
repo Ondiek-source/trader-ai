@@ -3,8 +3,8 @@ stream.py — Twelve Data WebSocket tick streaming.
 
 Connects to wss://ws.twelvedata.com/v1/quotes/price and subscribes to all
 configured pairs. Each tick is:
-  - Appended to an in-memory buffer per pair (flushed to storage every N ticks)
-  - Put onto a shared queue for the signal generator to consume
+    - Appended to an in-memory buffer per pair (flushed to storage every N ticks)
+    - Put onto a shared queue for the signal generator to consume
 
 On disconnect: logs warning, waits with backoff, reconnects (infinite retry).
 Buffer is never lost on reconnect.
@@ -30,9 +30,11 @@ logger = logging.getLogger(__name__)
 # Internal format:  EUR_USD
 # Twelve Data format: EUR/USD
 
+
 def _to_td_symbol(pair: str) -> str:
     """EUR_USD → EUR/USD"""
     return pair.replace("_", "/")
+
 
 def _from_td_symbol(symbol: str) -> str:
     """EUR/USD → EUR_USD"""
@@ -62,9 +64,9 @@ class TwelveDataStream:
     Streams live tick prices from Twelve Data WebSocket API.
 
     Thread model:
-      - A background thread runs an asyncio event loop for the WebSocket.
-      - Ticks are buffered per pair and flushed to storage every flush_size ticks.
-      - Each tick is also placed on tick_queue for the signal generator to consume.
+        - A background thread runs an asyncio event loop for the WebSocket.
+        - Ticks are buffered per pair and flushed to storage every flush_size ticks.
+        - Each tick is also placed on tick_queue for the signal generator to consume.
     """
 
     WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -106,7 +108,9 @@ class TwelveDataStream:
             target=self._run_loop, daemon=True, name="twelvedata-stream"
         )
         self._thread.start()
-        logger.info({"event": "stream_started", "provider": "TwelveData", "pairs": self._pairs})
+        logger.info(
+            {"event": "stream_started", "provider": "TwelveData", "pairs": self._pairs}
+        )
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -134,35 +138,44 @@ class TwelveDataStream:
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
-                logger.warning({
-                    "event": "stream_disconnected",
-                    "error": str(exc),
-                    "reconnect_in_seconds": reconnect_delay,
-                })
+                logger.warning(
+                    {
+                        "event": "stream_disconnected",
+                        "error": str(exc),
+                        "reconnect_in_seconds": reconnect_delay,
+                    }
+                )
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
 
     async def _connect_and_stream(self) -> None:
         """Open one WebSocket session and stream until error or stop."""
         try:
-            import websockets  # type: ignore[import-unresolved]
+            from websockets.asyncio.client import connect as _ws_connect  # type: ignore[import-unresolved]
         except ImportError:
-            logger.warning({
-                "event": "websockets_not_installed",
-                "message": "pip install websockets — falling back to stub mode",
-            })
-            await self._stub_stream()
-            return
+            try:
+                from websockets import connect as _ws_connect  # type: ignore[import-unresolved]
+            except ImportError:
+                logger.warning(
+                    {
+                        "event": "websockets_not_installed",
+                        "message": "pip install websockets>=12.0 — falling back to stub mode",
+                    }
+                )
+                await self._stub_stream()
+                return
 
         url = f"{self.WS_URL}?apikey={self._api_key}"
         symbols = ",".join(_to_td_symbol(p) for p in self._pairs)
 
-        async with websockets.connect(url) as ws:
+        async with _ws_connect(url) as ws:
             # Subscribe to all pairs
-            subscribe_msg = json.dumps({
-                "action": "subscribe",
-                "params": {"symbols": symbols},
-            })
+            subscribe_msg = json.dumps(
+                {
+                    "action": "subscribe",
+                    "params": {"symbols": symbols},
+                }
+            )
             await ws.send(subscribe_msg)
             logger.info({"event": "stream_connected", "symbols": symbols})
 
@@ -184,7 +197,9 @@ class TwelveDataStream:
             logger.debug({"event": "stream_subscribe_status", "msg": msg})
             return
         if event != "price":
-            logger.debug({"event": "stream_unknown_msg", "type": event, "keys": list(msg.keys())})
+            logger.debug(
+                {"event": "stream_unknown_msg", "type": event, "keys": list(msg.keys())}
+            )
             return
 
         try:
@@ -210,7 +225,9 @@ class TwelveDataStream:
             self._ingest_tick(tick)
 
         except (KeyError, ValueError, TypeError) as exc:
-            logger.warning({"event": "tick_parse_error", "error": str(exc), "raw": str(msg)[:200]})
+            logger.warning(
+                {"event": "tick_parse_error", "error": str(exc), "raw": str(msg)[:200]}
+            )
 
     # ── Ingestion / buffering ──────────────────────────────────────────────────
 
@@ -227,7 +244,9 @@ class TwelveDataStream:
         try:
             self._tick_queue.put_nowait(tick)
         except queue.Full:
-            logger.warning({"event": "tick_queue_full", "pair": tick.pair, "dropped": True})
+            logger.warning(
+                {"event": "tick_queue_full", "pair": tick.pair, "dropped": True}
+            )
 
     def _flush_pair(self, pair: str) -> None:
         buf = self._buffers.get(pair, [])
@@ -248,7 +267,13 @@ class TwelveDataStream:
     async def _stub_stream(self) -> None:
         """Emit synthetic ticks when websockets library is unavailable."""
         import random
-        mid_prices = {"EUR_USD": 1.0850, "GBP_USD": 1.2650, "USD_JPY": 149.50, "XAU_USD": 2020.0}
+
+        mid_prices = {
+            "EUR_USD": 1.0850,
+            "GBP_USD": 1.2650,
+            "USD_JPY": 149.50,
+            "XAU_USD": 2020.0,
+        }
         while not self._stop_event.is_set():
             for pair in self._pairs:
                 mid = mid_prices.get(pair, 1.0)

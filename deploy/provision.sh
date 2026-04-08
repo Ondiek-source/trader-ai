@@ -42,7 +42,7 @@ VM_SIZE="Standard_B2ms"          # 2 vCPU, 8 GB RAM — comfortably above 6 GB m
 VM_IMAGE="Win2022Datacenter"
 VM_ADMIN_USER="traderadmin"
 # Strong random password
-VM_ADMIN_PASS="TraderAI@$(openssl rand -hex 6)!"
+VM_ADMIN_PASS="TraderAI$(openssl rand -hex 8)Az"
 
 echo ""
 echo "=========================================="
@@ -61,19 +61,28 @@ echo "[1/6] Creating resource group $RESOURCE_GROUP..."
 az group create \
   --name "$RESOURCE_GROUP" \
   --location "$LOCATION" \
-  --output none
+  --output none 2>/dev/null || echo "      (already exists, continuing)"
 echo "      Done."
 
 # ── 2. Storage Account ────────────────────────────────────────────────────────
-echo "[2/6] Creating storage account $STORAGE_ACCOUNT..."
-az storage account create \
-  --name "$STORAGE_ACCOUNT" \
+# Re-use existing storage account if already provisioned
+EXISTING_STORAGE=$(az storage account list \
   --resource-group "$RESOURCE_GROUP" \
-  --location "$LOCATION" \
-  --sku Standard_LRS \
-  --kind StorageV2 \
-  --access-tier Hot \
-  --output none
+  --query "[0].name" --output tsv 2>/dev/null || true)
+if [[ -n "$EXISTING_STORAGE" ]]; then
+  STORAGE_ACCOUNT="$EXISTING_STORAGE"
+  echo "[2/6] Using existing storage account $STORAGE_ACCOUNT..."
+else
+  echo "[2/6] Creating storage account $STORAGE_ACCOUNT..."
+  az storage account create \
+    --name "$STORAGE_ACCOUNT" \
+    --resource-group "$RESOURCE_GROUP" \
+    --location "$LOCATION" \
+    --sku Standard_LRS \
+    --kind StorageV2 \
+    --access-tier Hot \
+    --output none
+fi
 
 STORAGE_CONN=$(az storage account show-connection-string \
   --name "$STORAGE_ACCOUNT" \
@@ -114,32 +123,43 @@ ACR_PASSWORD=$(az acr credential show \
 echo "      Done. Registry: $ACR_LOGIN_SERVER"
 
 # ── 4. Windows VM for trading bot ─────────────────────────────────────────────
-echo "[4/6] Creating Windows VM $VM_NAME (this takes ~3 minutes)..."
-az vm create \
-  --name "$VM_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --location "$LOCATION" \
-  --image "$VM_IMAGE" \
-  --size "$VM_SIZE" \
-  --admin-username "$VM_ADMIN_USER" \
-  --admin-password "$VM_ADMIN_PASS" \
-  --public-ip-sku Standard \
-  --output none
+EXISTING_VM=$(az vm show --name "$VM_NAME" --resource-group "$RESOURCE_GROUP" \
+  --query name --output tsv 2>/dev/null || true)
 
-# Open RDP port so you can remote in
-az vm open-port \
-  --name "$VM_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --port 3389 \
-  --output none
+if [[ -n "$EXISTING_VM" ]]; then
+  echo "[4/6] Using existing VM $VM_NAME..."
+  VM_PUBLIC_IP=$(az vm show \
+    --name "$VM_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --show-details \
+    --query publicIps \
+    --output tsv)
+else
+  echo "[4/6] Creating Windows VM $VM_NAME (this takes ~3 minutes)..."
+  az vm create \
+    --name "$VM_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --location "$LOCATION" \
+    --image "$VM_IMAGE" \
+    --size "$VM_SIZE" \
+    --admin-username "$VM_ADMIN_USER" \
+    --admin-password "$VM_ADMIN_PASS" \
+    --public-ip-sku Standard \
+    --output none
 
-VM_PUBLIC_IP=$(az vm show \
-  --name "$VM_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --show-details \
-  --query publicIps \
-  --output tsv)
+  az vm open-port \
+    --name "$VM_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --port 3389 \
+    --output none
 
+  VM_PUBLIC_IP=$(az vm show \
+    --name "$VM_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --show-details \
+    --query publicIps \
+    --output tsv)
+fi
 echo "      Done. VM IP: $VM_PUBLIC_IP"
 
 # ── 5. Disable VM screen lock via auto-shutdown disable + idle settings ───────
