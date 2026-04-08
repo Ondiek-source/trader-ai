@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+deploy/azure.env
 
 # Python
 __pycache__/
