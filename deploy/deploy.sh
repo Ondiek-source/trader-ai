@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy.sh — Build, push, and run the Trader AI container on Azure
+# deploy.sh — Build and deploy Trader AI entirely in Azure (no Docker needed)
+#
+# Uses ACR Build Tasks to build the image in the cloud, then deploys to
+# Azure Container Instance. Only requires Azure CLI — no Docker Desktop.
 #
 # Run this every time you want to deploy a new version.
 # Requires provision.sh to have been run first.
 #
 # Usage:
-#   chmod +x deploy/deploy.sh
-#   ./deploy/deploy.sh
+#   bash deploy/deploy.sh
 # =============================================================================
 
 set -euo pipefail
@@ -23,11 +25,10 @@ if [[ ! -f "$AZURE_ENV" ]]; then
 fi
 
 if [[ ! -f "$APP_ENV" ]]; then
-  echo "ERROR: .env not found. Copy .env.example to .env and fill it in."
+  echo "ERROR: .env not found. Copy .env.example and fill it in."
   exit 1
 fi
 
-# Load azure config
 source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
@@ -35,53 +36,43 @@ IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 echo ""
 echo "=========================================="
 echo "  Trader AI — Deploy to Azure"
+echo "  (no Docker Desktop required)"
 echo "=========================================="
 echo "Registry : $ACR_LOGIN_SERVER"
 echo "Container: $ACI_NAME"
 echo ""
 
-# ── 1. Build Docker image ─────────────────────────────────────────────────────
-echo "[1/4] Building Docker image..."
-docker build \
-  --platform linux/amd64 \
-  -t "trader-ai:latest" \
-  -f "$PROJECT_ROOT/Dockerfile" \
+# ── 1. Build image in Azure (ACR Build Task) ──────────────────────────────────
+echo "[1/3] Building image in Azure Container Registry..."
+echo "      (uploads source, builds in cloud — takes 5-10 minutes)"
+az acr build \
+  --registry "$ACR_NAME" \
+  --image "trader-ai:latest" \
+  --file "$PROJECT_ROOT/Dockerfile" \
   "$PROJECT_ROOT"
-echo "      Done."
+echo "      Done. Image: $IMAGE_TAG"
 
-# ── 2. Push to Azure Container Registry ──────────────────────────────────────
-echo "[2/4] Pushing image to ACR..."
-docker tag "trader-ai:latest" "$IMAGE_TAG"
-echo "$ACR_PASSWORD" | docker login "$ACR_LOGIN_SERVER" \
-  --username "$ACR_USERNAME" \
-  --password-stdin
-docker push "$IMAGE_TAG"
-echo "      Done."
-
-# ── 3. Load .env into ACI environment variables ───────────────────────────────
-echo "[3/4] Reading .env for container environment..."
-
-# Parse .env into --environment-variables string (skip comments and blanks)
+# ── 2. Parse .env into ACI environment variables ──────────────────────────────
+echo "[2/3] Reading .env..."
 ENV_ARGS=""
 while IFS= read -r line; do
-  [[ "$line" =~ ^#.*$ ]] && continue
-  [[ -z "$line" ]] && continue
+  [[ "$line" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "${line// }" ]] && continue
   KEY="${line%%=*}"
   VAL="${line#*=}"
-  # Skip empty values
   [[ -z "$VAL" ]] && continue
+  # Escape values with spaces by quoting
   ENV_ARGS="$ENV_ARGS $KEY=$VAL"
 done < "$APP_ENV"
 
-# ── 4. Deploy / update Azure Container Instance ───────────────────────────────
-echo "[4/4] Deploying container instance..."
+# ── 3. Deploy to Azure Container Instance ─────────────────────────────────────
+echo "[3/3] Deploying container instance..."
 
-# Delete existing instance if present (ACI doesn't support in-place image update)
 if az container show \
      --name "$ACI_NAME" \
      --resource-group "$RESOURCE_GROUP" \
      --output none 2>/dev/null; then
-  echo "      Removing existing container instance..."
+  echo "      Removing existing container..."
   az container delete \
     --name "$ACI_NAME" \
     --resource-group "$RESOURCE_GROUP" \
@@ -108,7 +99,7 @@ echo ""
 echo "=========================================="
 echo "  Deployment complete!"
 echo ""
-echo "  View logs:"
+echo "  View live logs:"
 echo "  az container logs --name $ACI_NAME --resource-group $RESOURCE_GROUP --follow"
 echo ""
 echo "  Check status:"
