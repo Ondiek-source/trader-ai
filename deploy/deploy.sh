@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy.sh — Build and deploy Trader AI entirely in Azure (no Docker needed)
+# deploy.sh — Deploy the latest image from ACR to Azure Container Instance
 #
-# Uses ACR Build Tasks to build the image in the cloud, then deploys to
-# Azure Container Instance. Only requires Azure CLI — no Docker Desktop.
+# Run this locally after GitHub Actions has finished building the image.
+# Requires: Azure CLI + az login
 #
-# Run this every time you want to deploy a new version.
-# Requires provision.sh to have been run first.
+# Check CI is done first:
+#   gh run list --repo Ondiek-source/trader-ai --limit 3
 #
 # Usage:
 #   bash deploy/deploy.sh
@@ -25,7 +25,7 @@ if [[ ! -f "$AZURE_ENV" ]]; then
 fi
 
 if [[ ! -f "$APP_ENV" ]]; then
-  echo "ERROR: .env not found. Copy .env.example and fill it in."
+  echo "ERROR: .env not found."
   exit 1
 fi
 
@@ -35,25 +35,14 @@ IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
 echo ""
 echo "=========================================="
-echo "  Trader AI — Deploy to Azure"
-echo "  (no Docker Desktop required)"
+echo "  Trader AI — Deploy to Azure Container Instance"
 echo "=========================================="
-echo "Registry : $ACR_LOGIN_SERVER"
+echo "Image    : $IMAGE_TAG"
 echo "Container: $ACI_NAME"
 echo ""
 
-# ── 1. Build image in Azure (ACR Build Task) ──────────────────────────────────
-echo "[1/3] Building image in Azure Container Registry..."
-echo "      (uploads source, builds in cloud — takes 5-10 minutes)"
-az acr build \
-  --registry "$ACR_NAME" \
-  --image "trader-ai:latest" \
-  --file "$PROJECT_ROOT/Dockerfile" \
-  "$PROJECT_ROOT"
-echo "      Done. Image: $IMAGE_TAG"
-
-# ── 2. Parse .env into ACI environment variables ──────────────────────────────
-echo "[2/3] Reading .env..."
+# ── Parse .env into environment variables for ACI ─────────────────────────────
+echo "[1/2] Reading .env..."
 ENV_ARGS=""
 while IFS= read -r line; do
   [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -61,12 +50,11 @@ while IFS= read -r line; do
   KEY="${line%%=*}"
   VAL="${line#*=}"
   [[ -z "$VAL" ]] && continue
-  # Escape values with spaces by quoting
   ENV_ARGS="$ENV_ARGS $KEY=$VAL"
 done < "$APP_ENV"
 
-# ── 3. Deploy to Azure Container Instance ─────────────────────────────────────
-echo "[3/3] Deploying container instance..."
+# ── Deploy to ACI ─────────────────────────────────────────────────────────────
+echo "[2/2] Deploying container instance..."
 
 if az container show \
      --name "$ACI_NAME" \
