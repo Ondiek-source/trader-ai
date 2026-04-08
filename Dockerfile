@@ -15,6 +15,7 @@ RUN apt-get update && \
         build-essential \
         libgomp1 \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
