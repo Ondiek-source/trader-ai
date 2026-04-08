@@ -21,7 +21,7 @@ set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 RESOURCE_GROUP="rg-trader-ai"
-LOCATION="eastus"
+LOCATION="westeurope"
 
 # Storage (name must be globally unique, lowercase, 3-24 chars)
 RAND=$((RANDOM % 9000 + 1000))
@@ -39,10 +39,10 @@ ACI_MEMORY=4
 # Windows VM (trading bot)
 VM_NAME="trader-bot-vm"
 VM_SIZE="Standard_B2ms"          # 2 vCPU, 8 GB RAM — comfortably above 6 GB min
-VM_IMAGE="Win2022Datacenter"
+VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
 # Strong random password
-VM_ADMIN_PASS="TraderAI2024xAz"
+VM_ADMIN_PASS="TraderAI-2024xAz"
 
 echo ""
 echo "=========================================="
