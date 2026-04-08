@@ -376,9 +376,7 @@ async def main() -> None:
     orchestrator = create_orchestrator(config=config, martingale_tracker=martingale)
 
     stream = OANDAStream(
-        token=config.oanda_token,
-        account_id=config.oanda_account_id,
-        environment=config.oanda_environment,
+        api_key=config.twelvedata_api_key,
         pairs=config.pairs,
         storage=storage,
         flush_size=config.tick_flush_size,

@@ -1,17 +1,19 @@
 """
-stream.py — OANDA v20 tick streaming.
+stream.py — Twelve Data WebSocket tick streaming.
 
-Opens a PricingStream for all configured pairs. Each tick is:
+Connects to wss://ws.twelvedata.com/v1/quotes/price and subscribes to all
+configured pairs. Each tick is:
   - Appended to an in-memory buffer per pair (flushed to storage every N ticks)
-  - Put onto a shared asyncio-compatible Queue for downstream consumers
+  - Put onto a shared queue for the signal generator to consume
 
-On stream disconnect: log warning, wait 2 s, reconnect (infinite retry).
-Buffer is never lost on reconnect — ticks remain in self._buffers until flushed.
+On disconnect: logs warning, waits with backoff, reconnects (infinite retry).
+Buffer is never lost on reconnect.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -22,18 +24,19 @@ from typing import Any
 
 import pandas as pd
 
-try:
-    import oandapyV20
-    import oandapyV20.endpoints.pricing as pricing
-    from oandapyV20 import API
-    from oandapyV20.exceptions import StreamTerminated, V20Error
-    OANDA_AVAILABLE = True
-except ImportError:
-    OANDA_AVAILABLE = False
-    logger_import = logging.getLogger(__name__)
-    logger_import.warning("oandapyV20 not installed — stream.py will run in stub mode.")
-
 logger = logging.getLogger(__name__)
+
+# ── Pair format helpers ────────────────────────────────────────────────────────
+# Internal format:  EUR_USD
+# Twelve Data format: EUR/USD
+
+def _to_td_symbol(pair: str) -> str:
+    """EUR_USD → EUR/USD"""
+    return pair.replace("_", "/")
+
+def _from_td_symbol(symbol: str) -> str:
+    """EUR/USD → EUR_USD"""
+    return symbol.replace("/", "_")
 
 
 @dataclass
@@ -54,35 +57,32 @@ class Tick:
         }
 
 
-class OANDAStream:
+class TwelveDataStream:
     """
-    Streams live tick prices from OANDA for all configured pairs.
+    Streams live tick prices from Twelve Data WebSocket API.
 
     Thread model:
-      - A single background thread runs _stream_loop().
+      - A background thread runs an asyncio event loop for the WebSocket.
       - Ticks are buffered per pair and flushed to storage every flush_size ticks.
       - Each tick is also placed on tick_queue for the signal generator to consume.
     """
 
+    WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
+
     def __init__(
         self,
-        token: str,
-        account_id: str,
-        environment: str,
+        api_key: str,
         pairs: list[str],
-        storage,
+        storage: Any,
         flush_size: int = 500,
         tick_queue: queue.Queue | None = None,
     ) -> None:
-        self._token = token
-        self._account_id = account_id
-        self._environment = environment  # "practice" | "live"
+        self._api_key = api_key
         self._pairs = pairs
         self._storage = storage
         self._flush_size = flush_size
         self._tick_queue: queue.Queue = tick_queue or queue.Queue(maxsize=100_000)
 
-        # Per-pair in-memory buffers — never cleared on disconnect
         self._buffers: dict[str, list[dict]] = {p: [] for p in pairs}
         self._buffer_lock = threading.Lock()
 
@@ -101,117 +101,136 @@ class OANDAStream:
         return self._ticks_received
 
     def start(self) -> None:
-        """Start the streaming thread (non-blocking)."""
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._stream_loop, daemon=True, name="oanda-stream")
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="twelvedata-stream"
+        )
         self._thread.start()
-        logger.info({"event": "stream_started", "pairs": self._pairs})
+        logger.info({"event": "stream_started", "provider": "TwelveData", "pairs": self._pairs})
 
     def stop(self) -> None:
-        """Signal the streaming thread to stop."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
-        # Final flush of any remaining buffered ticks
         self._flush_all()
         logger.info({"event": "stream_stopped"})
 
     def force_flush(self) -> None:
-        """Flush all in-memory buffers to storage immediately."""
         self._flush_all()
 
-    # ── Internal ───────────────────────────────────────────────────────────────
+    # ── Thread entry point ─────────────────────────────────────────────────────
 
-    def _stream_loop(self) -> None:
-        """Infinite loop: stream ticks, reconnect on any failure."""
+    def _run_loop(self) -> None:
+        """Run an asyncio event loop inside the background thread."""
+        asyncio.run(self._async_stream_loop())
+
+    async def _async_stream_loop(self) -> None:
+        """Outer reconnect loop."""
         reconnect_delay = 2.0
         while not self._stop_event.is_set():
             try:
-                self._run_stream()
-                reconnect_delay = 2.0  # reset on clean exit
+                await self._connect_and_stream()
+                reconnect_delay = 2.0
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
-                logger.warning(
-                    {
-                        "event": "stream_disconnected",
-                        "error": str(exc),
-                        "reconnect_in_seconds": reconnect_delay,
-                        "buffered_ticks": sum(len(v) for v in self._buffers.values()),
-                    }
-                )
-                time.sleep(reconnect_delay)
+                logger.warning({
+                    "event": "stream_disconnected",
+                    "error": str(exc),
+                    "reconnect_in_seconds": reconnect_delay,
+                })
+                await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
 
-    def _run_stream(self) -> None:
-        """Open one streaming session. Returns when stream ends or errors."""
-        if not OANDA_AVAILABLE:
-            logger.warning({"event": "stream_stub_mode", "message": "oandapyV20 unavailable — emitting synthetic ticks"})
-            self._stub_stream()
+    async def _connect_and_stream(self) -> None:
+        """Open one WebSocket session and stream until error or stop."""
+        try:
+            import websockets  # type: ignore[import-unresolved]
+        except ImportError:
+            logger.warning({
+                "event": "websockets_not_installed",
+                "message": "pip install websockets — falling back to stub mode",
+            })
+            await self._stub_stream()
             return
 
-        client = API(access_token=self._token, environment=self._environment)
-        instruments = ",".join(self._pairs)
-        params = {"instruments": instruments}
-        request = pricing.PricingStream(accountID=self._account_id, params=params)
+        url = f"{self.WS_URL}?apikey={self._api_key}"
+        symbols = ",".join(_to_td_symbol(p) for p in self._pairs)
 
-        logger.info({"event": "stream_connected", "environment": self._environment, "pairs": self._pairs})
+        async with websockets.connect(url) as ws:
+            # Subscribe to all pairs
+            subscribe_msg = json.dumps({
+                "action": "subscribe",
+                "params": {"symbols": symbols},
+            })
+            await ws.send(subscribe_msg)
+            logger.info({"event": "stream_connected", "symbols": symbols})
 
-        for response in client.request(request):
-            if self._stop_event.is_set():
-                break
-            self._handle_message(response)
+            while not self._stop_event.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
+                    self._handle_message(json.loads(raw))
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    await ws.ping()
 
     def _handle_message(self, msg: dict) -> None:
-        """Process a single streaming message from OANDA."""
-        msg_type = msg.get("type", "")
-        if msg_type == "HEARTBEAT":
-            return  # ignore heartbeats
-        if msg_type != "PRICE":
-            logger.debug({"event": "stream_unknown_msg_type", "type": msg_type})
+        """Process a single WebSocket message from Twelve Data."""
+        event = msg.get("event", "")
+
+        if event == "heartbeat":
+            return
+        if event in ("subscribe-status", "subscribe"):
+            logger.debug({"event": "stream_subscribe_status", "msg": msg})
+            return
+        if event != "price":
+            logger.debug({"event": "stream_unknown_msg", "type": event, "keys": list(msg.keys())})
             return
 
         try:
-            pair = msg["instrument"]
-            ts_str = msg.get("time", "")
-            ts = pd.Timestamp(ts_str, tz="UTC") if ts_str else pd.Timestamp.utcnow()
+            symbol = msg.get("symbol", "")
+            pair = _from_td_symbol(symbol)
 
-            bids = msg.get("bids", [{}])
-            asks = msg.get("asks", [{}])
-            bid = float(bids[0].get("price", 0)) if bids else 0.0
-            ask = float(asks[0].get("price", 0)) if asks else 0.0
+            # Twelve Data sends ask/bid as strings
+            ask = float(msg.get("ask") or msg.get("price") or 0)
+            bid = float(msg.get("bid") or ask)
             spread = round(ask - bid, 6)
 
-            tick = Tick(
-                pair=pair,
-                timestamp=ts.to_pydatetime(),
-                bid=bid,
-                ask=ask,
-                spread=spread,
-            )
+            # Timestamp: "2024-01-01 12:00:00" UTC or unix
+            ts_raw = msg.get("timestamp")
+            if ts_raw:
+                try:
+                    ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
+                except (ValueError, TypeError):
+                    ts = pd.Timestamp(str(ts_raw), tz="UTC").to_pydatetime()
+            else:
+                ts = datetime.now(timezone.utc)
+
+            tick = Tick(pair=pair, timestamp=ts, bid=bid, ask=ask, spread=spread)
             self._ingest_tick(tick)
 
-        except (KeyError, IndexError, ValueError) as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             logger.warning({"event": "tick_parse_error", "error": str(exc), "raw": str(msg)[:200]})
 
+    # ── Ingestion / buffering ──────────────────────────────────────────────────
+
     def _ingest_tick(self, tick: Tick) -> None:
-        """Buffer tick, flush if threshold reached, put onto queue."""
         with self._buffer_lock:
+            if tick.pair not in self._buffers:
+                self._buffers[tick.pair] = []
             self._buffers[tick.pair].append(tick.to_dict())
             self._ticks_received += 1
 
             if len(self._buffers[tick.pair]) >= self._flush_size:
                 self._flush_pair(tick.pair)
 
-        # Non-blocking put — drop if queue is full (backpressure protection)
         try:
             self._tick_queue.put_nowait(tick)
         except queue.Full:
             logger.warning({"event": "tick_queue_full", "pair": tick.pair, "dropped": True})
 
     def _flush_pair(self, pair: str) -> None:
-        """Must be called with self._buffer_lock held (or equivalent)."""
-        buf = self._buffers[pair]
+        buf = self._buffers.get(pair, [])
         if not buf:
             return
         df = pd.DataFrame(buf)
@@ -221,11 +240,13 @@ class OANDAStream:
 
     def _flush_all(self) -> None:
         with self._buffer_lock:
-            for pair in self._pairs:
+            for pair in list(self._buffers.keys()):
                 self._flush_pair(pair)
 
-    def _stub_stream(self) -> None:
-        """Generate synthetic ticks for testing when OANDA is unavailable."""
+    # ── Stub fallback ──────────────────────────────────────────────────────────
+
+    async def _stub_stream(self) -> None:
+        """Emit synthetic ticks when websockets library is unavailable."""
         import random
         mid_prices = {"EUR_USD": 1.0850, "GBP_USD": 1.2650, "USD_JPY": 149.50, "XAU_USD": 2020.0}
         while not self._stop_event.is_set():
@@ -242,25 +263,8 @@ class OANDAStream:
                     spread=round(spread, 6),
                 )
                 self._ingest_tick(tick)
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
 
-# ── asyncio-compatible wrapper ─────────────────────────────────────────────────
-
-async def run_stream(stream: OANDAStream) -> None:
-    """Run stream.start() in an executor so it doesn't block the event loop."""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, stream.start)
-
-
-async def get_tick_async(stream: OANDAStream, timeout: float = 1.0) -> Tick | None:
-    """Non-blocking async tick consumer. Returns None on timeout."""
-    loop = asyncio.get_running_loop()
-    try:
-        tick = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: stream.tick_queue.get(timeout=timeout)),
-            timeout=timeout + 0.5,
-        )
-        return tick
-    except (asyncio.TimeoutError, Exception):
-        return None
+# ── Backwards-compat alias (used in main.py) ───────────────────────────────────
+OANDAStream = TwelveDataStream

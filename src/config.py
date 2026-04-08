@@ -50,10 +50,8 @@ def _float(name: str, default: float) -> float:
 
 @dataclass
 class Config:
-    # ── OANDA ─────────────────────────────────────────────────────────────────
-    oanda_token: str
-    oanda_account_id: str
-    oanda_env: str  # "practice" | "live"
+    # ── Twelve Data ───────────────────────────────────────────────────────────
+    twelvedata_api_key: str
 
     # ── Azure Storage ─────────────────────────────────────────────────────────
     azure_storage_conn: str
@@ -99,15 +97,7 @@ class Config:
     backfill_years: int         # years of Dukascopy history to download
     optimize_expiry: bool       # True = test 60/120/300s and pick best per pair
 
-    # ── Derived / convenience ─────────────────────────────────────────────────
-    oanda_environment: str = field(init=False)
-
     def __post_init__(self) -> None:
-        # Validate OANDA env
-        if self.oanda_env not in ("practice", "live"):
-            raise ValueError(f"OANDA_ENV must be 'practice' or 'live', got: '{self.oanda_env}'")
-        self.oanda_environment = "practice" if self.oanda_env == "practice" else "live"
-
         # Validate pairs
         valid_pairs = {"EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"}
         for p in self.pairs:
@@ -127,11 +117,11 @@ class Config:
         # Warn loudly on live mode
         if not self.practice_mode:
             logger.warning(
-                "⚠️  [LIVE MODE ACTIVE] — System is configured for LIVE trading. "
+                "[LIVE MODE ACTIVE] — System is configured for LIVE trading. "
                 "Ensure you have reviewed all parameters and risk settings."
             )
         else:
-            logger.info("[PRACTICE MODE] — All operations run against the OANDA practice environment.")
+            logger.info("[PRACTICE MODE] — Signals will fire but treat results as simulation.")
 
 
 def load_config() -> Config:
@@ -150,10 +140,8 @@ def load_config() -> Config:
             raise ValueError(f"TARGET_NET_PROFIT must be a float, got: '{target_profit_raw}'")
 
     return Config(
-        # OANDA
-        oanda_token=_require("OANDA_TOKEN"),
-        oanda_account_id=_require("OANDA_ACCOUNT_ID"),
-        oanda_env=_optional("OANDA_ENV", "practice").lower(),
+        # Twelve Data
+        twelvedata_api_key=_require("TWELVEDATA_API_KEY"),
         # Azure
         azure_storage_conn=_require("AZURE_STORAGE_CONN"),
         container_name=_optional("CONTAINER_NAME", "traderai"),
