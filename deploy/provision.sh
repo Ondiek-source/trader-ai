@@ -38,7 +38,8 @@ ACI_MEMORY=4
 
 # Windows VM (trading bot)
 VM_NAME="trader-bot-vm"
-VM_SIZE="Standard_B2ms"          # 2 vCPU, 8 GB RAM — comfortably above 6 GB min
+VM_SIZE="Standard_D2s_v3"         # 2 vCPU, 8 GB RAM — widely available
+VM_LOCATION="uksouth"            # VM in uksouth (B2ms not available in westeurope)
 VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
 # Strong random password
@@ -135,11 +136,11 @@ if [[ -n "$EXISTING_VM" ]]; then
     --query publicIps \
     --output tsv)
 else
-  echo "[4/6] Creating Windows VM $VM_NAME (this takes ~3 minutes)..."
+  echo "[4/6] Creating Windows VM $VM_NAME in $VM_LOCATION (this takes ~3 minutes)..."
   az vm create \
     --name "$VM_NAME" \
     --resource-group "$RESOURCE_GROUP" \
-    --location "$LOCATION" \
+    --location "$VM_LOCATION" \
     --image "$VM_IMAGE" \
     --size "$VM_SIZE" \
     --admin-username "$VM_ADMIN_USER" \
