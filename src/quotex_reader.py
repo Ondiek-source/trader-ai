@@ -1,3 +1,4 @@
+
 """
 quotex_reader.py — Reads closed trade results from Quotex account.
 
@@ -53,13 +54,9 @@ QUOTEX_LIB_AVAILABLE = False
 try:
     from quotexapi.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
     QUOTEX_LIB_AVAILABLE = True
-except ImportError:
-    pass
-    logger.warning(
-        {"event": "quotexapi_not_installed",
-            "install": "pip install git+https://github.com/cleitonleonel/pyquotex.git",
-            "impact": "Trade result reading disabled — results must be submitted manually via /result endpoint"}
-    )
+except Exception as _qx_err:
+    import sys as _sys
+    print(f"[quotex_reader] pyquotex import failed: {type(_qx_err).__name__}: {_qx_err}", file=_sys.stderr)
 
 
 class QuotexReader:
