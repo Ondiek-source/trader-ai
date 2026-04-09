@@ -33,6 +33,13 @@ source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── Sync GitHub secrets with latest ACR credentials ───────────────────────────
+echo "Syncing GitHub secrets from azure.env..."
+gh secret set ACR_LOGIN_SERVER --repo Ondiek-source/trader-ai --body "$ACR_LOGIN_SERVER"
+gh secret set ACR_USERNAME     --repo Ondiek-source/trader-ai --body "$ACR_USERNAME"
+gh secret set ACR_PASSWORD     --repo Ondiek-source/trader-ai --body "$ACR_PASSWORD"
+echo "      Done."
+
 # ── Ensure required providers are registered ──────────────────────────────────
 for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do
   STATE=$(az provider show --namespace "$provider" --query registrationState --output tsv 2>/dev/null || echo "NotRegistered")
