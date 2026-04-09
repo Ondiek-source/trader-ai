@@ -116,7 +116,9 @@ class QuotexReader:
                 self._connected = True
                 # Switch to correct account type
                 if hasattr(self._client, "change_account"):
-                    self._client.change_account(self._account_type)
+                    result = self._client.change_account(self._account_type)
+                    if asyncio.iscoroutine(result):
+                        await result
 
                 self._balance = await self._safe_get_balance()
                 self._prev_balance = self._balance
@@ -146,7 +148,9 @@ class QuotexReader:
         if self._client:
             try:
                 if hasattr(self._client, "close"):
-                    self._client.close()
+                    result = self._client.close()
+                    if asyncio.iscoroutine(result):
+                        await result
             except Exception:
                 pass
         self._connected = False

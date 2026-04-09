@@ -84,6 +84,16 @@ HEALTH_LOG_INTERVAL = 60          # seconds
 
 # ── Task supervisor ────────────────────────────────────────────────────────────
 
+async def _safe(coro, name: str) -> None:
+    """Run a one-shot coroutine, logging but never propagating exceptions."""
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error({"event": "task_failed", "task": name, "error": str(exc)}, exc_info=True)
+
+
 async def supervised(name: str, coro_factory) -> None:
     """Wrap a coroutine factory in infinite restart-on-error loop."""
     while True:
@@ -425,8 +435,8 @@ async def main() -> None:
     # signal_task waits for model_manager to have a trained model before firing.
     tasks = [
         asyncio.create_task(supervised("dashboard", lambda: run_dashboard(port=8080))),
-        asyncio.create_task(backfill_task(config, storage)),
-        asyncio.create_task(initial_training(config, storage, model_manager)),
+        asyncio.create_task(_safe(backfill_task(config, storage), "backfill")),
+        asyncio.create_task(_safe(initial_training(config, storage, model_manager), "initial_training")),
         asyncio.create_task(supervised("stream", lambda: stream_task(stream))),
         asyncio.create_task(
             supervised(
@@ -455,7 +465,7 @@ async def main() -> None:
     logger.info({"event": "all_tasks_started", "count": len(tasks)})
 
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
         logger.info({"event": "shutdown_requested"})
     finally:
