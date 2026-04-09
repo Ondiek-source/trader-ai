@@ -1,32 +1,27 @@
 """
-backfill.py — Dukascopy historical tick data downloader.
+backfill.py — Historical M1 bar downloader using Twelve Data REST API.
 
-Downloads .bi5 (LZMA-compressed binary) tick files from Dukascopy's public CDN
-and writes them to Azure Blob Storage via storage.StorageManager.
+Downloads 1-minute OHLCV bars via Twelve Data's /time_series endpoint
+(same API key used for live streaming). Converts bars to synthetic tick
+records compatible with the existing storage schema, then writes monthly
+parquet blobs.
 
-Dukascopy URL pattern:
-    https://datafeed.dukascopy.com/datafeed/{INSTRUMENT}/{YEAR}/{MONTH:02d}/{DAY:02d}/{HOUR:02d}h_ticks.bi5
+Strategy:
+  - One REST request = up to 5000 M1 bars (~3.5 days of market hours)
+  - Walks backwards from today, fetching 5000-bar chunks
+  - Stops when target coverage is reached or 2 years covered
+  - Free plan: 800 requests/day, 8/min → full 2yr backfill in ~150 requests
+  - Skips months already present in blob storage (idempotent)
 
-Binary record format (20 bytes per tick, big-endian):
-    int32  — milliseconds from hour start
-    int32  — ask * 100000
-    int32  — bid * 100000
-    float32 — ask volume
-    float32 — bid volume
-
-Skips already-downloaded blobs. Rate-limited to 0.1 s between requests.
+Rate limiting: 1 request per 8s to stay within 8 req/min free tier limit.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import lzma
-import struct
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Generator
 
 import pandas as pd
 import requests
@@ -35,228 +30,219 @@ logger = logging.getLogger(__name__)
 
 # ── Instrument name mapping ───────────────────────────────────────────────────
 
-PAIR_TO_DUKASCOPY: dict[str, str] = {
-    "EUR_USD": "EURUSD",
-    "GBP_USD": "GBPUSD",
-    "USD_JPY": "USDJPY",
-    "XAU_USD": "XAUUSD",
+PAIR_TO_TD: dict[str, str] = {
+    "EUR_USD": "EUR/USD",
+    "GBP_USD": "GBP/USD",
+    "USD_JPY": "USD/JPY",
+    "XAU_USD": "XAU/USD",
 }
 
-# Price divisors — most FX pairs use 100000; XAUUSD uses 1000
-PRICE_DIVISOR: dict[str, float] = {
-    "EURUSD": 100_000.0,
-    "GBPUSD": 100_000.0,
-    "USDJPY": 1_000.0,
-    "XAUUSD": 1_000.0,
-}
-
-CDN_BASE = "https://datafeed.dukascopy.com/datafeed"
-REQUEST_DELAY = 0.1  # seconds between HTTP requests
+TD_BASE = "https://api.twelvedata.com/time_series"
+CHUNK_SIZE = 5000       # bars per request (Twelve Data max)
+REQUEST_INTERVAL = 8.0  # seconds between requests (8/min = free tier limit)
+BACKFILL_YEARS = 2      # how many years to try to fetch
 
 
-def _build_url(instrument: str, year: int, month: int, day: int, hour: int) -> str:
-    # Dukascopy month is 0-indexed in URL
-    return f"{CDN_BASE}/{instrument}/{year}/{month - 1:02d}/{day:02d}/{hour:02d}h_ticks.bi5"
-
-
-def _decode_bi5(
-    data: bytes, instrument: str, year: int, month: int, day: int, hour: int
-) -> pd.DataFrame:
+def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
     """
-    Decompress and decode a .bi5 file into a DataFrame.
+    Convert M1 OHLCV bars to synthetic tick records.
 
-    Returns columns: timestamp (datetime64[ms] UTC), bid, ask, spread.
+    Each bar produces 4 synthetic ticks: open, high, low, close.
+    Timestamps are spaced 15s apart within the minute.
+    bid == ask (zero spread) for historical bars — features degrade
+    gracefully when spread is 0.
     """
-    try:
-        raw = lzma.decompress(data)
-    except lzma.LZMAError as exc:
-        logger.warning({"event": "bi5_decompress_failed", "error": str(exc)})
-        return pd.DataFrame()
+    rows = []
+    for bar in bars:
+        try:
+            # Twelve Data returns datetime as "YYYY-MM-DD HH:MM:SS"
+            dt = datetime.strptime(bar["datetime"], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+            o = float(bar["open"])
+            h = float(bar["high"])
+            l = float(bar["low"])
+            c = float(bar["close"])
+        except (KeyError, ValueError):
+            continue
 
-    record_size = 20  # 5 × 4 bytes
-    n_records = len(raw) // record_size
-    if n_records == 0:
-        return pd.DataFrame()
+        for offset_s, price in [(0, o), (15, h), (30, l), (45, c)]:
+            rows.append({
+                "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s), tz="UTC"),
+                "bid": price,
+                "ask": price,
+                "spread": 0.0,
+                "pair": pair,
+            })
 
-    divisor = PRICE_DIVISOR.get(instrument, 100_000.0)
-    hour_start = datetime(year, month, day, hour, 0, 0, tzinfo=timezone.utc)
-    hour_start_ms = int(hour_start.timestamp() * 1000)
-
-    records: list[dict] = []
-    for i in range(n_records):
-        offset = i * record_size
-        chunk = raw[offset : offset + record_size]
-        if len(chunk) < record_size:
-            break
-        ms_offset, ask_raw, bid_raw = struct.unpack(">iii", chunk[:12])
-        ask_vol, bid_vol = struct.unpack(">ff", chunk[12:])
-
-        ts_ms = hour_start_ms + ms_offset
-        ask = ask_raw / divisor
-        bid = bid_raw / divisor
-        spread = round(ask - bid, 6)
-
-        records.append(
-            {
-                "timestamp": pd.Timestamp(ts_ms, unit="ms", tz="UTC"),
-                "bid": bid,
-                "ask": ask,
-                "spread": spread,
-            }
-        )
-
-    if not records:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(records)
-    df = df[df["bid"] > 0].reset_index(drop=True)  # type: ignore[assignment]
-    return df  # type: ignore[return-value]
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "bid", "ask", "spread", "pair"])
+    df = pd.DataFrame(rows)
+    df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    return df
 
 
-def _hour_range(
-    start: date, end: date
-) -> Generator[tuple[int, int, int, int], None, None]:
-    """Yield (year, month, day, hour) for every hour in [start, end)."""
-    current = datetime(start.year, start.month, start.day, 0, 0, 0, tzinfo=timezone.utc)
-    end_dt = datetime(end.year, end.month, end.day, 0, 0, 0, tzinfo=timezone.utc)
-    while current < end_dt:
-        yield current.year, current.month, current.day, current.hour
-        current += timedelta(hours=1)
-
-
-def _blob_path_for_hour(pair: str, year: int, month: int) -> str:
-    return f"data/{pair}/{year}-{month:02d}.parquet"
-
-
-async def backfill_pair(
-    pair: str,
-    start_date: date,
-    end_date: date,
-    storage,
-    session: requests.Session | None = None,
-) -> None:
+async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACKFILL_YEARS) -> None:
     """
-    Download Dukascopy tick history for `pair` between start_date and end_date.
-    Writes to storage via storage.write_raw_parquet() per monthly partition.
-    Skips hours whose monthly blob already exists (coarse skip — hour-level skip not implemented
-    to avoid blob-per-hour overhead; rerunning is idempotent due to dedup in storage).
+    Fetch up to `years_back` years of M1 bars for `pair` via Twelve Data.
+    Writes monthly parquet blobs to storage, skipping months already present.
     """
-    instrument = PAIR_TO_DUKASCOPY.get(pair)
-    if not instrument:
+    symbol = PAIR_TO_TD.get(pair)
+    if not symbol:
         logger.error({"event": "backfill_unknown_pair", "pair": pair})
         return
 
-    own_session = session is None
-    if own_session:
-        session = requests.Session()
-        session.headers["User-Agent"] = "Mozilla/5.0 (TraderAI backfill)"
+    end_date = datetime.now(timezone.utc)
+    start_date = end_date - timedelta(days=365 * years_back)
 
-    logger.info(
-        {
-            "event": "backfill_start",
-            "pair": pair,
-            "instrument": instrument,
-            "start": str(start_date),
-            "end": str(end_date),
-        }
-    )
+    logger.info({
+        "event": "backfill_start",
+        "pair": pair,
+        "symbol": symbol,
+        "start": start_date.strftime("%Y-%m-%d"),
+        "end": end_date.strftime("%Y-%m-%d"),
+        "source": "TwelveData",
+    })
 
-    # Accumulate frames per month to batch writes
+    session = requests.Session()
+    session.headers["User-Agent"] = "TraderAI/1.0"
+
+    # Walk backwards in time, fetching chunks of CHUNK_SIZE bars
+    current_end = end_date
     monthly_frames: dict[tuple[int, int], list[pd.DataFrame]] = {}
+    total_bars = 0
+    request_count = 0
 
-    for year, month, day, hour in _hour_range(start_date, end_date):
-        if asyncio.get_event_loop().is_running():
-            await asyncio.sleep(0)  # yield control to event loop
+    while current_end > start_date:
+        current_start = max(current_end - timedelta(days=7), start_date)
 
-        url = _build_url(instrument, year, month, day, hour)
-        key = (year, month)
+        params = {
+            "symbol": symbol,
+            "interval": "1min",
+            "start_date": current_start.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": current_end.strftime("%Y-%m-%d %H:%M:%S"),
+            "outputsize": CHUNK_SIZE,
+            "apikey": api_key,
+            "timezone": "UTC",
+            "format": "JSON",
+        }
+
+        await asyncio.sleep(0)  # yield to event loop
 
         try:
-            resp = session.get(url, timeout=15)
-            if resp.status_code == 404:
-                # No data for this hour (holiday / off-hours) — skip silently
-                time.sleep(REQUEST_DELAY)
-                continue
+            t0 = time.monotonic()
+            resp = session.get(TD_BASE, params=params, timeout=30)
             resp.raise_for_status()
-            df = _decode_bi5(resp.content, instrument, year, month, day, hour)
-            if not df.empty:
-                df["pair"] = pair
-                monthly_frames.setdefault(key, []).append(df)
-                logger.debug(
-                    {
-                        "event": "hour_downloaded",
-                        "pair": pair,
-                        "year": year,
-                        "month": month,
-                        "day": day,
-                        "hour": hour,
-                        "rows": len(df),
-                    }
-                )
-            time.sleep(REQUEST_DELAY)
+            data = resp.json()
+            request_count += 1
+
+            if data.get("status") == "error":
+                code = data.get("code", "")
+                msg = data.get("message", "")
+                if "429" in str(code) or "rate" in msg.lower():
+                    logger.warning({"event": "backfill_rate_limited", "pair": pair, "waiting_s": 60})
+                    await asyncio.sleep(60)
+                    continue
+                logger.warning({"event": "backfill_api_error", "pair": pair, "code": code, "msg": msg})
+                break
+
+            bars = data.get("values", [])
+            if not bars:
+                # No data in this window — move further back
+                current_end = current_start - timedelta(minutes=1)
+                continue
+
+            tick_df = _bars_to_ticks(bars, pair)
+            if not tick_df.empty:
+                total_bars += len(bars)
+                # Group into monthly buckets
+                tick_df["_ym"] = tick_df["timestamp"].dt.to_period("M")
+                for period, grp in tick_df.groupby("_ym"):
+                    key = (period.year, period.month)
+                    monthly_frames.setdefault(key, []).append(grp.drop(columns=["_ym"]))
+
+            logger.info({
+                "event": "backfill_chunk",
+                "pair": pair,
+                "bars_fetched": len(bars),
+                "window_start": current_start.strftime("%Y-%m-%d"),
+                "window_end": current_end.strftime("%Y-%m-%d"),
+                "total_bars": total_bars,
+                "requests": request_count,
+            })
+
+            # Oldest bar in this chunk becomes the new end
+            oldest_dt_str = bars[-1]["datetime"]
+            current_end = datetime.strptime(oldest_dt_str, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            ) - timedelta(minutes=1)
+
+            # Rate-limit: sleep remainder of REQUEST_INTERVAL
+            elapsed = time.monotonic() - t0
+            wait = max(0.0, REQUEST_INTERVAL - elapsed)
+            if wait > 0:
+                await asyncio.sleep(wait)
 
         except requests.RequestException as exc:
-            logger.warning(
-                {
-                    "event": "backfill_request_failed",
-                    "url": url,
-                    "error": str(exc),
-                    "pair": pair,
-                }
-            )
-            time.sleep(REQUEST_DELAY * 5)  # back off on network error
+            logger.warning({"event": "backfill_request_failed", "pair": pair, "error": str(exc)})
+            await asyncio.sleep(30)
+            continue
 
-    # Write collected data to storage
-    for (year, month), frames in monthly_frames.items():
-        combined = pd.concat(frames, ignore_index=True)
+    session.close()
+
+    # Flush all monthly frames to blob storage
+    months_written = 0
+    for (year, month), frames in sorted(monthly_frames.items()):
+        blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
+        if storage.blob_exists(blob_path):
+            logger.debug({"event": "backfill_month_exists", "pair": pair, "year": year, "month": month})
+            continue
         combined = (
-            combined.sort_values("timestamp")
+            pd.concat(frames, ignore_index=True)
+            .sort_values("timestamp")
             .drop_duplicates("timestamp")
             .reset_index(drop=True)
         )
-        blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
         storage.write_raw_parquet(blob_path, combined)
-        logger.info(
-            {
-                "event": "backfill_month_written",
-                "pair": pair,
-                "year": year,
-                "month": month,
-                "rows": len(combined),
-                "blob_path": blob_path,
-            }
-        )
+        months_written += 1
+        logger.info({
+            "event": "backfill_month_written",
+            "pair": pair, "year": year, "month": month,
+            "rows": len(combined), "blob_path": blob_path,
+        })
 
-    if own_session:
-        session.close()
+    logger.info({
+        "event": "backfill_complete",
+        "pair": pair,
+        "total_bars": total_bars,
+        "requests": request_count,
+        "months_written": months_written,
+    })
 
-    logger.info({"event": "backfill_complete", "pair": pair})
 
+async def backfill_all(pairs: list[str], storage, years_back: int = BACKFILL_YEARS) -> None:
+    """Run backfill for all pairs (sequentially to respect rate limits)."""
+    # Get API key from storage config — passed via environment via config
+    api_key = _get_api_key()
+    if not api_key:
+        logger.error({"event": "backfill_no_api_key", "reason": "TWELVEDATA_API_KEY not set"})
+        return
 
-async def backfill_all(pairs: list[str], storage, years_back: int = 5) -> None:
-    """
-    Run backfill for all pairs concurrently (limited to 2 concurrent downloads
-    to avoid hammering Dukascopy's CDN).
+    for pair in pairs:
+        await backfill_pair(pair, api_key, storage, years_back)
 
-    Default: 5 years of data (2019-2024) for robust model training.
-    """
-    end = date.today()
-    start = date(end.year - years_back, 1, 1)  # Jan 1 of (today - N years)
-
-    semaphore = asyncio.Semaphore(2)
-
-    async def _guarded(pair: str) -> None:
-        async with semaphore:
-            await backfill_pair(pair, start, end, storage)
-
-    await asyncio.gather(*[_guarded(pair) for pair in pairs])
     logger.info({"event": "backfill_all_complete", "pairs": pairs})
+
+
+def _get_api_key() -> str:
+    """Read TWELVEDATA_API_KEY from environment."""
+    import os
+    return os.environ.get("TWELVEDATA_API_KEY", "")
 
 
 def check_data_coverage(pair: str, storage, min_days: int = 365) -> bool:
     """
-    Returns True if there is at least min_days of tick data in blob storage.
-    Default min_days=365 (1 year) — we want 5 years for robust training.
+    Returns True if there is at least min_days of data in blob storage.
     Used at startup to decide whether a backfill run is needed.
     """
     df = storage.read_ticks(pair, months=3)
