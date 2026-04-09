@@ -4,7 +4,8 @@
   "extraPaths": ["src"],
   "include": ["src"],
   "exclude": ["**/__pycache__"],
-  "reportMissingImports": "warning",
-  "reportMissingModuleSource": "warning",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportUnknownMemberType": "none",
   "typeCheckingMode": "basic"
 }

@@ -724,7 +724,7 @@ class ModelManager:
             return None
 
         # Align feature row to expected columns
-        feat = feature_row.reindex(self._feature_cols).fillna(0.0).values.reshape(1, -1)
+        feat = feature_row.reindex(self._feature_cols).fillna(0.0).to_numpy(dtype=np.float64).reshape(1, -1)
         feat_scaled = scaler.transform(feat)
 
         indicator_signals: dict[str, dict] = {}
@@ -781,7 +781,8 @@ class ModelManager:
             ind_feat_full = (
                 feature_row.reindex(self._feature_cols)
                 .fillna(0.0)
-                .values.reshape(1, -1)
+                .to_numpy(dtype=np.float64)
+                .reshape(1, -1)
             )
             ind_feat_scaled = scaler.transform(ind_feat_full)
 
