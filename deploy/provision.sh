@@ -101,7 +101,8 @@ else
     --sku Basic \
     --admin-enabled true \
     --output none
-  echo "      Created: $ACR_NAME"
+  echo "      Created: $ACR_NAME — waiting 30s for propagation..."
+  sleep 30
 fi
 
 ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" \
