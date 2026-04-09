@@ -562,4 +562,11 @@ class QuotexReader:
 # ── Async runner (supervised task entry point) ─────────────────────────────────
 
 async def run_quotex_reader(reader: QuotexReader) -> None:
-    await reader.poll_results()
+    if not QUOTEX_LIB_AVAILABLE:
+        # pyquotex not installed — sleep forever without reconnect spam
+        logger.info({"event": "quotex_reader_disabled", "reason": "pyquotex_not_installed",
+                     "note": "Quotex result reading unavailable. Results tracked via balance delta if credentials are set."})
+        while True:
+            await asyncio.sleep(3600)
+    else:
+        await reader.poll_results()
