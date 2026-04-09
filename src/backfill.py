@@ -82,6 +82,56 @@ def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
     return df
 
 
+def _flush_months(
+    monthly_frames: dict[tuple[int, int], list[pd.DataFrame]],
+    pair: str,
+    storage,
+    flush_before: tuple[int, int] | None,
+) -> int:
+    """
+    Write completed months to blob storage and remove them from monthly_frames.
+    If flush_before is None, flushes all months.
+    If flush_before is (year, month), flushes all months strictly before that key.
+    Returns the number of months written.
+    """
+    months_written = 0
+    # Walking backwards: months with a key > current position are fully fetched.
+    # flush_before=None means flush everything.
+    keys_to_flush = [
+        k for k in monthly_frames
+        if flush_before is None or k > flush_before
+    ]
+    logger.info({
+        "event": "backfill_flush_attempt",
+        "pair": pair,
+        "flush_before": str(flush_before),
+        "keys_in_buffer": [str(k) for k in sorted(monthly_frames.keys())],
+        "keys_to_flush": [str(k) for k in sorted(keys_to_flush)],
+    })
+    for key in sorted(keys_to_flush):
+        year, month = key
+        blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
+        if storage.blob_exists(blob_path):
+            logger.debug({"event": "backfill_month_exists", "pair": pair, "year": year, "month": month})
+            del monthly_frames[key]
+            continue
+        frames = monthly_frames.pop(key)
+        combined = (
+            pd.concat(frames, ignore_index=True)
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .reset_index(drop=True)
+        )
+        storage.write_raw_parquet(blob_path, combined)
+        months_written += 1
+        logger.info({
+            "event": "backfill_month_written",
+            "pair": pair, "year": year, "month": month,
+            "rows": len(combined), "blob_path": blob_path,
+        })
+    return months_written
+
+
 async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACKFILL_YEARS) -> None:
     """
     Fetch up to `years_back` years of M1 bars for `pair` via Twelve Data.
@@ -177,6 +227,11 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
                 tzinfo=timezone.utc
             ) - timedelta(minutes=1)
 
+            # Incrementally flush completed months (any month older than current_end)
+            # so training can see data without waiting for the full backfill to finish.
+            flush_before = (current_end.year, current_end.month)
+            _flush_months(monthly_frames, pair, storage, flush_before=flush_before)
+
             # Rate-limit: sleep remainder of REQUEST_INTERVAL
             elapsed = time.monotonic() - t0
             wait = max(0.0, REQUEST_INTERVAL - elapsed)
@@ -190,26 +245,8 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
 
     session.close()
 
-    # Flush all monthly frames to blob storage
-    months_written = 0
-    for (year, month), frames in sorted(monthly_frames.items()):
-        blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
-        if storage.blob_exists(blob_path):
-            logger.debug({"event": "backfill_month_exists", "pair": pair, "year": year, "month": month})
-            continue
-        combined = (
-            pd.concat(frames, ignore_index=True)
-            .sort_values("timestamp")
-            .drop_duplicates("timestamp")
-            .reset_index(drop=True)
-        )
-        storage.write_raw_parquet(blob_path, combined)
-        months_written += 1
-        logger.info({
-            "event": "backfill_month_written",
-            "pair": pair, "year": year, "month": month,
-            "rows": len(combined), "blob_path": blob_path,
-        })
+    # Flush any remaining monthly frames
+    months_written = _flush_months(monthly_frames, pair, storage, flush_before=None)
 
     logger.info({
         "event": "backfill_complete",
