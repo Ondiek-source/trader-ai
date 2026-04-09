@@ -26,6 +26,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
+
 # ── JSON structured logging ────────────────────────────────────────────────────
 
 class _JSONFormatter(logging.Formatter):
