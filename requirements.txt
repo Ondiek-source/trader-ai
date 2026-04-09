@@ -35,8 +35,8 @@ joblib>=1.3.0
 # -- Environment management ---------------------------------------------------
 python-dotenv>=1.0.0
 
-# -- Quotex unofficial API (for reading trade results) -------------------------
-git+https://github.com/cleitonleonel/pyquotex.git
+# -- Quotex unofficial API: installed separately in Dockerfile (git+ URL)
+# git+https://github.com/cleitonleonel/pyquotex.git
 
 # stdlib only (no extra packages needed):
 #   asyncio, threading, queue, logging, lzma, struct, json, hmac, hashlib

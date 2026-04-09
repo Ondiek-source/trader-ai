@@ -31,7 +31,9 @@ WORKDIR /app
 # ---------------------------------------------------------------------------
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir "git+https://github.com/cleitonleonel/pyquotex.git" || \
+    echo "WARNING: pyquotex install failed — Quotex result reading disabled"
 
 # ---------------------------------------------------------------------------
 # Copy application source

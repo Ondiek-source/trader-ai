@@ -54,6 +54,9 @@ def _configure_logging(level: str = "INFO") -> None:
     root.setLevel(getattr(logging, level, logging.INFO))
     root.handlers.clear()
     root.addHandler(handler)
+    # Suppress noisy Azure SDK HTTP transport logs (404s from blob existence checks)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+    logging.getLogger("azure").setLevel(logging.WARNING)
 
 
 # ── Import application modules ─────────────────────────────────────────────────
@@ -398,7 +401,7 @@ async def main() -> None:
         password=getattr(config, "quotex_password", ""),
         practice_mode=config.practice_mode,
     )
-    if getattr(config, "quotex_read_results", False):
+    if getattr(config, "quotex_email", "") and getattr(config, "quotex_password", ""):
         await quotex_reader.connect()
 
     discord = DiscordReporter(webhook_url=getattr(config, "discord_webhook_url", ""))
