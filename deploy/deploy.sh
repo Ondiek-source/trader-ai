@@ -97,12 +97,21 @@ az container create \
   --memory "$ACI_MEMORY" \
   --os-type Linux \
   --restart-policy Always \
+  --ports 8080 \
+  --ip-address Public \
   --environment-variables $ENV_ARGS \
   --output table
+
+DASHBOARD_IP=$(az container show \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query ipAddress.ip --output tsv 2>/dev/null || echo "pending")
 
 echo ""
 echo "=========================================="
 echo "  Deployment complete!"
+echo ""
+echo "  Dashboard: http://${DASHBOARD_IP}:8080"
 echo ""
 echo "  View live logs:"
 echo "  az container logs --name $ACI_NAME --resource-group $RESOURCE_GROUP --follow"

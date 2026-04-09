@@ -68,6 +68,7 @@ from signals import create_orchestrator
 from webhook import WebhookSender, WebhookError
 from quotex_reader import QuotexReader, run_quotex_reader
 from reporter import DiscordReporter, TelegramBot, scheduled_report_loop
+from dashboard import run_dashboard, status_store
 
 logger = logging.getLogger("main")
 
@@ -244,13 +245,14 @@ async def feedback_task(quotex_reader: QuotexReader, orchestrator, model_manager
         storage.append_result(result)
 
 
-async def health_task(stream: OANDAStream, orchestrator) -> None:
+async def health_task(stream: OANDAStream, orchestrator, quotex_reader: QuotexReader | None = None) -> None:
     """Log system health every HEALTH_LOG_INTERVAL seconds."""
     start_time = time.monotonic()
     while True:
         await asyncio.sleep(HEALTH_LOG_INTERVAL)
         uptime = int(time.monotonic() - start_time)
         status = orchestrator.get_status()
+        qhealth = quotex_reader.health() if quotex_reader else {"connected": False, "balance": 0.0}
         logger.info(
             {
                 "event": "health",
@@ -262,8 +264,16 @@ async def health_task(stream: OANDAStream, orchestrator) -> None:
                 "pending_signals": status.get("pending_signals"),
             }
         )
-        # Flush any pending storage retries
-        # (storage retry flush is best-effort here)
+        # Push live data to dashboard
+        status_store.update({
+            "stopped": status.get("stopped", False),
+            "martingale_streak": status.get("martingale_streak", 0),
+            "confidence_threshold": status.get("confidence_threshold", 0.65),
+            "pending_signals": status.get("pending_signals", 0),
+            "session": status.get("session", {}),
+            "stream": {"connected": True, "ticks_received": stream.ticks_received},
+            "quotex": qhealth,
+        })
 
 
 async def backfill_task(config, storage) -> None:
@@ -401,12 +411,19 @@ async def main() -> None:
             discord_reporter=discord,
         )
 
+    # ── Seed dashboard with config ────────────────────────────────────────────
+    status_store.update({
+        "practice_mode": config.practice_mode,
+        "confidence_threshold": config.confidence_threshold,
+    })
+
     # ── Backfill + initial training ───────────────────────────────────────────
     await backfill_task(config, storage)
     await initial_training(config, storage, model_manager)
 
     # ── Launch concurrent tasks ───────────────────────────────────────────────
     tasks = [
+        asyncio.create_task(supervised("dashboard", lambda: run_dashboard(port=8080))),
         asyncio.create_task(supervised("stream", lambda: stream_task(stream))),
         asyncio.create_task(
             supervised(
@@ -418,7 +435,7 @@ async def main() -> None:
         asyncio.create_task(
             supervised("feedback", lambda: feedback_task(quotex_reader, orchestrator, model_manager, storage))
         ),
-        asyncio.create_task(supervised("health", lambda: health_task(stream, orchestrator))),
+        asyncio.create_task(supervised("health", lambda: health_task(stream, orchestrator, quotex_reader))),
     ]
 
     if telegram:
