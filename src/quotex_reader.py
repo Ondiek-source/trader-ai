@@ -3,6 +3,7 @@
 quotex_reader.py — Reads closed trade results from Quotex account.
 
 Uses pyquotex (cleitonleonel/pyquotex) unofficial WebSocket API.
+Module: pyquotex.stable_api (NOT quotexapi — package renamed in v1.0)
 Install: pip install git+https://github.com/cleitonleonel/pyquotex.git
 
 CONFIRMED API (from pyquotex source / research):
@@ -52,7 +53,7 @@ QUOTEX_TO_DIRECTION = {"call": "UP", "put": "DOWN"}
 _QuotexClient: Any = None  # replaced at import time if library is present
 QUOTEX_LIB_AVAILABLE = False
 try:
-    from quotexapi.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
+    from pyquotex.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
     QUOTEX_LIB_AVAILABLE = True
 except Exception as _qx_err:
     import sys as _sys
