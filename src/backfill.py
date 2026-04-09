@@ -68,7 +68,7 @@ def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
 
         for offset_s, price in [(0, o), (15, h), (30, l), (45, c)]:
             rows.append({
-                "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s), tz="UTC"),
+                "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s)),
                 "bid": price,
                 "ask": price,
                 "spread": 0.0,
