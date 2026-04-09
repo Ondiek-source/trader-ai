@@ -43,13 +43,12 @@ STORAGE_CONN=$(az storage account show-connection-string \
 if [[ -n "$STORAGE_CONN" ]]; then
   _upsert_env() {
     local key="$1" val="$2" file="$3"
-    local escaped_val
-    escaped_val=$(printf '%s\n' "$val" | sed 's/[&/\]/\\&/g')
-    if grep -q "^${key}=" "$file" 2>/dev/null; then
-      sed -i "s|^${key}=.*|${key}=${escaped_val}|" "$file"
-    else
-      echo "${key}=${val}" >> "$file"
-    fi
+    # Use grep+append instead of sed to avoid truncation on long values
+    local tmp
+    tmp=$(mktemp)
+    grep -v "^${key}=" "$file" > "$tmp" 2>/dev/null || true
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    mv "$tmp" "$file"
   }
   _upsert_env "AZURE_STORAGE_CONN" "$STORAGE_CONN" "$APP_ENV"
   _upsert_env "CONTAINER_NAME" "$CONTAINER_NAME" "$APP_ENV"
