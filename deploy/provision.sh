@@ -18,7 +18,7 @@ set -euo pipefail
 
 # ── Configuration — ALL resources in uksouth ──────────────────────────────────
 RESOURCE_GROUP="rg-trader-ai"
-LOCATION="swedencentral"
+LOCATION="southafricanorth"
 
 CONTAINER_NAME="traderai"
 ACI_NAME="trader-ai-engine"
@@ -26,7 +26,7 @@ ACI_CPU=2
 ACI_MEMORY=4
 
 VM_NAME="trader-bot-vm"
-VM_LOCATION="southafricanorth"  # VM in South Africa — Quotex accessible from here
+VM_LOCATION="southafricanorth"  # same region — Quotex accessible from here
 VM_SIZE="Standard_D2s_v3"    # 2 vCPU, 8 GB RAM
 VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
 VM_ADMIN_USER="traderadmin"
