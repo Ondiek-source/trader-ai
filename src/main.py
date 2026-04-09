@@ -309,61 +309,58 @@ async def backfill_task(config, storage) -> None:
 
 async def initial_training(config, storage, model_manager) -> None:
     """
-    Load saved models or train fresh from 5 years of historical data.
-
-    If OPTIMIZE_EXPIRY=true, tests all expiry windows and logs the best one
-    so the user can configure their Quotex bot accordingly.
+    Load saved models or train fresh from historical data.
+    Retries every 5 minutes until all pairs have a trained model
+    (backfill may still be running when this first executes).
     """
     model_manager.load(MODEL_SAVE_PATH)
 
-    for pair in config.pairs:
-        # Read all available historical data (up to 60 months for 5-year coverage)
-        tick_df = storage.read_ticks(pair, months=60)
+    while True:
+        all_trained = True
 
-        # ── Expiry optimization (runs once per pair, results logged) ──────────
-        if config.optimize_expiry and not tick_df.empty:
-            logger.info({"event": "expiry_optimization_start", "pair": pair})
-            opt_result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda p=pair, df=tick_df: model_manager._expiry_optimizer.optimize(p, df),
-            )
-            best_expiry = opt_result.get("best_expiry", config.expiry_seconds)
-            logger.info(
-                {
-                    "event": "expiry_recommendation",
-                    "pair": pair,
-                    "recommended_expiry_seconds": best_expiry,
-                    "action_required": f"Set your Quotex bot expiry to {best_expiry}s for {pair}",
-                    "all_win_rates": opt_result.get("results", {}),
-                }
-            )
+        for pair in config.pairs:
+            # Read all available historical data (up to 60 months for 5-year coverage)
+            tick_df = storage.read_ticks(pair, months=60)
 
-        for expiry in [config.expiry_seconds]:
+            expiry = config.expiry_seconds
             models_exist = bool(model_manager._models.get(pair, {}).get(expiry))
             if models_exist:
-                logger.info({"event": "model_loaded", "pair": pair, "expiry": expiry})
+                logger.info({"event": "model_already_trained", "pair": pair, "expiry": expiry})
                 continue
 
-            logger.info(
-                {"event": "initial_training_start", "pair": pair, "expiry": expiry,
-                 "data_rows": len(tick_df)}
-            )
             if tick_df.empty:
-                logger.warning({"event": "no_data_for_training", "pair": pair})
+                logger.warning({"event": "no_data_for_training", "pair": pair, "retry_in_s": 300})
+                all_trained = False
                 continue
 
             feature_df = compute_features(tick_df, expiry)
-            if feature_df.empty:
-                logger.warning({"event": "no_features_for_training", "pair": pair})
+            if feature_df.empty or len(feature_df) < 200:
+                logger.warning({
+                    "event": "insufficient_data_for_training",
+                    "pair": pair,
+                    "bars": len(feature_df),
+                    "needed": 200,
+                    "retry_in_s": 300,
+                })
+                all_trained = False
                 continue
 
-            logger.info({"event": "training_on_bars", "pair": pair, "bars": len(feature_df)})
+            logger.info({"event": "initial_training_start", "pair": pair, "expiry": expiry,
+                         "bars": len(feature_df)})
             await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda p=pair, e=expiry, df=feature_df: model_manager.train(p, e, df),
             )
+            logger.info({"event": "initial_training_complete", "pair": pair})
 
-    model_manager.save(MODEL_SAVE_PATH)
+        model_manager.save(MODEL_SAVE_PATH)
+
+        if all_trained:
+            logger.info({"event": "all_models_trained"})
+            return  # done — signal_task retrain loop handles subsequent updates
+
+        # Not enough data yet — backfill still running; retry in 5 min
+        await asyncio.sleep(300)
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
