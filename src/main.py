@@ -417,13 +417,13 @@ async def main() -> None:
         "confidence_threshold": config.confidence_threshold,
     })
 
-    # ── Backfill + initial training ───────────────────────────────────────────
-    await backfill_task(config, storage)
-    await initial_training(config, storage, model_manager)
-
-    # ── Launch concurrent tasks ───────────────────────────────────────────────
+    # ── Launch all tasks immediately — dashboard is live on port 8080 ─────────
+    # Backfill and initial training run as background tasks so nothing blocks.
+    # signal_task waits for model_manager to have a trained model before firing.
     tasks = [
         asyncio.create_task(supervised("dashboard", lambda: run_dashboard(port=8080))),
+        asyncio.create_task(backfill_task(config, storage)),
+        asyncio.create_task(initial_training(config, storage, model_manager)),
         asyncio.create_task(supervised("stream", lambda: stream_task(stream))),
         asyncio.create_task(
             supervised(

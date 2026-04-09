@@ -33,6 +33,31 @@ source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── Sync .env with current storage connection string ──────────────────────────
+echo "Syncing .env with storage account $STORAGE_ACCOUNT..."
+STORAGE_CONN=$(az storage account show-connection-string \
+  --name "$STORAGE_ACCOUNT" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query connectionString --output tsv 2>/dev/null || true)
+
+if [[ -n "$STORAGE_CONN" ]]; then
+  _upsert_env() {
+    local key="$1" val="$2" file="$3"
+    local escaped_val
+    escaped_val=$(printf '%s\n' "$val" | sed 's/[&/\]/\\&/g')
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+      sed -i "s|^${key}=.*|${key}=${escaped_val}|" "$file"
+    else
+      echo "${key}=${val}" >> "$file"
+    fi
+  }
+  _upsert_env "AZURE_STORAGE_CONN" "$STORAGE_CONN" "$APP_ENV"
+  _upsert_env "CONTAINER_NAME" "$CONTAINER_NAME" "$APP_ENV"
+  echo "      .env updated."
+else
+  echo "WARNING: Could not retrieve storage connection string — .env unchanged."
+fi
+
 # ── Sync GitHub secrets with latest ACR credentials ───────────────────────────
 echo "Syncing GitHub secrets from azure.env..."
 gh secret set ACR_LOGIN_SERVER --repo Ondiek-source/trader-ai --body "$ACR_LOGIN_SERVER"
