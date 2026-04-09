@@ -444,7 +444,7 @@ async def main() -> None:
             asyncio.create_task(
                 supervised(
                     "scheduled_report",
-                    lambda: scheduled_report_loop(telegram, orchestrator, interval_minutes=60),
+                    lambda: scheduled_report_loop(telegram),
                 )
             )
         )
