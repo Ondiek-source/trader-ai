@@ -40,7 +40,7 @@ PAIR_TO_TD: dict[str, str] = {
 TD_BASE = "https://api.twelvedata.com/time_series"
 CHUNK_SIZE = 5000       # bars per request (Twelve Data max)
 REQUEST_INTERVAL = 8.0  # seconds between requests (8/min = free tier limit)
-BACKFILL_YEARS = 2      # how many years to try to fetch
+BACKFILL_YEARS = 5      # how many years to try to fetch
 
 
 def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:

@@ -315,52 +315,62 @@ async def initial_training(config, storage, model_manager) -> None:
     """
     model_manager.load(MODEL_SAVE_PATH)
 
+    # Wait until backfill has written sufficient data before training.
+    # Check every 2 minutes. Train once coverage reaches ≥ 365 days per pair.
     while True:
         all_trained = True
 
         for pair in config.pairs:
-            # Read all available historical data (up to 60 months for 5-year coverage)
-            tick_df = storage.read_ticks(pair, months=60)
-
             expiry = config.expiry_seconds
             models_exist = bool(model_manager._models.get(pair, {}).get(expiry))
             if models_exist:
-                logger.info({"event": "model_already_trained", "pair": pair, "expiry": expiry})
+                logger.info({"event": "model_already_trained", "pair": pair})
                 continue
 
+            # Read all available data (up to 60 months)
+            tick_df = storage.read_ticks(pair, months=60)
+
             if tick_df.empty:
-                logger.warning({"event": "no_data_for_training", "pair": pair, "retry_in_s": 300})
+                logger.info({"event": "training_waiting_for_data", "pair": pair, "retry_in_s": 120})
+                all_trained = False
+                continue
+
+            # Check coverage span
+            tick_df["timestamp"] = pd.to_datetime(tick_df["timestamp"], utc=True)
+            span_days = (tick_df["timestamp"].max() - tick_df["timestamp"].min()).days
+
+            if span_days < 365:
+                logger.info({
+                    "event": "training_waiting_for_coverage",
+                    "pair": pair,
+                    "span_days": span_days,
+                    "target_days": 365,
+                    "retry_in_s": 120,
+                })
                 all_trained = False
                 continue
 
             feature_df = compute_features(tick_df, expiry)
             if feature_df.empty or len(feature_df) < 200:
-                logger.warning({
-                    "event": "insufficient_data_for_training",
-                    "pair": pair,
-                    "bars": len(feature_df),
-                    "needed": 200,
-                    "retry_in_s": 300,
-                })
+                logger.warning({"event": "insufficient_features", "pair": pair, "bars": len(feature_df)})
                 all_trained = False
                 continue
 
-            logger.info({"event": "initial_training_start", "pair": pair, "expiry": expiry,
-                         "bars": len(feature_df)})
+            logger.info({"event": "initial_training_start", "pair": pair,
+                         "expiry": expiry, "bars": len(feature_df), "span_days": span_days})
             await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda p=pair, e=expiry, df=feature_df: model_manager.train(p, e, df),
             )
-            logger.info({"event": "initial_training_complete", "pair": pair})
+            logger.info({"event": "initial_training_complete", "pair": pair, "bars": len(feature_df)})
 
         model_manager.save(MODEL_SAVE_PATH)
 
         if all_trained:
             logger.info({"event": "all_models_trained"})
-            return  # done — signal_task retrain loop handles subsequent updates
+            return  # signal_task retrain loop handles ongoing updates
 
-        # Not enough data yet — backfill still running; retry in 5 min
-        await asyncio.sleep(300)
+        await asyncio.sleep(120)  # check again in 2 minutes
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
