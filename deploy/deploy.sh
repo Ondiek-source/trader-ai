@@ -198,12 +198,7 @@ az container create \
   --ports 8080 \
   --ip-address Public \
   --environment-variables $ENV_ARGS \
-  --memory-limit "$ACI_MEMORY"\
-  --cpu-limit "$ACI_CPU"\
-  --log-analytics-workspace "$LOG_ANALYTICS_WORKSPACE"\
-  --log-analytics-workspace-key "$LOG_ANALYTICS_KEY"\
   --dns-name-label "trader-ai-bot"\
-  --environment-variables-file "$APP_ENV"\
   --output table
 
 DASHBOARD_IP=$(az container show \

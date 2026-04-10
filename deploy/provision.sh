@@ -101,8 +101,16 @@ else
     --sku Basic \
     --admin-enabled true \
     --output none
-  echo "      Created: $ACR_NAME — waiting 30s for propagation..."
-  sleep 30
+  echo "      Created: $ACR_NAME — waiting for propagation..."
+  # Wait up to 2 minutes for ACR to be ready
+  for i in {1..12}; do
+    if az acr show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" &>/dev/null; then
+      echo "      ACR is ready after $(($i * 10)) seconds"
+      break
+    fi
+    echo "      Waiting... ($(($i * 10))s elapsed)"
+    sleep 10
+  done
 fi
 
 ACR_LOGIN_SERVER=$(az acr show --name "$ACR_NAME" \
@@ -159,6 +167,11 @@ echo "      Registry: $ACR_LOGIN_SERVER"
 # echo "      Done."
 
 # ── 6. Write azure.env ────────────────────────────────────────────────────────
+# VM_NAME=$VM_NAME
+# VM_PUBLIC_IP=${VM_PUBLIC_IP:-unknown}
+# VM_ADMIN_USER=$VM_ADMIN_USER
+# VM_ADMIN_PASS=$VM_ADMIN_PASS
+# If you need to RDP into the VM, these credentials are required. Save them securely.
 echo "[6/6] Writing deploy/azure.env..."
 SCRIPT_DIR_ABS="$(cd "$(dirname "$0")" && pwd)"
 cat > "$SCRIPT_DIR_ABS/azure.env" <<EOF
@@ -174,10 +187,6 @@ ACR_PASSWORD=$ACR_PASSWORD
 ACI_NAME=$ACI_NAME
 ACI_CPU=$ACI_CPU
 ACI_MEMORY=$ACI_MEMORY
-VM_NAME=$VM_NAME
-VM_PUBLIC_IP=${VM_PUBLIC_IP:-unknown}
-VM_ADMIN_USER=$VM_ADMIN_USER
-VM_ADMIN_PASS=$VM_ADMIN_PASS
 EOF
 echo "      Done."
 
@@ -208,12 +217,22 @@ echo "      .env updated (AZURE_STORAGE_CONN, CONTAINER_NAME)."
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=========================================="
-echo "  Windows VM — RDP credentials:"
-echo "  IP   : ${VM_PUBLIC_IP:-see Azure portal}"
-echo "  User : $VM_ADMIN_USER"
-echo "  Pass : $VM_ADMIN_PASS"
-echo "  SAVE THESE — they won't be shown again."
+echo "  Provisioning complete!"
+echo "  Resource Group: $RESOURCE_GROUP"
+echo "  Location: $LOCATION"
+echo "  Storage: $STORAGE_ACCOUNT"
+echo "  Container Registry: $ACR_LOGIN_SERVER"
+echo ""
+echo "  Next: run bash deploy/deploy.sh"
 echo "=========================================="
+echo ""
+echo "=========================================="
+# echo "  Windows VM — RDP credentials:"
+# echo "  IP   : ${VM_PUBLIC_IP:-see Azure portal}"
+# echo "  User : $VM_ADMIN_USER"
+# echo "  Pass : $VM_ADMIN_PASS"
+# echo "  SAVE THESE — they won't be shown again."
+# echo "=========================================="
 echo ""
 echo "  Next: run bash deploy/deploy.sh"
 echo "=========================================="
