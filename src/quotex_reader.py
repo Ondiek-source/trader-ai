@@ -1,4 +1,3 @@
-
 """
 quotex_reader.py — Reads closed trade results from Quotex account.
 
@@ -54,10 +53,15 @@ _QuotexClient: Any = None  # replaced at import time if library is present
 QUOTEX_LIB_AVAILABLE = False
 try:
     from pyquotex.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
+
     QUOTEX_LIB_AVAILABLE = True
 except Exception as _qx_err:
     import sys as _sys
-    print(f"[quotex_reader] pyquotex import failed: {type(_qx_err).__name__}: {_qx_err}", file=_sys.stderr)
+
+    print(
+        f"[quotex_reader] pyquotex import failed: {type(_qx_err).__name__}: {_qx_err}",
+        file=_sys.stderr,
+    )
 
 
 class QuotexReader:
@@ -71,10 +75,10 @@ class QuotexReader:
     Both are correlated against pending signals using expiry time window.
     """
 
-    RESULT_BUFFER_SECONDS = 2     # wait after signal expiry before checking
-    BALANCE_POLL_INTERVAL = 1.5   # seconds between balance checks
-    MAX_WS_MESSAGES = 300         # ring buffer size for raw WS messages
-    MAX_RECONNECT_DELAY = 120     # seconds
+    RESULT_BUFFER_SECONDS = 2  # wait after signal expiry before checking
+    BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
+    MAX_WS_MESSAGES = 300  # ring buffer size for raw WS messages
+    MAX_RECONNECT_DELAY = 120  # seconds
 
     def __init__(self, email: str, password: str, practice_mode: bool = True) -> None:
         self._email = email
@@ -124,13 +128,15 @@ class QuotexReader:
                 self._prev_balance = self._balance
 
                 mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE ⚠️]"
-                logger.info({
-                    "event": "quotex_connected",
-                    "mode": mode_tag,
-                    "account_type": self._account_type,
-                    "balance": self._balance,
-                    "reason": str(reason),
-                })
+                logger.info(
+                    {
+                        "event": "quotex_connected",
+                        "mode": mode_tag,
+                        "account_type": self._account_type,
+                        "balance": self._balance,
+                        "reason": str(reason),
+                    }
+                )
 
                 # Log all available client methods (aids schema discovery)
                 self._introspect_client()
@@ -159,24 +165,32 @@ class QuotexReader:
         """Log all public client methods — helps discover history/result APIs."""
         try:
             methods = [m for m in dir(self._client) if not m.startswith("_")]
-            logger.info({
-                "event": "quotex_client_methods_discovered",
-                "methods": methods,
-                "note": "Look for get_history / get_closed_deals / get_result / closed_trades in this list",
-            })
+            logger.info(
+                {
+                    "event": "quotex_client_methods_discovered",
+                    "methods": methods,
+                    "note": "Look for get_history / get_closed_deals / get_result / closed_trades in this list",
+                }
+            )
             # Also log api sub-object if it exists
             if hasattr(self._client, "api"):
-                api_methods = [m for m in dir(self._client.api) if not m.startswith("_")]
-                logger.info({
-                    "event": "quotex_api_object_methods",
-                    "api_methods": api_methods,
-                })
+                api_methods = [
+                    m for m in dir(self._client.api) if not m.startswith("_")
+                ]
+                logger.info(
+                    {
+                        "event": "quotex_api_object_methods",
+                        "api_methods": api_methods,
+                    }
+                )
         except Exception as exc:
             logger.debug({"event": "introspect_failed", "error": str(exc)})
 
     # ── Signal registration ────────────────────────────────────────────────────
 
-    def register_pending(self, signal_id: str, signal: dict, expiry_time: datetime) -> None:
+    def register_pending(
+        self, signal_id: str, signal: dict, expiry_time: datetime
+    ) -> None:
         """Register a signal that needs result matching at expiry_time."""
         self._pending[signal_id] = {
             "signal": signal,
@@ -185,12 +199,14 @@ class QuotexReader:
             "attempts": 0,
             "resolved": False,
         }
-        logger.debug({
-            "event": "pending_registered",
-            "signal_id": signal_id,
-            "pair": signal.get("pair"),
-            "expiry_at": expiry_time.isoformat(),
-        })
+        logger.debug(
+            {
+                "event": "pending_registered",
+                "signal_id": signal_id,
+                "pair": signal.get("pair"),
+                "expiry_at": expiry_time.isoformat(),
+            }
+        )
 
     # ── Main poll loop ─────────────────────────────────────────────────────────
 
@@ -212,9 +228,11 @@ class QuotexReader:
 
             now = datetime.now(timezone.utc)
             due = {
-                sid: data for sid, data in self._pending.items()
+                sid: data
+                for sid, data in self._pending.items()
                 if not data["resolved"]
-                and now >= data["expiry_time"] + timedelta(seconds=self.RESULT_BUFFER_SECONDS)
+                and now
+                >= data["expiry_time"] + timedelta(seconds=self.RESULT_BUFFER_SECONDS)
                 and data["attempts"] < 3
             }
 
@@ -226,19 +244,21 @@ class QuotexReader:
                     await self._result_queue.put(result)
                 elif data["attempts"] >= 3:
                     data["resolved"] = True
-                    logger.warning({
-                        "event": "result_unresolved",
-                        "signal_id": signal_id,
-                        "pair": data["signal"].get("pair"),
-                        "message": "No matching trade found after 3 attempts. "
-                                    "Review [QUOTEX_RAW_MSG] logs to improve _parse_ws_message().",
-                    })
+                    logger.warning(
+                        {
+                            "event": "result_unresolved",
+                            "signal_id": signal_id,
+                            "pair": data["signal"].get("pair"),
+                            "message": "No matching trade found after 3 attempts. "
+                            "Review [QUOTEX_RAW_MSG] logs to improve _parse_ws_message().",
+                        }
+                    )
 
             # Clean up resolved entries older than 60s
             self._pending = {
-                sid: d for sid, d in self._pending.items()
-                if not d["resolved"]
-                or (now - d["expiry_time"]).total_seconds() < 60
+                sid: d
+                for sid, d in self._pending.items()
+                if not d["resolved"] or (now - d["expiry_time"]).total_seconds() < 60
             }
 
             await asyncio.sleep(0.5)
@@ -247,19 +267,26 @@ class QuotexReader:
 
     async def _balance_monitor(self) -> None:
         """Continuously polls balance to detect trade closes via delta."""
+        # First, set initial balance without logging a delta
+        if self._balance == 0.0:
+            self._balance = await self._safe_get_balance()
+            self._prev_balance = self._balance
+
         while self._connected:
             await asyncio.sleep(self.BALANCE_POLL_INTERVAL)
             try:
                 new_balance = await self._safe_get_balance()
                 if abs(new_balance - self._balance) > 0.001:
                     delta = new_balance - self._balance
-                    logger.info({
-                        "event": "balance_delta_detected",
-                        "prev": self._balance,
-                        "new": new_balance,
-                        "delta": round(delta, 4),
-                        "likely_outcome": "win" if delta > 0 else "loss",
-                    })
+                    logger.info(
+                        {
+                            "event": "balance_delta_detected",
+                            "prev": self._balance,
+                            "new": new_balance,
+                            "delta": round(delta, 4),
+                            "likely_outcome": "win" if delta > 0 else "loss",
+                        }
+                    )
                     self._balance = new_balance
             except Exception as exc:
                 logger.debug({"event": "balance_poll_error", "error": str(exc)})
@@ -301,21 +328,27 @@ class QuotexReader:
         delta = current - balance_before
         if abs(delta) > 0.001:
             outcome = "win" if delta > 0 else "loss"
-            logger.info({
-                "event": "result_from_balance_delta",
-                "signal_id": signal_id,
-                "pair": pair,
-                "delta": round(delta, 4),
-                "outcome": outcome,
-                "note": "Balance delta match — pair/direction inferred, not confirmed by Quotex",
-            })
+            logger.info(
+                {
+                    "event": "result_from_balance_delta",
+                    "signal_id": signal_id,
+                    "pair": pair,
+                    "delta": round(delta, 4),
+                    "outcome": outcome,
+                    "note": "Balance delta match — pair/direction inferred, not confirmed by Quotex",
+                }
+            )
             return self._make_result(signal_id, pair, direction, outcome, abs(delta))
 
         return None
 
-    def _scan_ws_messages(self, pair: str, direction: str, expiry_time: datetime) -> dict | None:
+    def _scan_ws_messages(
+        self, pair: str, direction: str, expiry_time: datetime
+    ) -> dict | None:
         """Scan buffered WebSocket messages for a trade result matching this signal."""
-        asset_candidates = {a.upper() for a in PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])}
+        asset_candidates = {
+            a.upper() for a in PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])
+        }
         quotex_direction = DIRECTION_TO_QUOTEX.get(direction, "call")
         window_start = expiry_time - timedelta(seconds=30)
         window_end = expiry_time + timedelta(seconds=10)
@@ -328,8 +361,10 @@ class QuotexReader:
 
                 # Check asset match
                 msg_asset = str(parsed.get("asset", "")).upper()
-                if not any(candidate in msg_asset or msg_asset in candidate
-                            for candidate in asset_candidates):
+                if not any(
+                    candidate in msg_asset or msg_asset in candidate
+                    for candidate in asset_candidates
+                ):
                     continue
 
                 # Check direction match (optional — match on asset+time if direction unknown)
@@ -362,20 +397,24 @@ class QuotexReader:
 
         # Log raw for schema discovery (first 50 unique message types)
         msg_type = msg.get("type", msg.get("name", msg.get("status", "unknown")))
-        logger.debug({
-            "event": "[QUOTEX_RAW_MSG]",
-            "type": msg_type,
-            "keys": list(msg.keys())[:15],
-            "preview": str(msg)[:300],
-        })
+        logger.debug(
+            {
+                "event": "[QUOTEX_RAW_MSG]",
+                "type": msg_type,
+                "keys": list(msg.keys())[:15],
+                "preview": str(msg)[:300],
+            }
+        )
 
         # Known field patterns (update these as raw logs reveal actual schema):
         result_candidates = {
-            "profit":      msg.get("profit", msg.get("win_amount", msg.get("payout"))),
-            "result":      msg.get("result", msg.get("status", msg.get("outcome"))),
-            "asset":       msg.get("asset", msg.get("symbol", msg.get("active"))),
-            "direction":   msg.get("direction", msg.get("call_put", msg.get("option_type"))),
-            "close_time":  None,
+            "profit": msg.get("profit", msg.get("win_amount", msg.get("payout"))),
+            "result": msg.get("result", msg.get("status", msg.get("outcome"))),
+            "asset": msg.get("asset", msg.get("symbol", msg.get("active"))),
+            "direction": msg.get(
+                "direction", msg.get("call_put", msg.get("option_type"))
+            ),
+            "close_time": None,
         }
 
         # Parse close time
@@ -446,13 +485,15 @@ class QuotexReader:
                             raw = await asyncio.wait_for(
                                 method(*call_args), timeout=8.0
                             )
-                            logger.info({
-                                "event": "[QUOTEX_RAW_RESPONSE - history method]",
-                                "method": method_name,
-                                "args": call_args,
-                                "raw_type": type(raw).__name__,
-                                "raw_preview": str(raw)[:600],
-                            })
+                            logger.info(
+                                {
+                                    "event": "[QUOTEX_RAW_RESPONSE - history method]",
+                                    "method": method_name,
+                                    "args": call_args,
+                                    "raw_type": type(raw).__name__,
+                                    "raw_preview": str(raw)[:600],
+                                }
+                            )
                             # Try to extract result from response
                             result = self._extract_from_history(raw, pair, direction)
                             if result:
@@ -461,13 +502,17 @@ class QuotexReader:
                         except Exception:
                             continue
                 except Exception as exc:
-                    logger.debug({"event": "history_method_failed", "method": method_name, "error": str(exc)})
+                    logger.debug(
+                        {
+                            "event": "history_method_failed",
+                            "method": method_name,
+                            "error": str(exc),
+                        }
+                    )
 
         return None
 
-    def _extract_from_history(
-        self, raw: Any, pair: str, direction: str
-    ) -> dict | None:
+    def _extract_from_history(self, raw: Any, pair: str, direction: str) -> dict | None:
         """Extract a matching trade from a history response of unknown schema."""
         if raw is None:
             return None
@@ -478,8 +523,12 @@ class QuotexReader:
             if not isinstance(item, dict):
                 return None
             # Asset check
-            item_asset = str(item.get("asset", item.get("symbol", item.get("active", "")))).upper()
-            if asset_candidates and not any(c in item_asset or item_asset in c for c in asset_candidates):
+            item_asset = str(
+                item.get("asset", item.get("symbol", item.get("active", "")))
+            ).upper()
+            if asset_candidates and not any(
+                c in item_asset or item_asset in c for c in asset_candidates
+            ):
                 return None
             # Find profit/result
             profit = None
@@ -536,7 +585,7 @@ class QuotexReader:
         """Called by WebSocket hook to buffer messages for introspection."""
         self._ws_messages.append(msg)
         if len(self._ws_messages) > self.MAX_WS_MESSAGES:
-            self._ws_messages = self._ws_messages[-self.MAX_WS_MESSAGES:]
+            self._ws_messages = self._ws_messages[-self.MAX_WS_MESSAGES :]
 
     def health(self) -> dict:
         return {
@@ -563,11 +612,17 @@ class QuotexReader:
 
 # ── Async runner (supervised task entry point) ─────────────────────────────────
 
+
 async def run_quotex_reader(reader: QuotexReader) -> None:
     if not QUOTEX_LIB_AVAILABLE:
         # pyquotex not installed — sleep forever without reconnect spam
-        logger.info({"event": "quotex_reader_disabled", "reason": "pyquotex_not_installed",
-                     "note": "Quotex result reading unavailable. Results tracked via balance delta if credentials are set."})
+        logger.info(
+            {
+                "event": "quotex_reader_disabled",
+                "reason": "pyquotex_not_installed",
+                "note": "Quotex result reading unavailable. Results tracked via balance delta if credentials are set.",
+            }
+        )
         while True:
             await asyncio.sleep(3600)
     else:

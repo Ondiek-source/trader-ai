@@ -33,12 +33,12 @@ SESSION_BOUNDS = {
 }
 
 if MEMORY_SAVER_MODE:
-    MOMENTUM_WINDOWS_S = [5, 30, 60]      # Reduced
-    TICK_VELOCITY_WINDOWS_S = [10, 30]    # Reduced
+    MOMENTUM_WINDOWS_S = [5, 30, 60]  # Reduced
+    TICK_VELOCITY_WINDOWS_S = [10, 30]  # Reduced
 else:
-    MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]   # Full
-    TICK_VELOCITY_WINDOWS_S = [5, 10, 30]     # Full
-    
+    MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]  # Full
+    TICK_VELOCITY_WINDOWS_S = [5, 10, 30]  # Full
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -119,7 +119,9 @@ def compute_features(tick_df: pd.DataFrame, expiry_seconds: int = 60) -> pd.Data
     bars = bars.reset_index()
     bars = bars.dropna(subset=["label"]).copy()
     bars["label"] = bars["label"].astype(int)
-    bars = bars.astype({col: 'float32' for col in bars.select_dtypes(include=['float64']).columns})
+    bars = bars.astype(
+        {col: "float32" for col in bars.select_dtypes(include=["float64"]).columns}
+    )
     return bars
 
 
@@ -356,20 +358,36 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
     """
     Aggregate tick-level features (velocity, spread z-score, momentum)
     and join them to the 1-min bar DataFrame.
+
+    Dynamically adjusts columns based on MEMORY_SAVER_MODE.
     """
     if tick_df.empty:
-        for col in [
-            "spread_zscore",
-            "spread_mean_reversion",
-            "tick_velocity_5s",
-            "tick_velocity_10s",
-            "tick_velocity_30s",
-            "price_momentum_1s",
-            "price_momentum_5s",
-            "price_momentum_15s",
-            "price_momentum_30s",
-            "price_momentum_60s",
-        ]:
+        # Define columns based on memory saver mode
+        if MEMORY_SAVER_MODE:
+            tick_feature_cols = [
+                "spread_zscore",
+                "spread_mean_reversion",
+                "tick_velocity_10s",
+                "tick_velocity_30s",
+                "price_momentum_5s",
+                "price_momentum_30s",
+                "price_momentum_60s",
+            ]
+        else:
+            tick_feature_cols = [
+                "spread_zscore",
+                "spread_mean_reversion",
+                "tick_velocity_5s",
+                "tick_velocity_10s",
+                "tick_velocity_30s",
+                "price_momentum_1s",
+                "price_momentum_5s",
+                "price_momentum_15s",
+                "price_momentum_30s",
+                "price_momentum_60s",
+            ]
+
+        for col in tick_feature_cols:
             bars[col] = 0.0
         return bars
 
@@ -386,54 +404,53 @@ def _add_tick_features(bars: pd.DataFrame, tick_df: pd.DataFrame) -> pd.DataFram
     tk["spread_mean_reversion"] = tk["spread"] - spread_roll.mean()
 
     # Tick velocity: count ticks per second in rolling windows
-    # Resample to 1-second count, then take rolling sums
     tick_count_1s = tk["mid"].resample("1s").count()
+
+    if MEMORY_SAVER_MODE:
+        TICK_VELOCITY_WINDOWS_S = [10, 30]
+        MOMENTUM_WINDOWS_S = [5, 30, 60]
+    else:
+        TICK_VELOCITY_WINDOWS_S = [5, 10, 30]
+        MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]
+
     for w in TICK_VELOCITY_WINDOWS_S:
         col = f"tick_velocity_{w}s"
         velocity = tick_count_1s.rolling(w, min_periods=1).sum()
-        tk[col] = velocity.reindex(tk.index, method="ffill").fillna(0)  # type: ignore[call-arg]
+        tk[col] = velocity.reindex(tk.index, method="ffill").fillna(0)
 
     # Price momentum over multiple windows
     for w in MOMENTUM_WINDOWS_S:
         col = f"price_momentum_{w}s"
         tk[col] = tk["mid"].diff(periods=max(1, w))
 
-    # Resample all tick features to 1-min (use last value per bar)
-    tick_features_1min = (
-        tk[
-            [
-                "spread_zscore",
-                "spread_mean_reversion",
-                "tick_velocity_5s",
-                "tick_velocity_10s",
-                "tick_velocity_30s",
-                "price_momentum_1s",
-                "price_momentum_5s",
-                "price_momentum_15s",
-                "price_momentum_30s",
-                "price_momentum_60s",
-            ]
+    # Build list of columns to resample
+    if MEMORY_SAVER_MODE:
+        feature_cols = [
+            "spread_zscore",
+            "spread_mean_reversion",
+            "tick_velocity_10s",
+            "tick_velocity_30s",
+            "price_momentum_5s",
+            "price_momentum_30s",
+            "price_momentum_60s",
         ]
-        .resample("1min")
-        .last()
-    )
+    else:
+        feature_cols = [
+            "spread_zscore",
+            "spread_mean_reversion",
+            "tick_velocity_5s",
+            "tick_velocity_10s",
+            "tick_velocity_30s",
+            "price_momentum_1s",
+            "price_momentum_5s",
+            "price_momentum_15s",
+            "price_momentum_30s",
+            "price_momentum_60s",
+        ]
 
+    tick_features_1min = tk[feature_cols].resample("1min").last()
     bars = bars.join(tick_features_1min, how="left")
-
-    # Fill any NaNs from join
-    tick_feature_cols = [
-        "spread_zscore",
-        "spread_mean_reversion",
-        "tick_velocity_5s",
-        "tick_velocity_10s",
-        "tick_velocity_30s",
-        "price_momentum_1s",
-        "price_momentum_5s",
-        "price_momentum_15s",
-        "price_momentum_30s",
-        "price_momentum_60s",
-    ]
-    bars[tick_feature_cols] = bars[tick_feature_cols].fillna(0.0)
+    bars[feature_cols] = bars[feature_cols].fillna(0.0)
     return bars
 
 

@@ -9,7 +9,7 @@
 #   bash deploy/healthcheck.sh
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AZURE_ENV="$SCRIPT_DIR/azure.env"
@@ -79,7 +79,7 @@ fi
 
 # ── 3. Historical data downloaded ─────────────────────────────────────────────
 echo "[ 3/8 ] Historical data download..."
-if echo "$LOGS" | grep -q "backfill_complete\|backfill_skipped"; then
+if echo "$LOGS" | grep -q "backfill_complete\|backfill_skipped" 2>/dev/null; then
   check "Historical data downloaded (5 years)" "pass"
 elif echo "$LOGS" | grep -q "backfill_starting"; then
   check "Historical data downloading" "warn" "Still in progress — wait 20-30 minutes and re-run this script"
@@ -90,7 +90,7 @@ fi
 # ── 4. Models trained ─────────────────────────────────────────────────────────
 echo "[ 4/8 ] Model training..."
 TRAINED_COUNT=$(echo "$LOGS" | grep -c "_trained" 2>/dev/null || echo "0")
-if [[ "$TRAINED_COUNT" -ge 3 ]]; then
+if [ "${TRAINED_COUNT:-0}" -ge 3 ] 2>/dev/null; then
   check "Models trained ($TRAINED_COUNT models)" "pass"
 elif [[ "$TRAINED_COUNT" -gt 0 ]]; then
   check "Models partially trained ($TRAINED_COUNT models)" "warn" "Training still in progress"
