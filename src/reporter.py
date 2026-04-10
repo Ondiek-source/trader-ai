@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import aiohttp
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 import requests
 
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── HTML report generator ─────────────────────────────────────────────────────
+
 
 def build_html_report(session_summary: dict, status: dict) -> str:
     """
@@ -52,7 +53,9 @@ def build_html_report(session_summary: dict, status: dict) -> str:
     reached = session_summary.get("target_reached", False)
 
     win_rate = round(wins / max(wins + losses, 1) * 100, 1)
-    status_badge = "🟢 ACTIVE" if active else ("✅ TARGET REACHED" if reached else "🔴 CLOSED")
+    status_badge = (
+        "🟢 ACTIVE" if active else ("✅ TARGET REACHED" if reached else "🔴 CLOSED")
+    )
 
     html = f"""
 <html><body style="font-family:monospace;background:#0d0d0d;color:#e0e0e0;padding:20px;">
@@ -120,39 +123,42 @@ def build_telegram_message(session_summary: dict, status: dict) -> str:
 
 # ── Discord reporter ───────────────────────────────────────────────────────────
 
+
 class DiscordReporter:
     """Sends session reports to a Discord webhook."""
 
     def __init__(self, webhook_url: str) -> None:
         self._url = webhook_url
 
-    def send_report(self, session_summary: dict, status: dict) -> None:
+    async def send_report_async(self, session_summary: dict, status: dict) -> None:
         if not self._url:
             return
         text = build_telegram_message(session_summary, status)
-        html = build_html_report(session_summary, status)
-
-        # Discord supports embeds; send the text as an embed description
         payload = {
             "embeds": [
                 {
                     "title": "📊 Trader AI — Daily Session Report",
-                    "description": text.replace("*", "**"),  # Discord uses **bold**
-                    "color": 0x00FF88 if session_summary.get("net_profit", 0) >= 0 else 0xFF4444,
+                    "description": text.replace("*", "**"),
+                    "color": (
+                        0x00FF88
+                        if session_summary.get("net_profit", 0) >= 0
+                        else 0xFF4444
+                    ),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "footer": {"text": "Trader AI Signal Engine"},
                 }
             ]
         }
+        timeout = aiohttp.ClientTimeout(total=30)
         try:
-            resp = requests.post(self._url, json=payload, timeout=10)
-            resp.raise_for_status()
-            logger.info({"event": "discord_report_sent", "status": resp.status_code})
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self._url, json=payload) as resp:
+                    await resp.text()
+            logger.info({"event": "discord_report_sent"})
         except Exception as exc:
             logger.warning({"event": "discord_report_failed", "error": str(exc)})
 
-    def send_alert(self, message: str, level: str = "info") -> None:
-        """Send a plain-text alert to Discord."""
+    async def send_alert_async(self, message: str, level: str = "info") -> None:
         if not self._url:
             return
         colors = {"info": 0x5865F2, "warning": 0xFF8800, "error": 0xFF4444}
@@ -165,13 +171,17 @@ class DiscordReporter:
                 }
             ]
         }
+        timeout = aiohttp.ClientTimeout(total=10)
         try:
-            requests.post(self._url, json=payload, timeout=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self._url, json=payload) as resp:
+                    await resp.text()
         except Exception as exc:
             logger.warning({"event": "discord_alert_failed", "error": str(exc)})
 
 
 # ── Telegram bot ───────────────────────────────────────────────────────────────
+
 
 class TelegramBot:
     """
@@ -201,30 +211,49 @@ class TelegramBot:
         self._offset: int = 0
         self._running = False
 
-    def _api(self, method: str, **kwargs) -> dict | None:
+    async def _api_async(self, method: str, **kwargs) -> dict | None:
         url = self.BASE_URL.format(token=self._token, method=method)
+        timeout = aiohttp.ClientTimeout(total=35)
         try:
-            resp = requests.post(url, json=kwargs, timeout=15)
-            data = resp.json()
-            if not data.get("ok"):
-                logger.warning({"event": "telegram_api_error", "method": method, "response": data})
-            return data
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=kwargs) as resp:
+                    data = await resp.json()
+                    if not data.get("ok"):
+                        logger.warning(
+                            {
+                                "event": "telegram_api_error",
+                                "method": method,
+                                "response": data,
+                            }
+                        )
+                    return data
+        except asyncio.TimeoutError:
+            logger.warning({"event": "telegram_timeout", "method": method})
+            return None
         except Exception as exc:
-            logger.warning({"event": "telegram_request_failed", "method": method, "error": str(exc)})
+            logger.warning(
+                {
+                    "event": "telegram_request_failed",
+                    "method": method,
+                    "error": str(exc),
+                }
+            )
             return None
 
-    def send_message(self, text: str, parse_mode: str = "Markdown") -> None:
-        self._api("sendMessage", chat_id=self._chat_id, text=text, parse_mode=parse_mode)
+    async def send_message(self, text: str, parse_mode: str = "Markdown") -> None:
+        await self._api_async(
+            "sendMessage", chat_id=self._chat_id, text=text, parse_mode=parse_mode
+        )
 
-    def send_report(self) -> None:
+    async def send_report(self) -> None:
         status = self._orchestrator.get_status()
         session = status.get("session", {})
         msg = build_telegram_message(session, status)
-        self.send_message(msg)
+        await self.send_message(msg)
         if self._discord:
-            self._discord.send_report(session, status)
+            await self._discord.send_report_async(session, status)
 
-    def _handle_command(self, text: str) -> str:
+    async def _handle_command(self, text: str) -> str:
         cmd = text.strip().split()[0].lower().lstrip("/")
 
         if cmd == "status":
@@ -239,7 +268,7 @@ class TelegramBot:
             return self._orchestrator.start_session()
 
         elif cmd == "report":
-            self.send_report()
+            await self.send_report()
             return "Report sent."
 
         elif cmd == "threshold":
@@ -264,7 +293,7 @@ class TelegramBot:
         logger.info({"event": "telegram_bot_started", "chat_id": self._chat_id})
         while self._running:
             try:
-                data = self._api(
+                data = await self._api_async(
                     "getUpdates",
                     offset=self._offset,
                     timeout=30,
@@ -283,8 +312,8 @@ class TelegramBot:
                     text = msg.get("text", "")
                     if not text.startswith("/"):
                         continue
-                    reply = self._handle_command(text)
-                    self.send_message(reply)
+                    reply = await self._handle_command(text)
+                    await self.send_message(reply)
 
             except asyncio.CancelledError:
                 break
@@ -298,6 +327,7 @@ class TelegramBot:
 
 # ── Scheduled report sender ───────────────────────────────────────────────────
 
+
 async def scheduled_report_loop(
     bot: TelegramBot,
     _orchestrator: Any = None,
@@ -305,11 +335,11 @@ async def scheduled_report_loop(
 ) -> None:
     """
     Sends a daily session report at 23:58 UTC, Monday–Friday only.
-    Sleeps in 30-second ticks and fires when the clock hits 23:58.
+    Sleeps in 60-second ticks and fires when the clock hits 23:58.
     """
     last_sent_date: str = ""
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
         try:
             now = datetime.now(timezone.utc)
             # 0=Monday … 4=Friday
@@ -321,7 +351,7 @@ async def scheduled_report_loop(
             if today == last_sent_date:
                 continue  # already sent today
             last_sent_date = today
-            bot.send_report()
+            await bot.send_report()
             logger.info({"event": "daily_report_sent", "date": today})
         except Exception as exc:
             logger.warning({"event": "scheduled_report_error", "error": str(exc)})
