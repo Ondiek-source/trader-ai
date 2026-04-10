@@ -102,7 +102,7 @@ fi
 # ── 4. Models trained (FIXED — handles newlines) ──────────────────────────────
 echo "[ 4/8 ] Model training..."
 # Clean the count to remove any newlines or extra characters
-RAW_COUNT=$(echo "$LOGS" | grep -c "walk_forward_complete" 2>/dev/null || echo "0")
+RAW_COUNT=$(echo "$LOGS" | grep -c "walk_forward_complete\|lstm_trained\|transformer_trained" 2>/dev/null || echo "0")
 TRAINED_COUNT=$(echo "$RAW_COUNT" | tr -d '\n\r' | xargs)
 
 # Ensure it's a valid number
@@ -110,8 +110,10 @@ if [[ ! "$TRAINED_COUNT" =~ ^[0-9]+$ ]]; then
   TRAINED_COUNT=0
 fi
 
-if [[ "$TRAINED_COUNT" -ge 2 ]] 2>/dev/null; then
-  check "Models trained ($TRAINED_COUNT models)" "pass"
+if [[ "$TRAINED_COUNT" -ge 5 ]] 2>/dev/null; then
+  check "Models trained (all 5 models)" "pass"
+elif [[ "$TRAINED_COUNT" -ge 3 ]] 2>/dev/null; then
+  check "Models partially trained ($TRAINED_COUNT/5 models)" "warn" "LSTM/Transformer may not have completed"
 elif [[ "$TRAINED_COUNT" -gt 0 ]] 2>/dev/null; then
   check "Models partially trained ($TRAINED_COUNT models)" "warn" "Training still in progress"
 else
@@ -123,16 +125,26 @@ else
   fi
 fi
 
-# ── 5. Live price stream active (UPDATED patterns) ────────────────────────────
+
+# ── 5. Live price stream active (FETCH FRESH LOGS) ────────────────────────────
 echo "[ 5/8 ] Live price stream..."
-if echo "$LOGS" | grep -q "stream_connected\|websocket.*connected\|price_stream_started\|tick_milestone"; then
-  check "Live price stream active (Twelve Data)" "pass"
-elif echo "$LOGS" | grep -q "stream_stub_mode\|synthetic_mode"; then
-  check "Live price stream" "warn" "Running in stub/synthetic mode — check TWELVEDATA_API_KEY"
-elif echo "$LOGS" | grep -q "TWELVEDATA_API_KEY.*invalid\|Twelve Data.*error\|rate_limit"; then
-  check "Live price stream active" "fail" "Twelve Data API error — check TWELVEDATA_API_KEY in .env"
+# Fetch fresh logs specifically for this check
+STREAM_LOGS=$(az container logs --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" 2>/dev/null | tail -200 || echo "")
+
+if echo "$STREAM_LOGS" | grep -q "stream_connected\|websocket.*connected\|Sending ping\|tick_milestone"; then
+    # WebSocket is active, check tick count
+    TICK_COUNT=$(echo "$STREAM_LOGS" | grep -c "tick_milestone" 2>/dev/null || echo "0")
+    if [[ "$TICK_COUNT" -gt 0 ]]; then
+        check "Live price stream active (Twelve Data)" "pass" "$TICK_COUNT ticks received"
+    else
+        check "Live price stream active" "warn" "WebSocket connected but no ticks yet"
+    fi
+elif echo "$STREAM_LOGS" | grep -q "stream_stub_mode\|synthetic_mode"; then
+    check "Live price stream" "warn" "Running in stub/synthetic mode — check TWELVEDATA_API_KEY"
+elif echo "$STREAM_LOGS" | grep -q "TWELVEDATA_API_KEY.*invalid\|Twelve Data.*error\|rate_limit\|429"; then
+    check "Live price stream active" "fail" "Twelve Data API error or rate limit exceeded"
 else
-  check "Live price stream active" "warn" "No stream events yet — check TWELVEDATA_API_KEY in .env"
+    check "Live price stream active" "warn" "No stream activity yet — check TWELVEDATA_API_KEY in .env"
 fi
 
 # ── 6. Signals being evaluated ────────────────────────────────────────────────
@@ -147,23 +159,21 @@ else
   check "Signals being evaluated" "warn" "No signal events yet — models may still be training"
 fi
 
-# ── 7. Quotex connection ───────────────────────────────────────────────────────
+# ── 7. Quotex connection (FETCH FRESH LOGS) ───────────────────────────────────
 echo "[ 7/8 ] Quotex account connection..."
-if echo "$LOGS" | grep -q "quotex_connected"; then
-  BALANCE=$(echo "$LOGS" | grep -E "quotex_connected|quotex_balance" | tail -1 | grep -o '"balance":[0-9.]*' | head -1 | cut -d: -f2)
-  MODE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"mode":"[^"]*"' | head -1)
-  check "Quotex account connected" "pass" "$MODE | Balance: $${BALANCE:-0}"
-elif echo "$LOGS" | grep -q "quotex_connected"; then
-  BALANCE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"balance":[0-9.]*' | head -1)
-  MODE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"mode":"[^"]*"' | head -1)
-  check "Quotex account connected" "pass" "$MODE | $BALANCE"
-elif echo "$LOGS" | grep -q "quotex_connect_failed"; then
-  REASON=$(echo "$LOGS" | grep "quotex_connect_failed" | tail -1 | grep -o '"reason":"[^"]*"' | head -1)
-  check "Quotex account connected" "fail" "Connection failed: $REASON"
-elif echo "$LOGS" | grep -q "quotex_no_credentials"; then
-  check "Quotex account connected" "fail" "No credentials — set QUOTEX_EMAIL and QUOTEX_PASSWORD"
+QUOTEX_LOGS=$(az container logs --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" --tail 200 2>/dev/null || echo "")
+
+if echo "$QUOTEX_LOGS" | grep -q "quotex_connected"; then
+    BALANCE=$(echo "$QUOTEX_LOGS" | grep "quotex_connected" | tail -1 | grep -o '"balance":[0-9.]*' | head -1 | cut -d':' -f2)
+    MODE=$(echo "$QUOTEX_LOGS" | grep "quotex_connected" | tail -1 | grep -o '"mode":"[^"]*"' | head -1)
+    check "Quotex account connected" "pass" "$MODE | Balance: $${BALANCE:-0}"
+elif echo "$QUOTEX_LOGS" | grep -q "quotex_connect_failed"; then
+    REASON=$(echo "$QUOTEX_LOGS" | grep "quotex_connect_failed" | tail -1 | grep -o '"reason":"[^"]*"' | head -1)
+    check "Quotex account connected" "fail" "Connection failed: $REASON"
+elif echo "$QUOTEX_LOGS" | grep -q "quotex_no_credentials"; then
+    check "Quotex account connected" "fail" "No credentials — set QUOTEX_EMAIL and QUOTEX_PASSWORD"
 else
-  check "Quotex account connected" "warn" "No Quotex events yet — may still be initialising"
+    check "Quotex account connected" "warn" "No Quotex events yet — may still be initialising"
 fi
 
 # ── 8. Webhook reachable ───────────────────────────────────────────────────────
