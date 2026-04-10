@@ -622,6 +622,7 @@ class ModelManager:
                     ),
                     self._feature_cols,
                 )
+
             except Exception as exc:
                 logger.warning({"event": "lgbm_train_failed", "error": str(exc)})
 
@@ -653,6 +654,7 @@ class ModelManager:
                     ),
                     self._feature_cols,
                 )
+
             except Exception as exc:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
 
@@ -710,6 +712,7 @@ class ModelManager:
             logger.info(
                 {"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)}
             )
+
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
         logger.info({"event": "debug_randomforest_complete", "pair": pair})
@@ -753,7 +756,13 @@ class ModelManager:
                 }
             )
             MAX_LSTM_SEQUENCES = self._max_sequences
-            logger.info({"event": "lstm_debug_max_sequences", "value": MAX_LSTM_SEQUENCES, "seq_len": SEQ_LEN})
+            logger.info(
+                {
+                    "event": "lstm_debug_max_sequences",
+                    "value": MAX_LSTM_SEQUENCES,
+                    "seq_len": SEQ_LEN,
+                }
+            )
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_LSTM_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_LSTM_SEQUENCES + SEQ_LEN)
@@ -826,6 +835,7 @@ class ModelManager:
                                 "sequences": len(X_seq),
                             }
                         )
+
                     else:
                         logger.warning(
                             {"event": "lstm_debug_no_sequences", "pair": pair}
@@ -880,7 +890,13 @@ class ModelManager:
 
             # Cap the number of sequences
             MAX_TRANSFORMER_SEQUENCES = self._max_sequences
-            logger.info({"event": "transformer_debug_max_sequences", "value": MAX_TRANSFORMER_SEQUENCES, "seq_len": SEQ_LEN})
+            logger.info(
+                {
+                    "event": "transformer_debug_max_sequences",
+                    "value": MAX_TRANSFORMER_SEQUENCES,
+                    "seq_len": SEQ_LEN,
+                }
+            )
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_TRANSFORMER_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_TRANSFORMER_SEQUENCES + SEQ_LEN)
@@ -962,6 +978,7 @@ class ModelManager:
                                 "sequences": len(X_seq),
                             }
                         )
+
                     else:
                         logger.warning(
                             {"event": "transformer_debug_no_sequences", "pair": pair}
