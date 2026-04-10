@@ -17,8 +17,11 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+import os
 
 logger = logging.getLogger(__name__)
+MEMORY_SAVER_MODE = os.environ.get("MEMORY_SAVER_MODE", "false").lower() == "true"
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -29,9 +32,13 @@ SESSION_BOUNDS = {
     "london_ny_overlap": (12, 16),
 }
 
-MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]  # seconds
-TICK_VELOCITY_WINDOWS_S = [5, 10, 30]  # seconds for rolling tick count
-
+if MEMORY_SAVER_MODE:
+    MOMENTUM_WINDOWS_S = [5, 30, 60]      # Reduced
+    TICK_VELOCITY_WINDOWS_S = [10, 30]    # Reduced
+else:
+    MOMENTUM_WINDOWS_S = [1, 5, 15, 30, 60]   # Full
+    TICK_VELOCITY_WINDOWS_S = [5, 10, 30]     # Full
+    
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -112,7 +119,7 @@ def compute_features(tick_df: pd.DataFrame, expiry_seconds: int = 60) -> pd.Data
     bars = bars.reset_index()
     bars = bars.dropna(subset=["label"]).copy()
     bars["label"] = bars["label"].astype(int)
-
+    bars = bars.astype({col: 'float32' for col in bars.select_dtypes(include=['float64']).columns})
     return bars
 
 
