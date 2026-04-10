@@ -553,7 +553,13 @@ class ModelManager:
         self._prediction_log: dict[str, list[dict]] = {}
         self._max_log_size = 1000
 
-    def train(self, pair: str, expiry_seconds: int, feature_df: pd.DataFrame) -> dict:
+    def train(
+        self,
+        pair: str,
+        expiry_seconds: int,
+        feature_df: pd.DataFrame,
+        feature_df_recent: pd.DataFrame | None = None,
+    ) -> dict:
         """
         Train all model candidates on feature_df. Run walk-forward validation.
         Returns dict of metrics per model.
@@ -660,29 +666,63 @@ class ModelManager:
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
 
-        # ── LSTM ──────────────────────────────────────────────────────────────
-        if TORCH_AVAILABLE and len(X_scaled) >= SEQ_LEN + 50:
-            try:
-                X_seq = _make_sequences(X_scaled, SEQ_LEN)
-                y_seq = y[SEQ_LEN - 1 :]
-                lstm = _LSTMModel(n_features=len(self._feature_cols))
-                lstm = _train_pytorch_model(lstm, X_seq, y_seq)
-                trained["lstm"] = lstm
-                logger.info({"event": "lstm_trained", "pair": pair})
-            except Exception as exc:
-                logger.warning({"event": "lstm_train_failed", "error": str(exc)})
+        # ── LSTM (use recent data only) ──────────────────────────────────────
+        if TORCH_AVAILABLE and feature_df_recent is not None and not feature_df_recent.empty:
+            # Use recent data for sequence models
+            df_recent = feature_df_recent.dropna(subset=["label"] + self._feature_cols).copy()
+            if len(df_recent) >= SEQ_LEN + 50:
+                try:
+                    X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
+                    y_recent = df_recent["label"].to_numpy(dtype=np.float64)
+                    
+                    # Scale using the same scaler as full data
+                    scaler = self._scalers.get(pair, {}).get(expiry_seconds)
+                    if scaler is None:
+                        scaler = StandardScaler()
+                        X_recent_scaled = scaler.fit_transform(X_recent)
+                        self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
+                    else:
+                        X_recent_scaled = scaler.transform(X_recent)
+                    
+                    X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
+                    y_seq = y_recent[SEQ_LEN - 1:]
+                    
+                    if len(X_seq) > 0:
+                        lstm = _LSTMModel(n_features=len(self._feature_cols))
+                        lstm = _train_pytorch_model(lstm, X_seq, y_seq, epochs=10)
+                        trained["lstm"] = lstm
+                        logger.info({"event": "lstm_trained", "pair": pair, "sequences": len(X_seq)})
+                except Exception as exc:
+                    logger.warning({"event": "lstm_train_failed", "error": str(exc)})
 
-        # ── Transformer ───────────────────────────────────────────────────────
-        if TORCH_AVAILABLE and len(X_scaled) >= SEQ_LEN + 50:
-            try:
-                X_seq = _make_sequences(X_scaled, SEQ_LEN)
-                y_seq = y[SEQ_LEN - 1 :]
-                transformer = _TransformerModel(n_features=len(self._feature_cols))
-                transformer = _train_pytorch_model(transformer, X_seq, y_seq)
-                trained["transformer"] = transformer
-                logger.info({"event": "transformer_trained", "pair": pair})
-            except Exception as exc:
-                logger.warning({"event": "transformer_train_failed", "error": str(exc)})
+        # ── Transformer (use recent data only) ───────────────────────────────
+        if TORCH_AVAILABLE and feature_df_recent is not None and not feature_df_recent.empty:
+            # Use recent data for sequence models
+            df_recent = feature_df_recent.dropna(subset=["label"] + self._feature_cols).copy()
+            if len(df_recent) >= SEQ_LEN + 50:
+                try:
+                    X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
+                    y_recent = df_recent["label"].to_numpy(dtype=np.float64)
+                    
+                    # Scale using the same scaler as full data
+                    scaler = self._scalers.get(pair, {}).get(expiry_seconds)
+                    if scaler is None:
+                        scaler = StandardScaler()
+                        X_recent_scaled = scaler.fit_transform(X_recent)
+                        self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
+                    else:
+                        X_recent_scaled = scaler.transform(X_recent)
+                    
+                    X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
+                    y_seq = y_recent[SEQ_LEN - 1:]
+                    
+                    if len(X_seq) > 0:
+                        transformer = _TransformerModel(n_features=len(self._feature_cols))
+                        transformer = _train_pytorch_model(transformer, X_seq, y_seq, epochs=10)
+                        trained["transformer"] = transformer
+                        logger.info({"event": "transformer_trained", "pair": pair, "sequences": len(X_seq)})
+                except Exception as exc:
+                    logger.warning({"event": "transformer_train_failed", "error": str(exc)})
 
         self._models.setdefault(pair, {})[expiry_seconds] = trained
         self._metrics.setdefault(pair, {})[expiry_seconds] = wf_metrics
@@ -724,7 +764,12 @@ class ModelManager:
             return None
 
         # Align feature row to expected columns
-        feat = feature_row.reindex(self._feature_cols).fillna(0.0).to_numpy(dtype=np.float64).reshape(1, -1)
+        feat = (
+            feature_row.reindex(self._feature_cols)
+            .fillna(0.0)
+            .to_numpy(dtype=np.float64)
+            .reshape(1, -1)
+        )
         feat_scaled = scaler.transform(feat)
 
         indicator_signals: dict[str, dict] = {}

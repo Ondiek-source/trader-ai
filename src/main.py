@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import queue
 import sys
 import time
@@ -191,14 +190,27 @@ async def signal_task(
 
             async def _retrain(p: str = pair) -> None:
                 try:
-                    tick_df = storage.read_ticks(p, months=6)
-                    if not tick_df.empty:
-                        feature_df = compute_features(tick_df, config.expiry_seconds)
-                        if not feature_df.empty:
+                    tick_df_full = storage.read_ticks(p, months=6)
+                    tick_df_recent = storage.read_ticks(p, months=3)
+
+                    if not tick_df_full.empty:
+                        feature_df_full = compute_features(
+                            tick_df_full, config.expiry_seconds
+                        )
+                        feature_df_recent = (
+                            compute_features(tick_df_recent, config.expiry_seconds)
+                            if not tick_df_recent.empty
+                            else None
+                        )
+
+                        if not feature_df_full.empty:
                             await asyncio.get_running_loop().run_in_executor(
                                 None,
                                 lambda: model_manager.train(
-                                    p, config.expiry_seconds, feature_df
+                                    p,
+                                    config.expiry_seconds,
+                                    feature_df_full,
+                                    feature_df_recent,
                                 ),
                             )
                             model_manager.save(MODEL_SAVE_PATH)
@@ -379,9 +391,11 @@ async def initial_training(config, storage, model_manager) -> None:
                 continue
 
             # Read all available data (up to 60 months)
-            tick_df = storage.read_ticks(pair, months=60)
+            # tick_df = storage.read_ticks(pair, months=60)
+            tick_df_full = storage.read_ticks(pair, months=60)  # For tree models
+            tick_df_recent = storage.read_ticks(pair, months=3)  # For LSTM/Transformer
 
-            if tick_df.empty:
+            if tick_df_full.empty:
                 logger.info(
                     {
                         "event": "training_waiting_for_data",
@@ -393,8 +407,12 @@ async def initial_training(config, storage, model_manager) -> None:
                 continue
 
             # Check coverage span
-            tick_df["timestamp"] = pd.to_datetime(tick_df["timestamp"], utc=True)
-            span_days = (tick_df["timestamp"].max() - tick_df["timestamp"].min()).days
+            tick_df_full["timestamp"] = pd.to_datetime(
+                tick_df_full["timestamp"], utc=True
+            )
+            span_days = (
+                tick_df_full["timestamp"].max() - tick_df_full["timestamp"].min()
+            ).days
 
             if span_days < 365:
                 logger.info(
@@ -409,13 +427,15 @@ async def initial_training(config, storage, model_manager) -> None:
                 all_trained = False
                 continue
 
-            feature_df = compute_features(tick_df, expiry)
-            if feature_df.empty or len(feature_df) < 200:
+            # feature_df = compute_features(tick_df, expiry)
+            feature_df_full = compute_features(tick_df_full, expiry)
+            feature_df_recent = compute_features(tick_df_recent, expiry)
+            if feature_df_full.empty or len(feature_df_full) < 200:
                 logger.warning(
                     {
                         "event": "insufficient_features",
                         "pair": pair,
-                        "bars": len(feature_df),
+                        "bars": len(feature_df_full),
                     }
                 )
                 all_trained = False
@@ -426,19 +446,21 @@ async def initial_training(config, storage, model_manager) -> None:
                     "event": "initial_training_start",
                     "pair": pair,
                     "expiry": expiry,
-                    "bars": len(feature_df),
+                    "bars": len(feature_df_full),
                     "span_days": span_days,
                 }
             )
             await asyncio.get_running_loop().run_in_executor(
                 None,
-                lambda p=pair, e=expiry, df=feature_df: model_manager.train(p, e, df),
+                lambda p=pair, e=expiry, df=feature_df_full, df_recent=feature_df_recent: model_manager.train(
+                    p, e, df, df_recent
+                ),
             )
             logger.info(
                 {
                     "event": "initial_training_complete",
                     "pair": pair,
-                    "bars": len(feature_df),
+                    "bars": len(feature_df_full),
                 }
             )
 
