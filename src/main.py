@@ -353,7 +353,17 @@ async def backfill_task(config, storage) -> None:
         not check_data_coverage(pair, storage, min_days=365) for pair in config.pairs
     )
     if not needs_backfill:
-        logger.info({"event": "backfill_skipped", "reason": "sufficient_data_5yr"})
+        # Count parquet files for logging (optional but helpful)
+        try:
+            from azure.storage.blob import BlobServiceClient
+            client = BlobServiceClient.from_connection_string(storage._client.connection_string)
+            container_client = client.get_container_client(storage._container)
+            blobs = list(container_client.list_blobs(name_starts_with="data/"))
+            parquet_count = len([b for b in blobs if b.name.endswith('.parquet')])
+        except:
+            parquet_count = 0
+
+        logger.info({"event": "backfill_skipped", "reason": "sufficient_data_5yr", "parquet_files": parquet_count})
         return
 
     logger.info(

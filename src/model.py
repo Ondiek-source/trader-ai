@@ -743,6 +743,7 @@ class ModelManager:
                 "metrics": {m: v.get("accuracy") for m, v in wf_metrics.items()},
             }
         )
+        logger.info({"event": "models_trained_count", "pair": pair, "count": len(trained)})
         return wf_metrics
 
     def predict(

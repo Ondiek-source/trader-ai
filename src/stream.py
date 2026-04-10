@@ -237,6 +237,15 @@ class TwelveDataStream:
                 self._buffers[tick.pair] = []
             self._buffers[tick.pair].append(tick.to_dict())
             self._ticks_received += 1
+            # Log every 100 ticks for healthcheck
+            if self._ticks_received % 100 == 0:
+                logger.info(
+                    {
+                        "event": "tick_milestone",
+                        "ticks": self._ticks_received,
+                        "pair": tick.pair,
+                    }
+                )
 
             if len(self._buffers[tick.pair]) >= self._flush_size:
                 self._flush_pair(tick.pair)
