@@ -24,6 +24,7 @@ import queue
 import sys
 import time
 import gc
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -78,6 +79,7 @@ from webhook import WebhookSender, WebhookError
 from quotex_reader import QuotexReader, run_quotex_reader
 from reporter import DiscordReporter, TelegramBot, scheduled_report_loop
 from dashboard import run_dashboard, status_store
+from log_storage import BlobLogHandler
 
 logger = logging.getLogger("main")
 
@@ -547,6 +549,22 @@ async def main() -> None:
         container_name=config.container_name,
         flush_size=config.tick_flush_size,
     )
+
+    # ── Add persistent blob logging ──────────────────────────────────────────
+    try:
+        blob_handler = BlobLogHandler(
+            conn_string=config.azure_storage_conn, container_name=config.container_name
+        )
+        blob_handler.setFormatter(_JSONFormatter())
+        root_logger = logging.getLogger()
+        root_logger.addHandler(blob_handler)
+        logger.info({"event": "persistent_logging_enabled"})
+    except Exception as e:
+        logger.warning({"event": "persistent_logging_failed", "error": str(e)})
+
+    # ── Log container start with unique ID ───────────────────────────────────
+    container_id = str(uuid.uuid4())[:8]
+    logger.info({"event": "container_start", "container_id": container_id})
 
     martingale = MartingaleTracker(
         base_threshold=config.confidence_threshold,
