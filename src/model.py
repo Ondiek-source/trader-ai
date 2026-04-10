@@ -566,7 +566,7 @@ class ModelManager:
         """
         df = feature_df.dropna(subset=["label"] + self._feature_cols).copy()
         df = df.sort_values("timestamp").reset_index(drop=True)
-
+        logger.info({"event": "debug_train_start", "pair": pair, "rows": len(df), "features": len(self._feature_cols)})
         if len(df) < 200:
             logger.warning(
                 {
@@ -649,9 +649,10 @@ class ModelManager:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
 
         # ── RandomForest (baseline) ───────────────────────────────────────────
+        logger.info({"event": "debug_randomforest_start", "pair": pair, "X_shape": X_scaled.shape})
         try:
             rf_model = RandomForestClassifier(
-                n_estimators=200, max_depth=8, random_state=42, n_jobs=-1
+                n_estimators=100, max_depth=6, random_state=42, n_jobs=2
             )
             rf_model.fit(X_scaled, y)
             trained["randomforest"] = rf_model
@@ -665,7 +666,10 @@ class ModelManager:
             )
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
+        
+        logger.info({"event": "debug_randomforest_complete", "pair": pair})
 
+        logger.info({"event": "debug_lstm_check", "pair": pair, "torch_available": TORCH_AVAILABLE, "has_recent_data": feature_df_recent is not None})
         # ── LSTM (use recent data only) ──────────────────────────────────────
         if TORCH_AVAILABLE and feature_df_recent is not None and not feature_df_recent.empty:
             # Use recent data for sequence models
