@@ -125,7 +125,7 @@ fi
 
 # ── 5. Live price stream active (UPDATED patterns) ────────────────────────────
 echo "[ 5/8 ] Live price stream..."
-if echo "$LOGS" | grep -q "stream_connected\|websocket.*connected\|price_stream_started"; then
+if echo "$LOGS" | grep -q "stream_connected\|websocket.*connected\|price_stream_started\|tick_milestone"; then
   check "Live price stream active (Twelve Data)" "pass"
 elif echo "$LOGS" | grep -q "stream_stub_mode\|synthetic_mode"; then
   check "Live price stream" "warn" "Running in stub/synthetic mode — check TWELVEDATA_API_KEY"
@@ -150,6 +150,10 @@ fi
 # ── 7. Quotex connection ───────────────────────────────────────────────────────
 echo "[ 7/8 ] Quotex account connection..."
 if echo "$LOGS" | grep -q "quotex_connected"; then
+  BALANCE=$(echo "$LOGS" | grep -E "quotex_connected|quotex_balance" | tail -1 | grep -o '"balance":[0-9.]*' | head -1 | cut -d: -f2)
+  MODE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"mode":"[^"]*"' | head -1)
+  check "Quotex account connected" "pass" "$MODE | Balance: $${BALANCE:-0}"
+elif echo "$LOGS" | grep -q "quotex_connected"; then
   BALANCE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"balance":[0-9.]*' | head -1)
   MODE=$(echo "$LOGS" | grep "quotex_connected" | tail -1 | grep -o '"mode":"[^"]*"' | head -1)
   check "Quotex account connected" "pass" "$MODE | $BALANCE"
