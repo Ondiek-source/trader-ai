@@ -6,8 +6,9 @@
 # -- Twelve Data WebSocket streaming ------------------------------------------
 websockets>=12.0
 
-# -- Azure Blob Storage -------------------------------------------------------
+# -- Azure & Blob Storage -------------------------------------------------------
 azure-storage-blob>=12.19.0
+psutil>=5.9.8
 
 # -- Parquet / columnar storage -----------------------------------------------
 pyarrow>=15.0.0

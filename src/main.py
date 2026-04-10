@@ -25,6 +25,7 @@ import sys
 import time
 import gc
 import uuid
+import psutil
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -324,6 +325,26 @@ async def health_task(
             if quotex_reader
             else {"connected": False, "balance": 0.0}
         )
+        # ── Memory and CPU metrics ─────────────────────────────────────────
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        cpu_percent = process.cpu_percent(interval=1)
+        
+        logger.info(
+            {
+                "event": "health",
+                "uptime_seconds": uptime,
+                "ticks_received": stream.ticks_received,
+                "session": status.get("session"),
+                "martingale_streak": status.get("martingale_streak"),
+                "confidence_threshold": status.get("confidence_threshold"),
+                "pending_signals": status.get("pending_signals"),
+                "memory_usage_mb": round(memory_mb, 1),
+                "memory_usage_gb": round(memory_mb / 1024, 2),
+                "cpu_percent": cpu_percent,
+            }
+        )
+        
         logger.info(
             {
                 "event": "health",
