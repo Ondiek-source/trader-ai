@@ -35,9 +35,9 @@ IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
 # ── ACR cleanup function ──────────────────────────────────────────────────────
 cleanup_acr() {
-    echo "Cleaning up old ACR images (keeping latest 2 tags)..."
+    echo "Cleaning up old ACR images (keeping latest 2 tags, preserving 'latest')..."
     
-    # Get all tags except 'latest' and keep only last 2
+    # Get all tags except 'latest' (NEVER delete latest)
     ALL_TAGS=$(az acr repository show-tags \
         --name "$ACR_NAME" \
         --repository trader-ai \
@@ -46,12 +46,11 @@ cleanup_acr() {
         --output tsv 2>/dev/null || true)
     
     if [[ -n "$ALL_TAGS" ]]; then
-        # Count tags and delete if more than 2
         TAG_COUNT=$(echo "$ALL_TAGS" | wc -l)
+        # Keep 2 non-latest tags, delete the rest
         if [[ $TAG_COUNT -gt 2 ]]; then
-            # Delete from line 3 onward (keep first 2)
             echo "$ALL_TAGS" | tail -n +3 | while read -r tag; do
-                if [[ -n "$tag" ]]; then
+                if [[ -n "$tag" && "$tag" != "latest" ]]; then
                     echo "  Deleting old tag: trader-ai:$tag"
                     az acr repository delete \
                         --name "$ACR_NAME" \
@@ -63,7 +62,7 @@ cleanup_acr() {
         fi
     fi
     
-    # Delete untagged manifests older than 7 days
+    # Only delete untagged manifests (dangling layers)
     echo "  Deleting untagged manifests older than 7 days..."
     az acr run --registry "$ACR_NAME" \
         --cmd 'acr purge --filter "trader-ai:.*" --untagged --ago 7d' \
