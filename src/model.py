@@ -531,6 +531,7 @@ class ModelManager:
         self._mt = martingale_tracker
         self._feature_cols = get_feature_columns()
         self._indicator_groups = get_indicator_feature_groups()
+        self._max_sequences = getattr(config, "max_sequences", 20000)
 
         # Nested dict: {pair: {expiry: {model_name: fitted_model}}}
         self._models: dict[str, dict[int, dict[str, Any]]] = {}
@@ -723,7 +724,6 @@ class ModelManager:
         )
 
         # ── LSTM (use recent data only) ──────────────────────────────────────
-        # ── LSTM (use recent data only) ──────────────────────────────────────
         logger.info(
             {
                 "event": "lstm_debug_start",
@@ -752,9 +752,13 @@ class ModelManager:
                     "cols": len(self._feature_cols),
                 }
             )
-
+            MAX_LSTM_SEQUENCES = self._max_sequences
+            original_rows = len(df_recent)
+            if len(df_recent) >= MAX_LSTM_SEQUENCES + SEQ_LEN:
+                df_recent = df_recent.tail(MAX_LSTM_SEQUENCES + SEQ_LEN)
+                logger.info({"event": "lstm_sequences_capped", "original": original_rows, "capped": len(df_recent)})
+                
             if len(df_recent) >= SEQ_LEN + 50:
-                logger.info({"event": "lstm_debug_creating_sequences", "pair": pair})
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
                     y_recent = df_recent["label"].to_numpy(dtype=np.float64)
@@ -846,39 +850,91 @@ class ModelManager:
             )
 
         # ── Transformer (use recent data only) ───────────────────────────────
+        logger.info(
+            {
+                "event": "transformer_debug_start",
+                "pair": pair,
+                "torch_available": TORCH_AVAILABLE,
+                "has_recent_data": feature_df_recent is not None,
+            }
+        )
+
         if (
             TORCH_AVAILABLE
             and feature_df_recent is not None
             and not feature_df_recent.empty
         ):
+            logger.info({"event": "transformer_debug_processing_recent", "pair": pair})
+
             # Use recent data for sequence models
             df_recent = feature_df_recent.dropna(
                 subset=["label"] + self._feature_cols
             ).copy()
+            
+            # Cap the number of sequences 
+            MAX_TRANSFORMER_SEQUENCES = self._max_sequences  
+            original_rows = len(df_recent)
+            if len(df_recent) >= MAX_TRANSFORMER_SEQUENCES + SEQ_LEN:
+                df_recent = df_recent.tail(MAX_TRANSFORMER_SEQUENCES + SEQ_LEN)
+                logger.info({"event": "transformer_sequences_capped", "original": original_rows, "capped": len(df_recent)})
+            
             if len(df_recent) >= SEQ_LEN + 50:
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
                     y_recent = df_recent["label"].to_numpy(dtype=np.float64)
+                    logger.info(
+                        {
+                            "event": "transformer_debug_X_shape",
+                            "pair": pair,
+                            "shape": X_recent.shape,
+                        }
+                    )
 
                     # Scale using the same scaler as full data
                     scaler = self._scalers.get(pair, {}).get(expiry_seconds)
                     if scaler is None:
+                        logger.info(
+                            {"event": "transformer_debug_creating_scaler", "pair": pair}
+                        )
                         scaler = StandardScaler()
                         X_recent_scaled = scaler.fit_transform(X_recent)
                         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
                     else:
+                        logger.info(
+                            {"event": "transformer_debug_using_existing_scaler", "pair": pair}
+                        )
                         X_recent_scaled = scaler.transform(X_recent)
 
+                    logger.info({"event": "transformer_debug_making_sequences", "pair": pair})
                     X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
                     y_seq = y_recent[SEQ_LEN - 1 :]
+                    logger.info(
+                        {
+                            "event": "transformer_debug_sequences_shape",
+                            "pair": pair,
+                            "X_seq_shape": X_seq.shape,
+                        }
+                    )
 
                     if len(X_seq) > 0:
+                        logger.info(
+                            {"event": "transformer_debug_creating_model", "pair": pair}
+                        )
                         transformer = _TransformerModel(
                             n_features=len(self._feature_cols)
+                        )
+
+                        logger.info(
+                            {
+                                "event": "transformer_debug_training_start",
+                                "pair": pair,
+                                "sequences": len(X_seq),
+                            }
                         )
                         transformer = _train_pytorch_model(
                             transformer, X_seq, y_seq, epochs=10
                         )
+
                         trained["transformer"] = transformer
                         logger.info(
                             {
@@ -887,10 +943,35 @@ class ModelManager:
                                 "sequences": len(X_seq),
                             }
                         )
+                    else:
+                        logger.warning(
+                            {"event": "transformer_debug_no_sequences", "pair": pair}
+                        )
                 except Exception as exc:
-                    logger.warning(
-                        {"event": "transformer_train_failed", "error": str(exc)}
+                    logger.error(
+                        {
+                            "event": "transformer_train_failed",
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        }
                     )
+            else:
+                logger.warning(
+                    {
+                        "event": "transformer_debug_insufficient_data",
+                        "pair": pair,
+                        "rows": len(df_recent),
+                        "required": SEQ_LEN + 50,
+                    }
+                )
+        else:
+            logger.info(
+                {
+                    "event": "transformer_debug_skipped",
+                    "pair": pair,
+                    "reason": "condition not met",
+                }
+            )
 
         self._models.setdefault(pair, {})[expiry_seconds] = trained
         self._metrics.setdefault(pair, {})[expiry_seconds] = wf_metrics

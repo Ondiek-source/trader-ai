@@ -33,6 +33,35 @@ source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── Delete old logs from blob storage ─────────────────────────────────────────
+cleanup_logs() {
+    echo "Deleting logs older than 7 days..."
+    
+    # Calculate date 7 days ago
+    CUTOFF_DATE=$(date -d "7 days ago" +%Y-%m-%d)
+    
+    # List and delete log folders older than 7 days
+    az storage blob list \
+        --account-name "$STORAGE_ACCOUNT" \
+        --container-name "$CONTAINER_NAME" \
+        --prefix "logs/" \
+        --query "[?contains(name, 'logs/')]" \
+        --output tsv 2>/dev/null | while read -r blob; do
+        # Extract date from blob path (logs/YYYY-MM-DD/...)
+        BLOB_DATE=$(echo "$blob" | cut -d'/' -f2)
+        if [[ "$BLOB_DATE" < "$CUTOFF_DATE" ]]; then
+            echo "  Deleting old log: $blob"
+            az storage blob delete \
+                --account-name "$STORAGE_ACCOUNT" \
+                --container-name "$CONTAINER_NAME" \
+                --name "$blob" \
+                --output none 2>/dev/null || true
+        fi
+    done
+    
+    echo "  Log cleanup complete."
+}
+
 # ── ACR cleanup function ──────────────────────────────────────────────────────
 cleanup_acr() {
     echo "Cleaning up old ACR images (keeping latest 2 tags, preserving 'latest')..."
@@ -104,6 +133,9 @@ echo "      Done."
 
 # ── Clean up old ACR images ───────────────────────────────────────────────────
 cleanup_acr
+
+# ── Clean up old logs ─────────────────────────────────────────────────────────
+cleanup_logs
 
 # ── Ensure required providers are registered ──────────────────────────────────
 for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do

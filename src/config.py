@@ -37,7 +37,9 @@ def _int(name: str, default: int) -> int:
     try:
         return int(val)
     except ValueError:
-        raise ValueError(f"Environment variable '{name}' must be an integer, got: '{val}'")
+        raise ValueError(
+            f"Environment variable '{name}' must be an integer, got: '{val}'"
+        )
 
 
 def _float(name: str, default: float) -> float:
@@ -85,8 +87,8 @@ class Config:
     webhook_key: str  # static auth key sent in payload (e.g. "Ondiek")
 
     # ── Reporting / notifications ─────────────────────────────────────────────
-    telegram_token: str       # Telegram Bot API token (empty = disabled)
-    telegram_chat_id: str     # Telegram chat ID to send messages to
+    telegram_token: str  # Telegram Bot API token (empty = disabled)
+    telegram_chat_id: str  # Telegram chat ID to send messages to
     discord_webhook_url: str  # Discord incoming webhook URL (empty = disabled)
 
     # ── Result callback / Quotex reader ──────────────────────────────────────
@@ -94,24 +96,32 @@ class Config:
     quotex_read_results: bool  # True = use Quotex API to read trade results
 
     # ── Training ──────────────────────────────────────────────────────────────
-    backfill_years: int         # years of Dukascopy history to download
-    optimize_expiry: bool       # True = test 60/120/300s and pick best per pair
+    backfill_years: int  # years of Dukascopy history to download
+    optimize_expiry: bool  # True = test 60/120/300s and pick best per pair
+    max_sequences: int  # Max sequences for LSTM & Transformer training (prevents OOM)
 
     def __post_init__(self) -> None:
         # Validate pairs
         valid_pairs = {"EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"}
         for p in self.pairs:
             if p not in valid_pairs:
-                logger.warning("Pair '%s' is not in the default set %s — proceeding anyway.", p, valid_pairs)
+                logger.warning(
+                    "Pair '%s' is not in the default set %s — proceeding anyway.",
+                    p,
+                    valid_pairs,
+                )
 
         # Validate confidence threshold
         if not 0.5 < self.confidence_threshold < 1.0:
-            raise ValueError(f"CONFIDENCE_THRESHOLD must be between 0.5 and 1.0, got: {self.confidence_threshold}")
+            raise ValueError(
+                f"CONFIDENCE_THRESHOLD must be between 0.5 and 1.0, got: {self.confidence_threshold}"
+            )
 
         # Validate expiry
         if self.expiry_seconds not in (60, 120, 300):
             logger.warning(
-                "EXPIRY_SECONDS=%d is not in the tested set [60, 120, 300]. Proceeding.", self.expiry_seconds
+                "EXPIRY_SECONDS=%d is not in the tested set [60, 120, 300]. Proceeding.",
+                self.expiry_seconds,
             )
 
         # Warn loudly on live mode
@@ -121,12 +131,16 @@ class Config:
                 "Ensure you have reviewed all parameters and risk settings."
             )
         else:
-            logger.info("[PRACTICE MODE] — Signals will fire but treat results as simulation.")
+            logger.info(
+                "[PRACTICE MODE] — Signals will fire but treat results as simulation."
+            )
 
 
 def load_config() -> Config:
     """Parse all environment variables and return a validated Config instance."""
-    pairs_raw = _optional("PAIRS", "EUR_USD")  # start with EUR/USD only; add more when validated
+    pairs_raw = _optional(
+        "PAIRS", "EUR_USD"
+    )  # start with EUR/USD only; add more when validated
     pairs = [p.strip().upper() for p in pairs_raw.split(",") if p.strip()]
     if not pairs:
         raise ValueError("PAIRS must contain at least one currency pair.")
@@ -137,7 +151,9 @@ def load_config() -> Config:
         try:
             target_net_profit = float(target_profit_raw)
         except ValueError:
-            raise ValueError(f"TARGET_NET_PROFIT must be a float, got: '{target_profit_raw}'")
+            raise ValueError(
+                f"TARGET_NET_PROFIT must be a float, got: '{target_profit_raw}'"
+            )
 
     return Config(
         # Twelve Data
@@ -176,4 +192,5 @@ def load_config() -> Config:
         # Training parameters
         backfill_years=_int("BACKFILL_YEARS", 5),
         optimize_expiry=_bool("OPTIMIZE_EXPIRY", True),
+        max_sequences=_int("MAX_SEQUENCES", 20000),
     )
