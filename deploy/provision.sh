@@ -23,7 +23,7 @@ LOCATION="southafricanorth"
 CONTAINER_NAME="traderai"
 ACI_NAME="trader-ai-engine"
 ACI_CPU=2
-ACI_MEMORY=4
+ACI_MEMORY=8
 
 VM_NAME="trader-bot-vm"
 VM_LOCATION="southafricanorth"  # same region — Quotex accessible from here

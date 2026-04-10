@@ -24,6 +24,7 @@ import os
 import queue
 import sys
 import time
+import gc
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -207,6 +208,8 @@ async def signal_task(
             if feature_df.empty:
                 continue
             feature_row = feature_df.iloc[-1]
+            # Force garbage collection to free memory from temporary DataFrames
+            gc.collect()
         except Exception as exc:
             logger.warning({"event": "feature_extraction_failed", "pair": pair, "error": str(exc)})
             continue

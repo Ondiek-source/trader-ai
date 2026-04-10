@@ -59,7 +59,7 @@ This system automatically analyses forex price data, decides when to place a tra
 
 The values to fill in:
 
-```
+```txt
 TWELVEDATA_API_KEY=        ← from twelvedata.com dashboard
 WEBHOOK_URL=               ← the URL your Quotex bot listens on
 QUOTEX_EMAIL=              ← your Quotex login email
@@ -101,14 +101,14 @@ PRACTICE_MODE=true         ← set to false when you are ready to go live
 3. Click **New repository secret** and add these one at a time:
 
 | Secret Name | Where to find the value |
-|---|---|
+| --- | --- |
 | `ACR_LOGIN_SERVER` | Printed by provision.sh (e.g. `traderaireg1234.azurecr.io`) |
 | `ACR_USERNAME` | Same as the registry name (e.g. `traderaireg1234`) |
 | `ACR_PASSWORD` | Run: `az acr credential show --name traderaireg1234 --query "passwords[0].value" -o tsv` |
 
-4. After adding all three, they will appear in the list (values are hidden — that is normal).
-5. Go back to your terminal.
-6. Run: `git push origin main` — this triggers GitHub to build the Docker image automatically.
+1. After adding all three, they will appear in the list (values are hidden — that is normal).
+2. Go back to your terminal.
+3. Run: `git push origin main` — this triggers GitHub to build the Docker image automatically.
 
 ### Step 8 — Check the build succeeded
 
