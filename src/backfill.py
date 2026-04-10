@@ -235,7 +235,7 @@ def check_data_coverage(pair: str, storage, min_days: int = 365) -> bool:
     Returns True if there is at least min_days of data in blob storage.
     Used at startup to decide whether a backfill run is needed.
     """
-    df = storage.read_ticks(pair, months=3)
+    df = storage.read_ticks(pair, months=12)
     if df.empty:
         return False
     ts_col = "timestamp"

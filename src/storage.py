@@ -112,7 +112,7 @@ class StorageManager:
         new_df = pd.DataFrame([row])
         self._append_parquet(blob_path, new_df, RESULT_SCHEMA)
 
-    def read_ticks(self, pair: str, months: int = 3) -> pd.DataFrame:
+    def read_ticks(self, pair: str, months: int = 12) -> pd.DataFrame:
         """Read up to `months` of tick data from blob for the given pair."""
         now = datetime.now(timezone.utc)
         frames: list[pd.DataFrame] = []
