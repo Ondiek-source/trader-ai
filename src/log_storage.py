@@ -12,11 +12,11 @@ from azure.storage.blob import BlobServiceClient
 class BlobLogHandler(logging.Handler):
     """Custom logging handler that writes logs to Azure Blob Storage."""
 
-    def __init__(self, conn_string: str, container_name: str, flush_interval: int = 30):
+    def __init__(self, conn_string: str, container_name: str, flush_interval: int = 10):
         super().__init__()
         self.conn_string = conn_string
         self.container_name = container_name
-        self.flush_interval = flush_interval  # Flush every 30 seconds
+        self.flush_interval = flush_interval  # Flush every 10 seconds
         self._client = None
         self._buffer = []
         self._last_flush = time.time()

@@ -566,7 +566,14 @@ class ModelManager:
         """
         df = feature_df.dropna(subset=["label"] + self._feature_cols).copy()
         df = df.sort_values("timestamp").reset_index(drop=True)
-        logger.info({"event": "debug_train_start", "pair": pair, "rows": len(df), "features": len(self._feature_cols)})
+        logger.info(
+            {
+                "event": "debug_train_start",
+                "pair": pair,
+                "rows": len(df),
+                "features": len(self._feature_cols),
+            }
+        )
         if len(df) < 200:
             logger.warning(
                 {
@@ -649,13 +656,25 @@ class ModelManager:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
 
         # ── RandomForest (use subset of data to save memory) ───────────────────────────
-        logger.info({"event": "debug_randomforest_start", "pair": pair, "X_shape": X_scaled.shape})
+        logger.info(
+            {
+                "event": "debug_randomforest_start",
+                "pair": pair,
+                "X_shape": X_scaled.shape,
+            }
+        )
 
         # Use only last 100k rows for RandomForest (saves memory)
         MAX_RF_ROWS = 100000
         if len(df) > MAX_RF_ROWS:
             df_rf = df.tail(MAX_RF_ROWS).copy()  # Use most recent data
-            logger.info({"event": "randomforest_subset", "original": len(df), "subset": len(df_rf)})
+            logger.info(
+                {
+                    "event": "randomforest_subset",
+                    "original": len(df),
+                    "subset": len(df_rf),
+                }
+            )
         else:
             df_rf = df
 
@@ -666,69 +685,181 @@ class ModelManager:
                 random_state=42,
                 n_jobs=2,
             )
-            
+
             # Prepare data for RandomForest
             X_rf = df_rf[self._feature_cols].to_numpy(dtype=np.float64)
             y_rf = df_rf["label"].to_numpy(dtype=np.float64)
-            
+
             # Scale using the same scaler
             scaler_rf = StandardScaler()
             X_rf_scaled = scaler_rf.fit_transform(X_rf)
-            
+
             rf_model.fit(X_rf_scaled, y_rf)
             trained["randomforest"] = rf_model
-            
+
             # Run walk-forward validation on the subset (not full 500k rows)
             wf_metrics["randomforest"] = walk_forward_evaluate(
                 df_rf,  # Use subset for validation
                 "randomforest",
-                lambda: RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42),
+                lambda: RandomForestClassifier(
+                    n_estimators=100, max_depth=6, random_state=42
+                ),
                 self._feature_cols,
             )
-            logger.info({"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)})
+            logger.info(
+                {"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)}
+            )
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
         logger.info({"event": "debug_randomforest_complete", "pair": pair})
 
-        logger.info({"event": "debug_lstm_check", "pair": pair, "torch_available": TORCH_AVAILABLE, "has_recent_data": feature_df_recent is not None})
+        logger.info(
+            {
+                "event": "debug_lstm_check",
+                "pair": pair,
+                "torch_available": TORCH_AVAILABLE,
+                "has_recent_data": feature_df_recent is not None,
+            }
+        )
+
         # ── LSTM (use recent data only) ──────────────────────────────────────
-        if TORCH_AVAILABLE and feature_df_recent is not None and not feature_df_recent.empty:
+        # ── LSTM (use recent data only) ──────────────────────────────────────
+        logger.info(
+            {
+                "event": "lstm_debug_start",
+                "pair": pair,
+                "torch_available": TORCH_AVAILABLE,
+                "has_recent_data": feature_df_recent is not None,
+            }
+        )
+
+        if (
+            TORCH_AVAILABLE
+            and feature_df_recent is not None
+            and not feature_df_recent.empty
+        ):
+            logger.info({"event": "lstm_debug_processing_recent", "pair": pair})
+
             # Use recent data for sequence models
-            df_recent = feature_df_recent.dropna(subset=["label"] + self._feature_cols).copy()
+            df_recent = feature_df_recent.dropna(
+                subset=["label"] + self._feature_cols
+            ).copy()
+            logger.info(
+                {
+                    "event": "lstm_debug_recent_shape",
+                    "pair": pair,
+                    "rows": len(df_recent),
+                    "cols": len(self._feature_cols),
+                }
+            )
+
             if len(df_recent) >= SEQ_LEN + 50:
+                logger.info({"event": "lstm_debug_creating_sequences", "pair": pair})
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
                     y_recent = df_recent["label"].to_numpy(dtype=np.float64)
-                    
+                    logger.info(
+                        {
+                            "event": "lstm_debug_X_shape",
+                            "pair": pair,
+                            "shape": X_recent.shape,
+                        }
+                    )
+
                     # Scale using the same scaler as full data
                     scaler = self._scalers.get(pair, {}).get(expiry_seconds)
                     if scaler is None:
+                        logger.info(
+                            {"event": "lstm_debug_creating_scaler", "pair": pair}
+                        )
                         scaler = StandardScaler()
                         X_recent_scaled = scaler.fit_transform(X_recent)
                         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
                     else:
+                        logger.info(
+                            {"event": "lstm_debug_using_existing_scaler", "pair": pair}
+                        )
                         X_recent_scaled = scaler.transform(X_recent)
-                    
+
+                    logger.info({"event": "lstm_debug_making_sequences", "pair": pair})
                     X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
-                    y_seq = y_recent[SEQ_LEN - 1:]
-                    
+                    y_seq = y_recent[SEQ_LEN - 1 :]
+                    logger.info(
+                        {
+                            "event": "lstm_debug_sequences_shape",
+                            "pair": pair,
+                            "X_seq_shape": X_seq.shape,
+                        }
+                    )
+
                     if len(X_seq) > 0:
+                        logger.info(
+                            {"event": "lstm_debug_creating_model", "pair": pair}
+                        )
                         lstm = _LSTMModel(n_features=len(self._feature_cols))
+
+                        logger.info(
+                            {
+                                "event": "lstm_debug_training_start",
+                                "pair": pair,
+                                "sequences": len(X_seq),
+                            }
+                        )
                         lstm = _train_pytorch_model(lstm, X_seq, y_seq, epochs=10)
+
                         trained["lstm"] = lstm
-                        logger.info({"event": "lstm_trained", "pair": pair, "sequences": len(X_seq)})
+                        logger.info(
+                            {
+                                "event": "lstm_trained",
+                                "pair": pair,
+                                "sequences": len(X_seq),
+                            }
+                        )
+                    else:
+                        logger.warning(
+                            {"event": "lstm_debug_no_sequences", "pair": pair}
+                        )
                 except Exception as exc:
-                    logger.warning({"event": "lstm_train_failed", "error": str(exc)})
+                    logger.error(
+                        {
+                            "event": "lstm_train_failed",
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+            else:
+                logger.warning(
+                    {
+                        "event": "lstm_debug_insufficient_data",
+                        "pair": pair,
+                        "rows": len(df_recent),
+                        "required": SEQ_LEN + 50,
+                    }
+                )
+        else:
+            logger.info(
+                {
+                    "event": "lstm_debug_skipped",
+                    "pair": pair,
+                    "reason": "condition not met",
+                }
+            )
 
         # ── Transformer (use recent data only) ───────────────────────────────
-        if TORCH_AVAILABLE and feature_df_recent is not None and not feature_df_recent.empty:
+        if (
+            TORCH_AVAILABLE
+            and feature_df_recent is not None
+            and not feature_df_recent.empty
+        ):
             # Use recent data for sequence models
-            df_recent = feature_df_recent.dropna(subset=["label"] + self._feature_cols).copy()
+            df_recent = feature_df_recent.dropna(
+                subset=["label"] + self._feature_cols
+            ).copy()
             if len(df_recent) >= SEQ_LEN + 50:
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
                     y_recent = df_recent["label"].to_numpy(dtype=np.float64)
-                    
+
                     # Scale using the same scaler as full data
                     scaler = self._scalers.get(pair, {}).get(expiry_seconds)
                     if scaler is None:
@@ -737,17 +868,29 @@ class ModelManager:
                         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
                     else:
                         X_recent_scaled = scaler.transform(X_recent)
-                    
+
                     X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
-                    y_seq = y_recent[SEQ_LEN - 1:]
-                    
+                    y_seq = y_recent[SEQ_LEN - 1 :]
+
                     if len(X_seq) > 0:
-                        transformer = _TransformerModel(n_features=len(self._feature_cols))
-                        transformer = _train_pytorch_model(transformer, X_seq, y_seq, epochs=10)
+                        transformer = _TransformerModel(
+                            n_features=len(self._feature_cols)
+                        )
+                        transformer = _train_pytorch_model(
+                            transformer, X_seq, y_seq, epochs=10
+                        )
                         trained["transformer"] = transformer
-                        logger.info({"event": "transformer_trained", "pair": pair, "sequences": len(X_seq)})
+                        logger.info(
+                            {
+                                "event": "transformer_trained",
+                                "pair": pair,
+                                "sequences": len(X_seq),
+                            }
+                        )
                 except Exception as exc:
-                    logger.warning({"event": "transformer_train_failed", "error": str(exc)})
+                    logger.warning(
+                        {"event": "transformer_train_failed", "error": str(exc)}
+                    )
 
         self._models.setdefault(pair, {})[expiry_seconds] = trained
         self._metrics.setdefault(pair, {})[expiry_seconds] = wf_metrics
@@ -768,7 +911,9 @@ class ModelManager:
                 "metrics": {m: v.get("accuracy") for m, v in wf_metrics.items()},
             }
         )
-        logger.info({"event": "models_trained_count", "pair": pair, "count": len(trained)})
+        logger.info(
+            {"event": "models_trained_count", "pair": pair, "count": len(trained)}
+        )
         return wf_metrics
 
     def predict(
