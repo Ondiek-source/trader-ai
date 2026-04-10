@@ -33,6 +33,45 @@ source "$AZURE_ENV"
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── ACR cleanup function ──────────────────────────────────────────────────────
+cleanup_acr() {
+    echo "Cleaning up old ACR images (keeping latest 2 tags)..."
+    
+    # Get all tags except 'latest' and keep only last 2
+    ALL_TAGS=$(az acr repository show-tags \
+        --name "$ACR_NAME" \
+        --repository trader-ai \
+        --orderby time_desc \
+        --query "[?name != 'latest']" \
+        --output tsv 2>/dev/null || true)
+    
+    if [[ -n "$ALL_TAGS" ]]; then
+        # Count tags and delete if more than 2
+        TAG_COUNT=$(echo "$ALL_TAGS" | wc -l)
+        if [[ $TAG_COUNT -gt 2 ]]; then
+            # Delete from line 3 onward (keep first 2)
+            echo "$ALL_TAGS" | tail -n +3 | while read -r tag; do
+                if [[ -n "$tag" ]]; then
+                    echo "  Deleting old tag: trader-ai:$tag"
+                    az acr repository delete \
+                        --name "$ACR_NAME" \
+                        --image "trader-ai:$tag" \
+                        --yes \
+                        --output none 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+    
+    # Delete untagged manifests older than 7 days
+    echo "  Deleting untagged manifests older than 7 days..."
+    az acr run --registry "$ACR_NAME" \
+        --cmd 'acr purge --filter "trader-ai:.*" --untagged --ago 7d' \
+        /dev/null 2>/dev/null || true
+    
+    echo "  Cleanup complete."
+}
+
 # ── Sync .env with current storage connection string ──────────────────────────
 echo "Syncing .env with storage account $STORAGE_ACCOUNT..."
 STORAGE_CONN=$(az storage account show-connection-string \
@@ -63,6 +102,9 @@ gh secret set ACR_LOGIN_SERVER --repo Ondiek-source/trader-ai --body "$ACR_LOGIN
 gh secret set ACR_USERNAME     --repo Ondiek-source/trader-ai --body "$ACR_USERNAME"
 gh secret set ACR_PASSWORD     --repo Ondiek-source/trader-ai --body "$ACR_PASSWORD"
 echo "      Done."
+
+# ── Clean up old ACR images ───────────────────────────────────────────────────
+cleanup_acr
 
 # ── Ensure required providers are registered ──────────────────────────────────
 for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do

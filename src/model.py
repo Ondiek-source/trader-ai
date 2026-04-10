@@ -648,25 +648,46 @@ class ModelManager:
             except Exception as exc:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
 
-        # ── RandomForest (baseline) ───────────────────────────────────────────
+        # ── RandomForest (use subset of data to save memory) ───────────────────────────
         logger.info({"event": "debug_randomforest_start", "pair": pair, "X_shape": X_scaled.shape})
+
+        # Use only last 100k rows for RandomForest (saves memory)
+        MAX_RF_ROWS = 100000
+        if len(df) > MAX_RF_ROWS:
+            df_rf = df.tail(MAX_RF_ROWS).copy()  # Use most recent data
+            logger.info({"event": "randomforest_subset", "original": len(df), "subset": len(df_rf)})
+        else:
+            df_rf = df
+
         try:
             rf_model = RandomForestClassifier(
-                n_estimators=100, max_depth=6, random_state=42, n_jobs=2
+                n_estimators=100,  # Reduced from 200
+                max_depth=6,
+                random_state=42,
+                n_jobs=2,
             )
-            rf_model.fit(X_scaled, y)
+            
+            # Prepare data for RandomForest
+            X_rf = df_rf[self._feature_cols].to_numpy(dtype=np.float64)
+            y_rf = df_rf["label"].to_numpy(dtype=np.float64)
+            
+            # Scale using the same scaler
+            scaler_rf = StandardScaler()
+            X_rf_scaled = scaler_rf.fit_transform(X_rf)
+            
+            rf_model.fit(X_rf_scaled, y_rf)
             trained["randomforest"] = rf_model
+            
+            # Run walk-forward validation on the subset (not full 500k rows)
             wf_metrics["randomforest"] = walk_forward_evaluate(
-                df,
+                df_rf,  # Use subset for validation
                 "randomforest",
-                lambda: RandomForestClassifier(
-                    n_estimators=100, max_depth=6, random_state=42
-                ),
+                lambda: RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42),
                 self._feature_cols,
             )
+            logger.info({"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)})
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
-        
         logger.info({"event": "debug_randomforest_complete", "pair": pair})
 
         logger.info({"event": "debug_lstm_check", "pair": pair, "torch_available": TORCH_AVAILABLE, "has_recent_data": feature_df_recent is not None})
