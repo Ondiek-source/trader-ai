@@ -38,9 +38,9 @@ PAIR_TO_TD: dict[str, str] = {
 }
 
 TD_BASE = "https://api.twelvedata.com/time_series"
-CHUNK_SIZE = 5000       # bars per request (Twelve Data max)
+CHUNK_SIZE = 5000  # bars per request (Twelve Data max)
 REQUEST_INTERVAL = 8.0  # seconds between requests (8/min = free tier limit)
-BACKFILL_YEARS = 5      # how many years to try to fetch
+BACKFILL_YEARS = 5  # how many years to try to fetch
 
 
 def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
@@ -67,13 +67,15 @@ def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
             continue
 
         for offset_s, price in [(0, o), (15, h), (30, l), (45, c)]:
-            rows.append({
-                "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s)),
-                "bid": price,
-                "ask": price,
-                "spread": 0.0,
-                "pair": pair,
-            })
+            rows.append(
+                {
+                    "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s)),
+                    "bid": price,
+                    "ask": price,
+                    "spread": 0.0,
+                    "pair": pair,
+                }
+            )
 
     if not rows:
         return pd.DataFrame(columns=["timestamp", "bid", "ask", "spread", "pair"])
@@ -82,8 +84,9 @@ def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
     return df
 
 
-
-async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACKFILL_YEARS) -> None:
+async def backfill_pair(
+    pair: str, api_key: str, storage, years_back: int = BACKFILL_YEARS
+) -> None:
     """
     Fetch up to `years_back` years of M1 bars for `pair` via Twelve Data.
     Writes monthly parquet blobs to storage, skipping months already present.
@@ -92,18 +95,57 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
     if not symbol:
         logger.error({"event": "backfill_unknown_pair", "pair": pair})
         return
-
+    
+    # ========== NEW: Quick check using check_data_coverage ==========
+    if check_data_coverage(pair, storage, min_days=365 * years_back):
+        logger.info({
+            "event": "backfill_skipped_quick",
+            "pair": pair,
+            "reason": f"Already have {years_back}+ years of data in blob storage",
+        })
+        return
+    # ========== End of quick check ==========
+    
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=365 * years_back)
 
-    logger.info({
-        "event": "backfill_start",
-        "pair": pair,
-        "symbol": symbol,
-        "start": start_date.strftime("%Y-%m-%d"),
-        "end": end_date.strftime("%Y-%m-%d"),
-        "source": "TwelveData",
-    })
+    logger.info(
+        {
+            "event": "backfill_start",
+            "pair": pair,
+            "symbol": symbol,
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d"),
+            "source": "TwelveData",
+        }
+    )
+
+    # ========== NEW: Check if all months already exist ==========
+    all_months_exist = True
+    current_check = start_date.replace(day=1)
+    while current_check <= end_date:
+        blob_path = (
+            f"data/{pair}/{current_check.year}-{current_check.month:02d}.parquet"
+        )
+        if not storage.blob_exists(blob_path):
+            all_months_exist = False
+            break
+        # Move to next month
+        if current_check.month == 12:
+            current_check = current_check.replace(year=current_check.year + 1, month=1)
+        else:
+            current_check = current_check.replace(month=current_check.month + 1)
+
+    if all_months_exist:
+        logger.info(
+            {
+                "event": "backfill_skipped",
+                "pair": pair,
+                "reason": f"All {years_back} years of monthly data already exist in blob storage",
+            }
+        )
+        return  # ← Exit early, no API calls at all!
+    # ========== End of new check ==========
 
     session = requests.Session()
     session.headers["User-Agent"] = "TraderAI/1.0"
@@ -142,13 +184,29 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
                 code = data.get("code", "")
                 msg = data.get("message", "")
                 if "429" in str(code) or "rate" in msg.lower():
-                    logger.warning({"event": "backfill_rate_limited", "pair": pair, "waiting_s": 60})
+                    logger.warning(
+                        {
+                            "event": "backfill_rate_limited",
+                            "pair": pair,
+                            "waiting_s": 60,
+                        }
+                    )
                     await asyncio.sleep(60)
                     continue
-                logger.warning({"event": "backfill_api_error", "pair": pair, "code": code, "msg": msg})
+                logger.warning(
+                    {
+                        "event": "backfill_api_error",
+                        "pair": pair,
+                        "code": code,
+                        "msg": msg,
+                    }
+                )
                 break
 
             bars = data.get("values", [])
+            # Limit batch size to prevent memory spikes
+            if len(bars) > 2000:
+                bars = bars[:2000]  # Process in smaller batches
             if not bars:
                 # No data in this window — move further back
                 current_end = current_start - timedelta(minutes=1)
@@ -162,26 +220,45 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
                 tick_df["_ym"] = tick_df["timestamp"].dt.to_period("M")
                 for period, grp in tick_df.groupby("_ym"):
                     blob_path = f"data/{pair}/{period.year}-{period.month:02d}.parquet"
+
+                    # Check if blob already exists BEFORE writing
+                    if storage.blob_exists(blob_path):
+                        logger.info(
+                            {
+                                "event": "backfill_month_skipped",
+                                "pair": pair,
+                                "year": period.year,
+                                "month": period.month,
+                                "blob_path": blob_path,
+                                "reason": "already exists in blob storage",
+                            }
+                        )
+                        continue  # Skip this month completely
+
                     storage.write_raw_parquet(blob_path, grp.drop(columns=["_ym"]))
-                    logger.info({
-                        "event": "backfill_month_written",
-                        "pair": pair,
-                        "year": period.year,
-                        "month": period.month,
-                        "rows": len(grp),
-                        "blob_path": blob_path,
-                    })
+                    logger.info(
+                        {
+                            "event": "backfill_month_written",
+                            "pair": pair,
+                            "year": period.year,
+                            "month": period.month,
+                            "rows": len(grp),
+                            "blob_path": blob_path,
+                        }
+                    )
                 del tick_df  # free memory immediately
 
-            logger.info({
-                "event": "backfill_chunk",
-                "pair": pair,
-                "bars_fetched": len(bars),
-                "window_start": current_start.strftime("%Y-%m-%d"),
-                "window_end": current_end.strftime("%Y-%m-%d"),
-                "total_bars": total_bars,
-                "requests": request_count,
-            })
+            logger.info(
+                {
+                    "event": "backfill_chunk",
+                    "pair": pair,
+                    "bars_fetched": len(bars),
+                    "window_start": current_start.strftime("%Y-%m-%d"),
+                    "window_end": current_end.strftime("%Y-%m-%d"),
+                    "total_bars": total_bars,
+                    "requests": request_count,
+                }
+            )
 
             # Oldest bar in this chunk becomes the new end
             oldest_dt_str = bars[-1]["datetime"]
@@ -196,26 +273,34 @@ async def backfill_pair(pair: str, api_key: str, storage, years_back: int = BACK
                 await asyncio.sleep(wait)
 
         except requests.RequestException as exc:
-            logger.warning({"event": "backfill_request_failed", "pair": pair, "error": str(exc)})
+            logger.warning(
+                {"event": "backfill_request_failed", "pair": pair, "error": str(exc)}
+            )
             await asyncio.sleep(30)
             continue
 
     session.close()
 
-    logger.info({
-        "event": "backfill_complete",
-        "pair": pair,
-        "total_bars": total_bars,
-        "requests": request_count,
-    })
+    logger.info(
+        {
+            "event": "backfill_complete",
+            "pair": pair,
+            "total_bars": total_bars,
+            "requests": request_count,
+        }
+    )
 
 
-async def backfill_all(pairs: list[str], storage, years_back: int = BACKFILL_YEARS) -> None:
+async def backfill_all(
+    pairs: list[str], storage, years_back: int = BACKFILL_YEARS
+) -> None:
     """Run backfill for all pairs (sequentially to respect rate limits)."""
     # Get API key from storage config — passed via environment via config
     api_key = _get_api_key()
     if not api_key:
-        logger.error({"event": "backfill_no_api_key", "reason": "TWELVEDATA_API_KEY not set"})
+        logger.error(
+            {"event": "backfill_no_api_key", "reason": "TWELVEDATA_API_KEY not set"}
+        )
         return
 
     for pair in pairs:
@@ -227,6 +312,7 @@ async def backfill_all(pairs: list[str], storage, years_back: int = BACKFILL_YEA
 def _get_api_key() -> str:
     """Read TWELVEDATA_API_KEY from environment."""
     import os
+
     return os.environ.get("TWELVEDATA_API_KEY", "")
 
 
@@ -235,7 +321,8 @@ def check_data_coverage(pair: str, storage, min_days: int = 365) -> bool:
     Returns True if there is at least min_days of data in blob storage.
     Used at startup to decide whether a backfill run is needed.
     """
-    df = storage.read_ticks(pair, months=12)
+    months_to_read = max(24, (min_days // 30) + 3)
+    df = storage.read_ticks(pair, months=months_to_read)
     if df.empty:
         return False
     ts_col = "timestamp"
