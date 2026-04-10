@@ -357,13 +357,35 @@ async def backfill_task(config, storage) -> None:
         try:
             from azure.storage.blob import BlobServiceClient
 
-            client = BlobServiceClient.from_connection_string(
-                storage._client.connection_string
+            conn_string = storage._client.connection_string
+            logger.info(
+                {"event": "blob_conn_string_present", "length": len(conn_string)}
             )
+
+            client = BlobServiceClient.from_connection_string(conn_string)
             container_client = client.get_container_client(storage._container)
+
+            # List blobs with timeout
+            import sys
+
+            sys.stderr.write("Listing blobs...\n")
+
             blobs = list(container_client.list_blobs(name_starts_with="data/"))
             parquet_count = len([b for b in blobs if b.name.endswith(".parquet")])
-            logger.info({"event": "blob_count_success", "count": parquet_count})
+            logger.info(
+                {
+                    "event": "blob_count_success",
+                    "count": parquet_count,
+                }
+            )
+        except ImportError as e:
+            logger.error(
+                {
+                    "event": "blob_import_error",
+                    "error": str(e),
+                }
+            )
+            parquet_count = 0
         except Exception as e:
             logger.error(
                 {
