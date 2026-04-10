@@ -5,7 +5,7 @@
 # Idempotent: safe to re-run — skips resources that already exist.
 #
 # Creates:
-#   - Resource group (uksouth)
+#   - Resource group (eastus)
 #   - Storage account + blob container (tick data / model files)
 #   - Azure Container Registry (Docker image store)
 #   - Windows VM 8GB RAM (trading bot host — 24/7, no screen lock)
@@ -16,21 +16,21 @@
 
 set -euo pipefail
 
-# ── Configuration — ALL resources in uksouth ──────────────────────────────────
+# ── Configuration — ALL resources in one location ──────────────────────────────────
 RESOURCE_GROUP="rg-trader-ai"
-LOCATION="southafricanorth"
+LOCATION="eastus"
 
 CONTAINER_NAME="traderai"
 ACI_NAME="trader-ai-engine"
-ACI_CPU=2
-ACI_MEMORY=8
+ACI_CPU=8
+ACI_MEMORY=16
 
-VM_NAME="trader-bot-vm"
-VM_LOCATION="southafricanorth"  # same region — Quotex accessible from here
-VM_SIZE="Standard_D2s_v3"    # 2 vCPU, 8 GB RAM
-VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
-VM_ADMIN_USER="traderadmin"
-VM_ADMIN_PASS="TraderAI-2024xAz"
+# VM_NAME="trader-bot-vm"
+# VM_LOCATION="eastus"  # same region — Quotex accessible from here
+# VM_SIZE="Standard_D2s_v3"    # 2 vCPU, 8 GB RAM
+# VM_IMAGE="MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest"
+# VM_ADMIN_USER="traderadmin"
+# VM_ADMIN_PASS="TraderAI-2024xAz"
 
 echo ""
 echo "=========================================="
@@ -114,49 +114,49 @@ ACR_PASSWORD=$(az acr credential show --name "$ACR_NAME" \
 echo "      Registry: $ACR_LOGIN_SERVER"
 
 # ── 4. Windows VM ─────────────────────────────────────────────────────────────
-echo "[4/6] Windows VM $VM_NAME ($VM_SIZE)..."
-EXISTING_VM=$(az vm show --name "$VM_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query name --output tsv 2>/dev/null || true)
+# echo "[4/6] Windows VM $VM_NAME ($VM_SIZE)..."
+# EXISTING_VM=$(az vm show --name "$VM_NAME" \
+#   --resource-group "$RESOURCE_GROUP" \
+#   --query name --output tsv 2>/dev/null || true)
 
-if [[ -n "$EXISTING_VM" ]]; then
-  echo "      Already exists — skipping."
-  VM_PUBLIC_IP=$(az vm show --name "$VM_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --show-details --query publicIps --output tsv)
-else
-  echo "      Creating (3-5 minutes)..."
-  az vm create \
-    --name "$VM_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --location "$VM_LOCATION" \
-    --image "$VM_IMAGE" \
-    --size "$VM_SIZE" \
-    --admin-username "$VM_ADMIN_USER" \
-    --admin-password "$VM_ADMIN_PASS" \
-    --public-ip-sku Standard \
-    --output table
+# if [[ -n "$EXISTING_VM" ]]; then
+#   echo "      Already exists — skipping."
+#   VM_PUBLIC_IP=$(az vm show --name "$VM_NAME" \
+#     --resource-group "$RESOURCE_GROUP" \
+#     --show-details --query publicIps --output tsv)
+# else
+#   echo "      Creating (3-5 minutes)..."
+#   az vm create \
+#     --name "$VM_NAME" \
+#     --resource-group "$RESOURCE_GROUP" \
+#     --location "$VM_LOCATION" \
+#     --image "$VM_IMAGE" \
+#     --size "$VM_SIZE" \
+#     --admin-username "$VM_ADMIN_USER" \
+#     --admin-password "$VM_ADMIN_PASS" \
+#     --public-ip-sku Standard \
+#     --output table
 
-  az vm open-port \
-    --name "$VM_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --port 3389 \
-    --output none
+#   az vm open-port \
+#     --name "$VM_NAME" \
+#     --resource-group "$RESOURCE_GROUP" \
+#     --port 3389 \
+#     --output none
 
-  VM_PUBLIC_IP=$(az vm show --name "$VM_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --show-details --query publicIps --output tsv)
-  echo "      Created. IP: $VM_PUBLIC_IP"
-fi
+#   VM_PUBLIC_IP=$(az vm show --name "$VM_NAME" \
+#     --resource-group "$RESOURCE_GROUP" \
+#     --show-details --query publicIps --output tsv)
+#   echo "      Created. IP: $VM_PUBLIC_IP"
+# fi
 
-# ── 5. Disable VM auto-shutdown ───────────────────────────────────────────────
-echo "[5/6] Disabling VM auto-shutdown..."
-az vm auto-shutdown \
-  --name "$VM_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --off \
-  --output none 2>/dev/null || true
-echo "      Done."
+# # ── 5. Disable VM auto-shutdown ───────────────────────────────────────────────
+# echo "[5/6] Disabling VM auto-shutdown..."
+# az vm auto-shutdown \
+#   --name "$VM_NAME" \
+#   --resource-group "$RESOURCE_GROUP" \
+#   --off \
+#   --output none 2>/dev/null || true
+# echo "      Done."
 
 # ── 6. Write azure.env ────────────────────────────────────────────────────────
 echo "[6/6] Writing deploy/azure.env..."

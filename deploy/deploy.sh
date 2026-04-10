@@ -135,7 +135,7 @@ echo "      Done."
 # cleanup_acr
 
 # ── Clean up old logs ─────────────────────────────────────────────────────────
-cleanup_logs
+# cleanup_logs
 
 # ── Ensure required providers are registered ──────────────────────────────────
 for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do
@@ -192,17 +192,42 @@ az container create \
   --registry-password "$ACR_PASSWORD" \
   --cpu "$ACI_CPU" \
   --memory "$ACI_MEMORY" \
+  --location "$LOCATION" \
   --os-type Linux \
   --restart-policy Always \
   --ports 8080 \
   --ip-address Public \
   --environment-variables $ENV_ARGS \
+  --memory-limit "$ACI_MEMORY"\
+  --cpu-limit "$ACI_CPU"\
+  --log-analytics-workspace "$LOG_ANALYTICS_WORKSPACE"\
+  --log-analytics-workspace-key "$LOG_ANALYTICS_KEY"\
+  --dns-name-label "trader-ai-bot"\
+  --environment-variables-file "$APP_ENV"\
   --output table
 
 DASHBOARD_IP=$(az container show \
   --name "$ACI_NAME" \
   --resource-group "$RESOURCE_GROUP" \
   --query ipAddress.ip --output tsv 2>/dev/null || echo "pending")
+
+# After container create, wait for model save
+echo "Waiting for models to train and save..."
+sleep 1000  # 18 minutes
+
+# Check if models exist in blob
+MODEL_COUNT=$(az storage blob list \
+    --account-name "$STORAGE_ACCOUNT" \
+    --container-name "$CONTAINER_NAME" \
+    --prefix "models/" \
+    --query "length([])" \
+    --output tsv 2>/dev/null || echo "0")
+
+if [[ "$MODEL_COUNT" -gt 0 ]]; then
+    echo "✅ Models saved to blob storage"
+else
+    echo "⚠️ No models found in blob storage"
+fi
 
 echo ""
 echo "=========================================="
