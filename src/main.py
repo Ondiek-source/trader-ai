@@ -2,14 +2,14 @@
 main.py — Asyncio orchestrator for the Trader AI signal engine.
 
 Task topology:
-  stream_task      — OANDA tick stream (thread executor)
-  signal_task      — Feature engineering + model inference → webhook
-  result_task      — HTTP server receiving trade results from bot
-  feedback_task    — Consumes results → updates orchestrator + storage
-  report_task      — Scheduled Telegram/Discord reports (every 60 min)
-  telegram_task    — Telegram bot long-polling for commands
-  health_task      — System heartbeat every 60 s
-  backfill_task    — One-shot historical data download at startup
+    stream_task      — Tick stream (thread executor)
+    signal_task      — Feature engineering + model inference → webhook
+    result_task      — HTTP server receiving trade results from bot
+    feedback_task    — Consumes results → updates orchestrator + storage
+    report_task      — Scheduled Telegram/Discord reports (every 60 min)
+    telegram_task    — Telegram bot long-polling for commands
+    health_task      — System heartbeat every 60 s
+    backfill_task    — One-shot historical data download at startup
 
 Each task is wrapped in a supervisor that catches any exception,
 logs it, sleeps 5 s, and restarts the task.
@@ -329,7 +329,7 @@ async def health_task(
         process = psutil.Process()
         memory_mb = process.memory_info().rss / 1024 / 1024
         cpu_percent = process.cpu_percent(interval=1)
-        
+
         logger.info(
             {
                 "event": "health",
@@ -344,7 +344,7 @@ async def health_task(
                 "cpu_percent": cpu_percent,
             }
         )
-        
+
         logger.info(
             {
                 "event": "health",
