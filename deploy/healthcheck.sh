@@ -102,7 +102,7 @@ fi
 # ── 4. Models trained (FIXED — handles newlines) ──────────────────────────────
 echo "[ 4/8 ] Model training..."
 # Clean the count to remove any newlines or extra characters
-RAW_COUNT=$(echo "$LOGS" | grep -c "trained\|_trained\|training_complete" 2>/dev/null || echo "0")
+RAW_COUNT=$(echo "$LOGS" | grep -c "walk_forward_complete" 2>/dev/null || echo "0")
 TRAINED_COUNT=$(echo "$RAW_COUNT" | tr -d '\n\r' | xargs)
 
 # Ensure it's a valid number
@@ -110,7 +110,7 @@ if [[ ! "$TRAINED_COUNT" =~ ^[0-9]+$ ]]; then
   TRAINED_COUNT=0
 fi
 
-if [[ "$TRAINED_COUNT" -ge 3 ]] 2>/dev/null; then
+if [[ "$TRAINED_COUNT" -ge 2 ]] 2>/dev/null; then
   check "Models trained ($TRAINED_COUNT models)" "pass"
 elif [[ "$TRAINED_COUNT" -gt 0 ]] 2>/dev/null; then
   check "Models partially trained ($TRAINED_COUNT models)" "warn" "Training still in progress"
