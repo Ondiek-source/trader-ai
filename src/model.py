@@ -756,8 +756,14 @@ class ModelManager:
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_LSTM_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_LSTM_SEQUENCES + SEQ_LEN)
-                logger.info({"event": "lstm_sequences_capped", "original": original_rows, "capped": len(df_recent)})
-                
+                logger.info(
+                    {
+                        "event": "lstm_sequences_capped",
+                        "original": original_rows,
+                        "capped": len(df_recent),
+                    }
+                )
+
             if len(df_recent) >= SEQ_LEN + 50:
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
@@ -870,14 +876,20 @@ class ModelManager:
             df_recent = feature_df_recent.dropna(
                 subset=["label"] + self._feature_cols
             ).copy()
-            
-            # Cap the number of sequences 
-            MAX_TRANSFORMER_SEQUENCES = self._max_sequences  
+
+            # Cap the number of sequences
+            MAX_TRANSFORMER_SEQUENCES = self._max_sequences
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_TRANSFORMER_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_TRANSFORMER_SEQUENCES + SEQ_LEN)
-                logger.info({"event": "transformer_sequences_capped", "original": original_rows, "capped": len(df_recent)})
-            
+                logger.info(
+                    {
+                        "event": "transformer_sequences_capped",
+                        "original": original_rows,
+                        "capped": len(df_recent),
+                    }
+                )
+
             if len(df_recent) >= SEQ_LEN + 50:
                 try:
                     X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
@@ -901,11 +913,16 @@ class ModelManager:
                         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
                     else:
                         logger.info(
-                            {"event": "transformer_debug_using_existing_scaler", "pair": pair}
+                            {
+                                "event": "transformer_debug_using_existing_scaler",
+                                "pair": pair,
+                            }
                         )
                         X_recent_scaled = scaler.transform(X_recent)
 
-                    logger.info({"event": "transformer_debug_making_sequences", "pair": pair})
+                    logger.info(
+                        {"event": "transformer_debug_making_sequences", "pair": pair}
+                    )
                     X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
                     y_seq = y_recent[SEQ_LEN - 1 :]
                     logger.info(
@@ -1213,8 +1230,8 @@ class ModelManager:
         current = self._result_counts.get(pair, 0)
         return (current - last) >= self._retrain_threshold
 
-    def save(self, path: str) -> None:
-        """Persist all models and trackers to disk."""
+    def save(self, path: str, storage=None) -> None:
+        """Persist all models and trackers to disk and blob."""
         os.makedirs(path, exist_ok=True)
         payload = {
             "models": self._models,
@@ -1226,16 +1243,37 @@ class ModelManager:
         }
         with open(os.path.join(path, "model_manager.pkl"), "wb") as f:
             pickle.dump(payload, f)
+        # Also save to blob storage if provided
+        if storage:
+            with open(os.path.join(path, "model_manager.pkl"), "rb") as f:
+                storage.save_model(f.read())
+
         logger.info({"event": "models_saved", "path": path})
 
-    def load(self, path: str) -> None:
+    def load(self, path: str, storage=None) -> None:
         """Load persisted models from disk."""
         fpath = os.path.join(path, "model_manager.pkl")
-        if not os.path.exists(fpath):
+        # Try local first
+        if os.path.exists(fpath):
+            with open(fpath, "rb") as f:
+                payload = pickle.load(f)
+            logger.info({"event": "models_loaded_from_local", "path": path})
+        elif storage:
+            # Try blob storage
+            data = storage.load_model()
+            if data:
+                with open(fpath, "wb") as f:
+                    f.write(data)
+                with open(fpath, "rb") as f:
+                    payload = pickle.load(f)
+                logger.info({"event": "models_loaded_from_blob"})
+            else:
+                logger.info({"event": "no_saved_models", "path": path})
+                return
+        else:
             logger.info({"event": "no_saved_models", "path": path})
             return
-        with open(fpath, "rb") as f:
-            payload = pickle.load(f)
+
         self._models = payload.get("models", {})
         self._scalers = payload.get("scalers", {})
         self._metrics = payload.get("metrics", {})

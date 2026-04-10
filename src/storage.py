@@ -59,7 +59,9 @@ FALLBACK_ROOT = Path("/tmp/fallback")
 class StorageManager:
     """Thread-safe Parquet append manager backed by Azure Blob Storage."""
 
-    def __init__(self, conn_string: str, container_name: str, flush_size: int = 500) -> None:
+    def __init__(
+        self, conn_string: str, container_name: str, flush_size: int = 500
+    ) -> None:
         self._client = BlobServiceClient.from_connection_string(conn_string)
         self._container = container_name
         self._flush_size = flush_size
@@ -137,24 +139,34 @@ class StorageManager:
         for m in range(12):
             year = now.year if now.month - m > 0 else now.year - 1
             month = (now.month - m - 1) % 12 + 1
-            blob_path = self._result_blob_path(pair, datetime(year, month, 1, tzinfo=timezone.utc))
+            blob_path = self._result_blob_path(
+                pair, datetime(year, month, 1, tzinfo=timezone.utc)
+            )
             df = self._read_parquet(blob_path)
             if df is not None:
                 frames.append(df)
         if not frames:
             return pd.DataFrame(columns=list(RESULT_SCHEMA.names))
-        return pd.concat(frames, ignore_index=True).sort_values("signal_time").reset_index(drop=True)
+        return (
+            pd.concat(frames, ignore_index=True)
+            .sort_values("signal_time")
+            .reset_index(drop=True)
+        )
 
     def blob_exists(self, blob_path: str) -> bool:
         """Check if a blob exists (used by backfill to skip already-downloaded data)."""
         try:
-            blob_client = self._client.get_blob_client(container=self._container, blob=blob_path)
+            blob_client = self._client.get_blob_client(
+                container=self._container, blob=blob_path
+            )
             blob_client.get_blob_properties()
             return True
         except Exception:
             return False
 
-    def write_raw_parquet(self, blob_path: str, df: pd.DataFrame, schema: pa.Schema | None = None) -> None:
+    def write_raw_parquet(
+        self, blob_path: str, df: pd.DataFrame, schema: pa.Schema | None = None
+    ) -> None:
         """Write a DataFrame to a blob path directly (used by backfill)."""
         self._append_parquet(blob_path, df, schema)
 
@@ -169,7 +181,13 @@ class StorageManager:
                     self._upload_table(blob_path, table)
                     logger.info({"event": "retry_success", "blob_path": blob_path})
                 except Exception as exc:
-                    logger.warning({"event": "retry_failed", "blob_path": blob_path, "error": str(exc)})
+                    logger.warning(
+                        {
+                            "event": "retry_failed",
+                            "blob_path": blob_path,
+                            "error": str(exc),
+                        }
+                    )
                     remaining.append((blob_path, table))
             self._retry_queue = remaining
 
@@ -191,7 +209,9 @@ class StorageManager:
         self._append_parquet(blob_path, df, TICK_SCHEMA)
         self._tick_buffers[pair] = []
 
-    def _append_parquet(self, blob_path: str, new_df: pd.DataFrame, schema: pa.Schema | None) -> None:
+    def _append_parquet(
+        self, blob_path: str, new_df: pd.DataFrame, schema: pa.Schema | None
+    ) -> None:
         """Read existing parquet from blob, concat new_df, write back."""
         existing = self._read_parquet(blob_path)
         if existing is not None and not existing.empty:
@@ -202,11 +222,17 @@ class StorageManager:
         # De-duplicate on timestamp within a pair (ticks)
         ts_col = "timestamp" if "timestamp" in combined.columns else "signal_time"
         if ts_col in combined.columns:
-            combined = combined.drop_duplicates(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
+            combined = (
+                combined.drop_duplicates(subset=[ts_col])
+                .sort_values(ts_col)
+                .reset_index(drop=True)
+            )
 
         if schema is not None:
             try:
-                table = pa.Table.from_pandas(combined, schema=schema, preserve_index=False)
+                table = pa.Table.from_pandas(
+                    combined, schema=schema, preserve_index=False
+                )
             except Exception:
                 table = pa.Table.from_pandas(combined, preserve_index=False)
         else:
@@ -214,10 +240,21 @@ class StorageManager:
 
         try:
             self._upload_table(blob_path, table)
-            logger.debug({"event": "parquet_written", "blob_path": blob_path, "rows": len(combined)})
+            logger.debug(
+                {
+                    "event": "parquet_written",
+                    "blob_path": blob_path,
+                    "rows": len(combined),
+                }
+            )
         except (AzureError, Exception) as exc:
             logger.error(
-                {"event": "blob_write_failed", "blob_path": blob_path, "error": str(exc), "action": "spilling_to_tmp"}
+                {
+                    "event": "blob_write_failed",
+                    "blob_path": blob_path,
+                    "error": str(exc),
+                    "action": "spilling_to_tmp",
+                }
             )
             self._spill_to_tmp(blob_path, table)
             with self._retry_lock:
@@ -227,7 +264,9 @@ class StorageManager:
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
         buf.seek(0)
-        blob_client = self._client.get_blob_client(container=self._container, blob=blob_path)
+        blob_client = self._client.get_blob_client(
+            container=self._container, blob=blob_path
+        )
         blob_client.upload_blob(buf, overwrite=True)
 
     def _read_parquet(self, blob_path: str) -> pd.DataFrame | None:
@@ -240,7 +279,9 @@ class StorageManager:
                 pass
         # Read from Azure
         try:
-            blob_client = self._client.get_blob_client(container=self._container, blob=blob_path)
+            blob_client = self._client.get_blob_client(
+                container=self._container, blob=blob_path
+            )
             data = blob_client.download_blob().readall()
             buf = io.BytesIO(data)
             return pd.read_parquet(buf)
@@ -267,9 +308,36 @@ class StorageManager:
         except Exception:
             try:
                 self._client.create_container(self._container)
-                logger.info({"event": "container_created", "container": self._container})
+                logger.info(
+                    {"event": "container_created", "container": self._container}
+                )
             except Exception as exc:
                 logger.warning({"event": "container_create_warning", "error": str(exc)})
+
+    def save_model(
+        self, model_data: bytes, model_name: str = "model_manager.pkl"
+    ) -> None:
+        """Save model to blob storage."""
+        blob_path = f"models/{model_name}"
+        blob_client = self._client.get_blob_client(
+            container=self._container, blob=blob_path
+        )
+        blob_client.upload_blob(model_data, overwrite=True)
+        logger.info({"event": "model_saved_to_blob", "blob_path": blob_path})
+
+    def load_model(self, model_name: str = "model_manager.pkl") -> bytes | None:
+        """Load model from blob storage."""
+        blob_path = f"models/{model_name}"
+        try:
+            blob_client = self._client.get_blob_client(
+                container=self._container, blob=blob_path
+            )
+            data = blob_client.download_blob().readall()
+            logger.info({"event": "model_loaded_from_blob", "blob_path": blob_path})
+            return data
+        except Exception:
+            logger.info({"event": "no_model_in_blob", "blob_path": blob_path})
+            return None
 
     @staticmethod
     def _tick_blob_path(pair: str, year: int, month: int) -> str:

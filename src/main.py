@@ -216,7 +216,7 @@ async def signal_task(
                                     feature_df_recent,
                                 ),
                             )
-                            model_manager.save(MODEL_SAVE_PATH)
+                            model_manager.save(MODEL_SAVE_PATH, storage=storage)
                             logger.info({"event": "retrain_complete", "pair": p})
                 except Exception as exc:
                     logger.warning(
@@ -345,17 +345,6 @@ async def health_task(
             }
         )
 
-        logger.info(
-            {
-                "event": "health",
-                "uptime_seconds": uptime,
-                "ticks_received": stream.ticks_received,
-                "session": status.get("session"),
-                "martingale_streak": status.get("martingale_streak"),
-                "confidence_threshold": status.get("confidence_threshold"),
-                "pending_signals": status.get("pending_signals"),
-            }
-        )
         # Push live data to dashboard
         status_store.update(
             {
@@ -448,7 +437,7 @@ async def initial_training(config, storage, model_manager) -> None:
     Retries every 5 minutes until all pairs have a trained model
     (backfill may still be running when this first executes).
     """
-    model_manager.load(MODEL_SAVE_PATH)
+    model_manager.load(MODEL_SAVE_PATH, storage=storage)
 
     # Wait until backfill has written sufficient data before training.
     # Check every 2 minutes. Train once coverage reaches ≥ 365 days per pair.
@@ -536,7 +525,7 @@ async def initial_training(config, storage, model_manager) -> None:
                 }
             )
 
-        model_manager.save(MODEL_SAVE_PATH)
+        model_manager.save(MODEL_SAVE_PATH, storage=storage)
 
         if all_trained:
             logger.info({"event": "all_models_trained"})
@@ -570,7 +559,7 @@ async def main() -> None:
         container_name=config.container_name,
         flush_size=config.tick_flush_size,
     )
-
+    
     # ── Add persistent blob logging ──────────────────────────────────────────
     try:
         blob_handler = BlobLogHandler(
@@ -696,7 +685,7 @@ async def main() -> None:
             task.cancel()
         stream.stop()
         await quotex_reader.disconnect()
-        model_manager.save(MODEL_SAVE_PATH)
+        model_manager.save(MODEL_SAVE_PATH, storage=storage)
         storage.force_flush if hasattr(storage, "force_flush") else None
         logger.info({"event": "shutdown_complete"})
 
