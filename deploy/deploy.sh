@@ -132,7 +132,7 @@ gh secret set ACR_PASSWORD     --repo Ondiek-source/trader-ai --body "$ACR_PASSW
 echo "      Done."
 
 # ── Clean up old ACR images ───────────────────────────────────────────────────
-cleanup_acr
+# cleanup_acr
 
 # ── Clean up old logs ─────────────────────────────────────────────────────────
 cleanup_logs

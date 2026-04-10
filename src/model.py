@@ -753,6 +753,7 @@ class ModelManager:
                 }
             )
             MAX_LSTM_SEQUENCES = self._max_sequences
+            logger.info({"event": "lstm_debug_max_sequences", "value": MAX_LSTM_SEQUENCES, "seq_len": SEQ_LEN})
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_LSTM_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_LSTM_SEQUENCES + SEQ_LEN)
