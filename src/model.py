@@ -880,6 +880,7 @@ class ModelManager:
 
             # Cap the number of sequences
             MAX_TRANSFORMER_SEQUENCES = self._max_sequences
+            logger.info({"event": "transformer_debug_max_sequences", "value": MAX_TRANSFORMER_SEQUENCES, "seq_len": SEQ_LEN})
             original_rows = len(df_recent)
             if len(df_recent) >= MAX_TRANSFORMER_SEQUENCES + SEQ_LEN:
                 df_recent = df_recent.tail(MAX_TRANSFORMER_SEQUENCES + SEQ_LEN)
