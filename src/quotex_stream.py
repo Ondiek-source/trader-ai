@@ -1,16 +1,23 @@
 """
 quotex_stream.py — Quotex OTC tick streaming via pyquotex.
 
-Drop-in alternative to :class:`~stream.TwelveDataStream`.  Polls Quotex for
-live OTC prices and emits :class:`~stream.Tick` objects on the same shared
-queue, so the signal generator, feature engineering, and storage pipeline
-work unchanged.
+Drop-in alternative to :class:`~twelveticks_stream.TwelveDataStream`.
+Polls Quotex for live OTC prices and emits :class:`~twelveticks_stream.Tick`
+objects on the same shared queue, so the signal generator, feature
+engineering, and storage pipeline work unchanged.
 
 Thread model mirrors TwelveDataStream:
     - Background thread runs an asyncio event loop.
-    - Each price poll becomes a :class:`~stream.Tick`.
+    - Each price poll becomes a :class:`~twelveticks_stream.Tick`.
     - Ticks are buffered per pair and flushed to storage every N ticks.
     - On disconnect: logs warning, waits with backoff, reconnects forever.
+
+pyquotex API (confirmed from docs):
+    - Quotex(email, password, lang="en")
+    - await client.connect() → (bool, str)
+    - client.start_realtime_price(asset, period) → None  (sync, blocks until data)
+    - await client.get_realtime_price(asset) → dict | int | float | None
+    - client.close() → None
 """
 
 from __future__ import annotations
@@ -31,20 +38,19 @@ logger = logging.getLogger(__name__)
 # ── Quotex symbol mapping ─────────────────────────────────────────────────────
 # Internal format : EUR_USD
 # Quotex OTC sub  : EURUSD_otc   (lowercase _otc suffix)
-# Webhook format  : EURUSD_otc   (same as subscription)
 
 
 def _to_quotex_symbol(pair: str) -> str:
-    """``EUR_USD`` → ``EURUSD_otc`` (Quotex OTC format)."""
+    """
+    Convert internal pair format to Quotex OTC subscription symbol.
+
+    Args:
+        pair: Internal format like ``"EUR_USD"``.
+
+    Returns:
+        Quotex OTC symbol like ``"EURUSD_otc"``.
+    """
     return pair.replace("_", "") + "_otc"
-
-
-def _from_quotex_symbol(symbol: str) -> str:
-    """``EURUSD_otc`` → ``EUR_USD``"""
-    base = symbol.replace("_otc", "").replace("_OTC", "")
-    if len(base) == 6:
-        return f"{base[:3]}_{base[3:]}"
-    return base
 
 
 # ── Main stream class ─────────────────────────────────────────────────────────
@@ -54,8 +60,13 @@ class QuotexStream:
     """
     Streams live OTC prices from Quotex via pyquotex.
 
+    Drop-in replacement for :class:`~twelveticks_stream.TwelveDataStream`
+    with the same public interface: ``tick_queue``, ``ticks_received``,
+    ``start()``, ``stop()``.
+
     Args:
-        client: An authenticated ``Quotex`` instance from ``pyquotex.stable_api``.
+        client: An authenticated ``Quotex`` instance from
+            ``pyquotex.stable_api``.
         pairs: List of internal-format pairs (``["EUR_USD", ...]``).
         storage: :class:`~storage.StorageManager` instance for persistence.
         flush_size: Number of ticks to buffer before auto-flush to blob.
@@ -75,21 +86,21 @@ class QuotexStream:
         tick_queue: queue.Queue[Tick] | None = None,
         poll_interval: float = 1.0,
     ) -> None:
-        self._client = client
-        self._pairs = pairs
-        self._storage = storage
-        self._flush_size = flush_size
+        self._client: Any = client
+        self._pairs: list[str] = pairs
+        self._storage: Any = storage
+        self._flush_size: int = flush_size
         self._tick_queue: queue.Queue[Tick] = tick_queue or queue.Queue(maxsize=100_000)
-        self._poll_interval = poll_interval
+        self._poll_interval: float = poll_interval
 
-        self._buffers: dict[str, list[dict]] = {p: [] for p in pairs}
-        self._buffer_lock = threading.Lock()
+        self._buffers: dict[str, list[dict[str, Any]]] = {p: [] for p in pairs}
+        self._buffer_lock: threading.Lock = threading.Lock()
         self._last_price: dict[str, float] = {}
 
-        self._stop_event = threading.Event()
+        self._stop_event: threading.Event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._ticks_received = 0
-        self._connected = False
+        self._ticks_received: int = 0
+        self._connected: bool = False
 
         logger.info(
             {
@@ -104,7 +115,11 @@ class QuotexStream:
 
     @property
     def tick_queue(self) -> queue.Queue[Tick]:
-        """Shared queue of :class:`~stream.Tick` objects for the signal generator."""
+        """
+        Shared queue of :class:`~twelveticks_stream.Tick` objects.
+
+        Consumed by the signal generator in :func:`main.signal_task`.
+        """
         return self._tick_queue
 
     @property
@@ -115,10 +130,17 @@ class QuotexStream:
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the background streaming thread."""
+        """
+        Start the background streaming thread.
+
+        The thread runs its own asyncio event loop and polls Quotex
+        prices at :attr:`_poll_interval` for each pair.
+        """
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="quotex-stream"
+            target=self._run_loop,
+            daemon=True,
+            name="quotex-stream",
         )
         self._thread.start()
         logger.info(
@@ -131,9 +153,9 @@ class QuotexStream:
         )
 
     def stop(self) -> None:
-        """Signal the stream to stop, wait for the thread, then flush remaining ticks."""
+        """Signal the stream to stop, wait for the thread, then flush."""
         self._stop_event.set()
-        if self._thread:
+        if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
         self._flush_all()
         logger.info({"event": "stream_stopped", "provider": "Quotex"})
@@ -149,8 +171,11 @@ class QuotexStream:
         asyncio.run(self._async_stream_loop())
 
     async def _async_stream_loop(self) -> None:
-        """Outer reconnect loop — reconnects with exponential backoff."""
-        reconnect_delay = self.BACKOFF_BASE
+        """
+        Outer reconnect loop — reconnects with exponential backoff
+        on any exception.
+        """
+        reconnect_delay: float = self.BACKOFF_BASE
         while not self._stop_event.is_set():
             try:
                 await self._connect()
@@ -174,7 +199,14 @@ class QuotexStream:
     # ── Connection ─────────────────────────────────────────────────────────────
 
     async def _connect(self) -> None:
-        """Connect and authenticate with Quotex."""
+        """
+        Connect and authenticate with Quotex.
+
+        Retries up to :attr:`MAX_RETRIES` times with linear backoff.
+
+        Raises:
+            ConnectionError: If all retries are exhausted.
+        """
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
                 check, msg = await self._client.connect()
@@ -182,11 +214,11 @@ class QuotexStream:
                     self._connected = True
                     logger.info({"event": "quotex_connected", "message": msg})
                     return
-                raise ConnectionError(msg)
+                raise ConnectionError(str(msg))
             except Exception as exc:
                 if attempt == self.MAX_RETRIES:
                     raise
-                wait = self.BACKOFF_BASE * attempt
+                wait: float = self.BACKOFF_BASE * attempt
                 logger.warning(
                     {
                         "event": "quotex_connect_retry",
@@ -200,18 +232,29 @@ class QuotexStream:
 
         raise ConnectionError("Quotex connection exhausted all retries")
 
-    # ── Subscription ───────────────────────────────────────────────────────────
+    # ── Stream setup ───────────────────────────────────────────────────────────
 
-    async def _subscribe_symbols(self, symbols: dict[str, str]) -> None:
-        """Subscribe to real-time price data for all symbols."""
+    def _start_realtime_streams(self, symbols: dict[str, str]) -> None:
+        """
+        Start real-time price streams for all symbols.
+
+        Per pyquotex docs, ``start_realtime_price`` is synchronous and
+        internally blocks until ``api.realtime_price[asset]`` is populated.
+        Without this, ``get_realtime_price`` returns empty dicts.
+
+        Args:
+            symbols: Mapping of internal pair → Quotex symbol
+                (e.g. ``{"EUR_USD": "EURUSD_otc"}``).
+        """
         for pair, symbol in symbols.items():
+            if self._stop_event.is_set():
+                return
             try:
-                result = self._client.subscribe_realtime_candle(symbol)
-                if asyncio.iscoroutine(result):
-                    await result
+                # start_realtime_price is sync — blocks until data is ready
+                self._client.start_realtime_price(symbol, 60)
                 logger.info(
                     {
-                        "event": "quotex_subscribed",
+                        "event": "quotex_realtime_stream_started",
                         "pair": pair,
                         "symbol": symbol,
                     }
@@ -219,7 +262,7 @@ class QuotexStream:
             except Exception as exc:
                 logger.error(
                     {
-                        "event": "quotex_subscribe_failed",
+                        "event": "quotex_realtime_stream_failed",
                         "pair": pair,
                         "symbol": symbol,
                         "error": str(exc),
@@ -227,18 +270,24 @@ class QuotexStream:
                     }
                 )
 
-        await asyncio.sleep(5)
-
     # ── Polling loop ───────────────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
         """
-        Subscribe to each pair's OTC symbol, then poll forever.
-        """
-        symbols = {p: _to_quotex_symbol(p) for p in self._pairs}
+        Start real-time streams, then poll for prices forever.
 
-        # Subscribe before polling — Quotex returns empty dicts otherwise
-        await self._subscribe_symbols(symbols)
+        On each tick:
+            1. Call :meth:`_get_price` for each symbol.
+            2. Construct a :class:`~twelveticks_stream.Tick`.
+            3. Ingest into buffer and queue.
+        """
+        symbols: dict[str, str] = {p: _to_quotex_symbol(p) for p in self._pairs}
+
+        # Start streams — get_realtime_price returns empty dict without this.
+        # This is sync and may block, so we run it in an executor.
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._start_realtime_streams, symbols
+        )
 
         logger.info(
             {
@@ -254,12 +303,11 @@ class QuotexStream:
                     return
 
                 try:
-                    price = await self._get_price(symbol)
+                    price: float | None = await self._get_price(symbol)
                     if price is None:
-                        # Don't log warning for empty dict — subscription warming up
                         continue
 
-                    tick = self._make_tick(pair, price)
+                    tick: Tick = self._make_tick(pair, price)
                     self._ingest_tick(tick)
 
                 except Exception as exc:
@@ -281,56 +329,46 @@ class QuotexStream:
         """
         Get current price for *symbol*.
 
-        Primary: get_realtime_price (returns dict — we extract the price).
-        Fallback: get_candles (returns list of dicts — we take the last close).
+        Requires :meth:`_start_realtime_streams` to have been called first.
+
+        ``get_realtime_price`` returns data from the WebSocket buffer
+        (``api.realtime_price`` dict).  Response format varies by
+        pyquotex version — handled by checking for common keys.
+
+        Args:
+            symbol: Quotex symbol (e.g. ``"EURUSD_otc"``).
+
+        Returns:
+            Price as a positive float, or ``None`` if unavailable.
         """
-
-        # ── Primary: get_realtime_price ─────────────────────────────────────
         try:
-            result = await self._client.get_realtime_price(symbol)
-
-            # Log raw result once for schema discovery
-            if not hasattr(self, "_logged_raw_price"):
-                logger.info(
-                    {
-                        "event": "quotex_raw_realtime_price",
-                        "symbol": symbol,
-                        "result_type": type(result).__name__,
-                        "result_repr": repr(result)[:400],
-                    }
-                )
-                self._logged_raw_price = True
+            # get_realtime_price is async per docs
+            result: Any = await self._client.get_realtime_price(symbol)
 
             if result is None:
                 return None
 
-            # Empty dict — subscription not ready yet, silently skip
+            # Dict response — extract price from known keys
             if isinstance(result, dict):
                 if not result:
-                    return None
+                    return None  # buffer not ready yet
                 for key in ("price", "value", "close", "last", "bid", "ask"):
                     if key in result:
-                        val = float(result[key])
-                        if val > 0:
-                            return val
-                logger.warning(
-                    {
-                        "event": "quotex_price_dict_no_key",
-                        "symbol": symbol,
-                        "keys": list(result.keys())[:10],
-                    }
-                )
+                        try:
+                            val: float = float(result[key])
+                            if val > 0:
+                                return val
+                        except (ValueError, TypeError):
+                            continue
                 return None
 
-            # Plain number
+            # Plain number response
             if isinstance(result, (int, float)):
                 val = float(result)
                 return val if val > 0 else None
 
             return None
 
-        except AttributeError:
-            logger.error({"event": "quotex_no_realtime_price_method", "symbol": symbol})
         except Exception as exc:
             logger.error(
                 {
@@ -340,27 +378,27 @@ class QuotexStream:
                     "error_type": type(exc).__name__,
                 }
             )
-
-        # ── Fallback: get_candles ───────────────────────────────────────────
-        try:
-            candles = await self._client.get_candles(symbol, 60, 1)
-            if not candles or len(candles) == 0:
-                return None
-            candle = candles[-1]
-            if not isinstance(candle, dict):
-                return None
-            close = float(candle.get("close", 0))
-            return close if close > 0 else None
-        except Exception:
             return None
 
     # ── Tick construction ──────────────────────────────────────────────────────
 
     def _make_tick(self, pair: str, price: float) -> Tick:
-        """Build a :class:`~stream.Tick` from a single price value."""
-        spread = self._estimate_spread(pair, price)
-        bid = round(price - spread / 2, 5)
-        ask = round(price + spread / 2, 5)
+        """
+        Build a :class:`~twelveticks_stream.Tick` from a single price value.
+
+        Quotex only provides a mid price, so bid/ask are estimated
+        using :meth:`_estimate_spread`.
+
+        Args:
+            pair: Internal pair format (``"EUR_USD"``).
+            price: Mid price from Quotex.
+
+        Returns:
+            A fully populated :class:`~twelveticks_stream.Tick`.
+        """
+        spread: float = self._estimate_spread(pair, price)
+        bid: float = round(price - spread / 2, 5)
+        ask: float = round(price + spread / 2, 5)
 
         self._last_price[pair] = price
 
@@ -374,7 +412,16 @@ class QuotexStream:
 
     @staticmethod
     def _estimate_spread(pair: str, price: float) -> float:
-        """Estimate a typical OTC spread for *pair*."""
+        """
+        Estimate a typical OTC spread for *pair*.
+
+        Args:
+            pair: Internal pair format.
+            price: Current mid price (unused but kept for API consistency).
+
+        Returns:
+            Estimated spread as a float.
+        """
         if "JPY" in pair:
             return 0.015
         elif "XAU" in pair or "GOLD" in pair:
@@ -384,10 +431,19 @@ class QuotexStream:
         else:
             return 0.00015
 
-    # ── Ingestion / buffering (identical to TwelveDataStream) ──────────────────
+    # ── Ingestion / buffering ──────────────────────────────────────────────────
 
     def _ingest_tick(self, tick: Tick) -> None:
-        """Buffer a tick and optionally flush to storage."""
+        """
+        Buffer a tick and optionally flush to storage.
+
+        Puts the tick on :attr:`_tick_queue` for the signal generator.
+        Flushes the pair's buffer to storage when it reaches
+        :attr:`_flush_size`.
+
+        Args:
+            tick: Fresh tick to ingest.
+        """
         with self._buffer_lock:
             self._buffers[tick.pair].append(tick.to_dict())
             self._ticks_received += 1
@@ -409,15 +465,26 @@ class QuotexStream:
             self._tick_queue.put_nowait(tick)
         except queue.Full:
             logger.warning(
-                {"event": "tick_queue_full", "pair": tick.pair, "dropped": True}
+                {
+                    "event": "tick_queue_full",
+                    "pair": tick.pair,
+                    "dropped": True,
+                }
             )
 
     def _flush_pair(self, pair: str) -> None:
-        """Flush one pair's buffer to storage.  Must hold ``_buffer_lock``."""
-        buf = self._buffers[pair]
+        """
+        Flush one pair's buffer to storage.
+
+        Must be called while holding :attr:`_buffer_lock`.
+
+        Args:
+            pair: Internal pair format to flush.
+        """
+        buf: list[dict[str, Any]] = self._buffers[pair]
         if not buf:
             return
-        df = pd.DataFrame(buf)
+        df: pd.DataFrame = pd.DataFrame(buf)
         self._storage.append_ticks(pair, df)
         logger.debug(
             {
@@ -430,7 +497,7 @@ class QuotexStream:
         self._buffers[pair] = []
 
     def _flush_all(self) -> None:
-        """Flush every pair's buffer.  Acquires ``_buffer_lock``."""
+        """Flush every pair's buffer.  Acquires :attr:`_buffer_lock`."""
         with self._buffer_lock:
             for pair in list(self._buffers.keys()):
                 self._flush_pair(pair)

@@ -17,7 +17,7 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 
 import pandas as pd
 import pyarrow as pa
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ── Schema definitions ────────────────────────────────────────────────────────
 
-TICK_SCHEMA = pa.schema(
+TICK_SCHEMA: pa.Schema = pa.schema(
     [
         pa.field("timestamp", pa.timestamp("ms", tz="UTC")),
         pa.field("bid", pa.float64()),
@@ -39,19 +39,19 @@ TICK_SCHEMA = pa.schema(
     ]
 )
 
-RESULT_SCHEMA = pa.schema(
+RESULT_SCHEMA: pa.Schema = pa.schema(
     [
-        pa.field("signal_time", pa.timestamp("ms", tz="UTC")),
+        pa.field("received_at", pa.timestamp("ms", tz="UTC")),
         pa.field("pair", pa.string()),
         pa.field("direction", pa.string()),
-        pa.field("confidence", pa.float64()),
-        pa.field("expiry_seconds", pa.int32()),
         pa.field("result", pa.string()),
         pa.field("payout", pa.float64()),
+        pa.field("stake", pa.float64()),
+        pa.field("signal_id", pa.string()),
     ]
 )
 
-FALLBACK_ROOT = Path("/tmp/fallback")
+FALLBACK_ROOT: Path = Path("/tmp/fallback")
 
 
 class StorageManager:
@@ -77,17 +77,19 @@ class StorageManager:
         container_name: str,
         flush_size: int = 500,
     ) -> None:
-        self._client = BlobServiceClient.from_connection_string(conn_string)
-        self._container = container_name
-        self._flush_size = flush_size
+        self._client: BlobServiceClient = BlobServiceClient.from_connection_string(
+            conn_string
+        )
+        self._container: str = container_name
+        self._flush_size: int = flush_size
 
         # In-memory tick buffers: {pair -> list[dict]}
-        self._tick_buffers: dict[str, list[dict]] = defaultdict(list)
+        self._tick_buffers: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
         # Pending retry queue: list of (blob_path, pyarrow.Table)
         self._retry_queue: list[tuple[str, pa.Table]] = []
-        self._retry_lock = threading.Lock()
+        self._retry_lock: threading.Lock = threading.Lock()
 
         self._ensure_container()
 
@@ -95,7 +97,7 @@ class StorageManager:
 
     def append_ticks(self, pair: str, df: pd.DataFrame) -> None:
         """
-        Buffer tick records; auto-flush when buffer reaches *flush_size*.
+        Buffer tick records; auto-flush when buffer reaches :attr:`_flush_size`.
 
         Args:
             pair: Currency pair (e.g. ``"EUR_USD"``).
@@ -103,7 +105,7 @@ class StorageManager:
         """
         if df.empty:
             return
-        records = df.to_dict("records")
+        records: list[dict[str, Any]] = cast(list[dict[str, Any]], df.to_dict("records"))
         with self._locks[pair]:
             self._tick_buffers[pair].extend(records)
             if len(self._tick_buffers[pair]) >= self._flush_size:
@@ -129,25 +131,49 @@ class StorageManager:
         """
         Write a single trade result record to blob storage.
 
-        Args:
-            result: Dict with keys matching :data:`RESULT_SCHEMA`.
-        """
-        pair = result["pair"]
-        ts = result.get("signal_time", datetime.now(timezone.utc))
-        if isinstance(ts, str):
-            ts = pd.Timestamp(ts, tz="UTC")
-        blob_path = self._result_blob_path(pair, ts)
+        Accepts the dict format returned by
+        :meth:`~quotex_reader.QuotexReader._make_result`::
 
-        row = {
-            "signal_time": pd.Timestamp(ts, tz="UTC"),
+            {
+                "signal_id": "...",
+                "pair": "EUR_USD",
+                "direction": "UP",
+                "result": "win",
+                "payout": 5.50,
+                "stake": 0.0,
+                "received_at": "2025-01-15T12:00:00+00:00",
+            }
+
+        Args:
+            result: Trade result dict.
+        """
+        pair: str = result.get("pair", "")
+        if not pair:
+            logger.warning({"event": "append_result_no_pair", "result": result})
+            return
+
+        # Parse received_at — could be ISO string or datetime
+        ts_raw: Any = result.get("received_at", datetime.now(timezone.utc))
+        ts: pd.Timestamp
+        if isinstance(ts_raw, str):
+            ts = pd.Timestamp(ts_raw, tz="UTC")
+        elif isinstance(ts_raw, datetime):
+            ts = pd.Timestamp(ts_raw, tz="UTC")
+        else:
+            ts = pd.Timestamp(datetime.now(timezone.utc), tz="UTC")
+
+        blob_path: str = self._result_blob_path(pair, ts.to_pydatetime())
+
+        row: dict[str, Any] = {
+            "received_at": ts,
             "pair": str(pair),
             "direction": str(result.get("direction", "")),
-            "confidence": float(result.get("confidence", 0.0)),
-            "expiry_seconds": int(result.get("expiry_seconds", 0)),
             "result": str(result.get("result", "")),
             "payout": float(result.get("payout", 0.0)),
+            "stake": float(result.get("stake", 0.0)),
+            "signal_id": str(result.get("signal_id", "")),
         }
-        new_df = pd.DataFrame([row])
+        new_df: pd.DataFrame = pd.DataFrame([row])
         self._append_parquet(blob_path, new_df, RESULT_SCHEMA)
 
     def read_ticks(self, pair: str, months: int = 12) -> pd.DataFrame:
@@ -159,7 +185,8 @@ class StorageManager:
             months: How many recent months to load.
 
         Returns:
-            Sorted DataFrame, or an empty DataFrame with correct columns.
+            Sorted DataFrame with columns matching :data:`TICK_SCHEMA`,
+            or an empty DataFrame with those columns.
         """
         return self._read_months(
             pair,
@@ -178,7 +205,8 @@ class StorageManager:
             months: How many recent months to load.
 
         Returns:
-            Sorted DataFrame, or an empty DataFrame with correct columns.
+            Sorted DataFrame with columns matching :data:`RESULT_SCHEMA`,
+            or an empty DataFrame with those columns.
         """
         return self._read_months(
             pair,
@@ -187,7 +215,7 @@ class StorageManager:
                 p, datetime(y, m, 1, tzinfo=timezone.utc)
             ),
             columns=list(RESULT_SCHEMA.names),
-            sort_col="signal_time",
+            sort_col="received_at",
         )
 
     def blob_exists(self, blob_path: str) -> bool:
@@ -212,17 +240,56 @@ class StorageManager:
             return False
 
     def write_raw_parquet(
-        self, blob_path: str, df: pd.DataFrame, schema: pa.Schema | None = None
+        self,
+        blob_path: str,
+        df: pd.DataFrame,
+        schema: pa.Schema | None = None,
     ) -> None:
         """
         Write a DataFrame to a blob path directly (used by backfill).
+
+        Unlike :meth:`_append_parquet`, this does **not** read the existing
+        file first — it overwrites the blob entirely.
 
         Args:
             blob_path: Destination blob path.
             df: Data to write.
             schema: Optional PyArrow schema for type enforcement.
         """
-        self._append_parquet(blob_path, df, schema)
+        if df.empty:
+            return
+
+        if schema is not None:
+            try:
+                table: pa.Table = pa.Table.from_pandas(
+                    df, schema=schema, preserve_index=False
+                )
+            except Exception:
+                table = pa.Table.from_pandas(df, preserve_index=False)
+        else:
+            table = pa.Table.from_pandas(df, preserve_index=False)
+
+        try:
+            self._upload_table(blob_path, table)
+            self._clear_fallback(blob_path)
+            logger.debug(
+                {
+                    "event": "raw_parquet_written",
+                    "blob_path": blob_path,
+                    "rows": len(df),
+                }
+            )
+        except Exception as exc:
+            logger.error(
+                {
+                    "event": "raw_parquet_write_failed",
+                    "blob_path": blob_path,
+                    "error": str(exc),
+                }
+            )
+            self._spill_to_tmp(blob_path, table)
+            with self._retry_lock:
+                self._retry_queue.append((blob_path, table))
 
     def flush_retry_queue(self) -> None:
         """
@@ -254,7 +321,9 @@ class StorageManager:
     # ── Model persistence ─────────────────────────────────────────────────────
 
     def save_model(
-        self, model_data: bytes, model_name: str = "model_manager.pkl"
+        self,
+        model_data: bytes,
+        model_name: str = "model_manager.pkl",
     ) -> None:
         """
         Persist a serialised model to blob storage.
@@ -263,7 +332,7 @@ class StorageManager:
             model_data: Raw bytes (e.g. ``pickle.dumps(model)``).
             model_name: Filename under ``models/``.
         """
-        blob_path = f"models/{model_name}"
+        blob_path: str = f"models/{model_name}"
         blob_client = self._client.get_blob_client(
             container=self._container, blob=blob_path
         )
@@ -280,12 +349,12 @@ class StorageManager:
         Returns:
             Raw bytes, or ``None`` if the blob doesn't exist.
         """
-        blob_path = f"models/{model_name}"
+        blob_path: str = f"models/{model_name}"
         try:
             blob_client = self._client.get_blob_client(
                 container=self._container, blob=blob_path
             )
-            data = blob_client.download_blob().readall()
+            data: bytes = blob_client.download_blob().readall()
             logger.info({"event": "model_loaded_from_blob", "blob_path": blob_path})
             return data
         except ResourceNotFoundError:
@@ -293,7 +362,11 @@ class StorageManager:
             return None
         except Exception as exc:
             logger.warning(
-                {"event": "model_load_error", "blob_path": blob_path, "error": str(exc)}
+                {
+                    "event": "model_load_error",
+                    "blob_path": blob_path,
+                    "error": str(exc),
+                }
             )
             return None
 
@@ -303,12 +376,16 @@ class StorageManager:
         self,
         pair: str,
         months: int,
-        path_fn: Any,
+        path_fn: Callable[[str, int, int], str],
         columns: list[str],
         sort_col: str,
     ) -> pd.DataFrame:
         """
-        Generic month-range reader shared by read_ticks and read_results.
+        Generic month-range reader shared by :meth:`read_ticks` and
+        :meth:`read_results`.
+
+        Iterates backwards from the current month, reading each month's
+        parquet file and concatenating the results.
 
         Args:
             pair: Currency pair.
@@ -320,51 +397,66 @@ class StorageManager:
         Returns:
             Sorted concatenated DataFrame, or empty DataFrame with *columns*.
         """
-        now = datetime.now(timezone.utc)
+        now: datetime = datetime.now(timezone.utc)
         frames: list[pd.DataFrame] = []
         for m in range(months):
-            year = now.year if now.month - m > 0 else now.year - 1
-            month = (now.month - m - 1) % 12 + 1
-            blob_path = path_fn(pair, year, month)
-            df = self._read_parquet(blob_path)
+            year: int = now.year if now.month - m > 0 else now.year - 1
+            month: int = (now.month - m - 1) % 12 + 1
+            blob_path: str = path_fn(pair, year, month)
+            df: pd.DataFrame | None = self._read_parquet(blob_path)
             if df is not None and not df.empty:
                 frames.append(df)
         if not frames:
             return pd.DataFrame(columns=columns)
-        combined = pd.concat(frames, ignore_index=True)
+        combined: pd.DataFrame = pd.concat(frames, ignore_index=True)
         return combined.sort_values(sort_col).reset_index(drop=True)
 
     def _flush_ticks(self, pair: str) -> None:
-        """Flush buffered tick records to blob.  Caller must hold ``_locks[pair]``."""
-        records = self._tick_buffers[pair]
+        """
+        Flush buffered tick records to blob.
+
+        Must be called with ``_locks[pair]`` held.
+
+        Args:
+            pair: Currency pair to flush.
+        """
+        records: list[dict[str, Any]] = self._tick_buffers[pair]
         if not records:
             return
-        df = pd.DataFrame(records)
+        df: pd.DataFrame = pd.DataFrame(records)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df["pair"] = pair
 
-        now = datetime.now(timezone.utc)
-        blob_path = self._tick_blob_path(pair, now.year, now.month)
+        now: datetime = datetime.now(timezone.utc)
+        blob_path: str = self._tick_blob_path(pair, now.year, now.month)
         self._append_parquet(blob_path, df, TICK_SCHEMA)
         self._tick_buffers[pair] = []
 
     def _append_parquet(
-        self, blob_path: str, new_df: pd.DataFrame, schema: pa.Schema | None
+        self,
+        blob_path: str,
+        new_df: pd.DataFrame,
+        schema: pa.Schema | None,
     ) -> None:
         """
         Read existing parquet, append *new_df*, write back.
 
         Deduplicates on the timestamp column.  On blob write failure the
         table is spilled to ``/tmp/fallback/`` and queued for retry.
+
+        Args:
+            blob_path: Blob path to read/modify/write.
+            new_df: New rows to append.
+            schema: Optional PyArrow schema for type enforcement.
         """
-        existing = self._read_parquet(blob_path)
+        existing: pd.DataFrame | None = self._read_parquet(blob_path)
         if existing is not None and not existing.empty:
-            combined = pd.concat([existing, new_df], ignore_index=True)
+            combined: pd.DataFrame = pd.concat([existing, new_df], ignore_index=True)
         else:
             combined = new_df.copy()
 
-        ts_col = "timestamp" if "timestamp" in combined.columns else "signal_time"
+        ts_col: str = "timestamp" if "timestamp" in combined.columns else "received_at"
         if ts_col in combined.columns:
             combined = (
                 combined.drop_duplicates(subset=[ts_col])
@@ -372,6 +464,7 @@ class StorageManager:
                 .reset_index(drop=True)
             )
 
+        table: pa.Table
         if schema is not None:
             try:
                 table = pa.Table.from_pandas(
@@ -409,10 +502,14 @@ class StorageManager:
         """
         Serialize *table* as Parquet and upload to *blob_path*.
 
+        Args:
+            blob_path: Destination blob path.
+            table: PyArrow table to upload.
+
         Raises:
             AzureError: On any blob storage failure.
         """
-        buf = io.BytesIO()
+        buf: io.BytesIO = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
         buf.seek(0)
         blob_client = self._client.get_blob_client(
@@ -428,6 +525,9 @@ class StorageManager:
         unreachable, the fallback is returned.  If the blob is reachable
         the fallback is ignored in favour of the authoritative copy.
 
+        Args:
+            blob_path: Blob path to read.
+
         Returns:
             DataFrame, or ``None`` if neither source has data.
         """
@@ -436,7 +536,7 @@ class StorageManager:
             blob_client = self._client.get_blob_client(
                 container=self._container, blob=blob_path
             )
-            data = blob_client.download_blob().readall()
+            data: bytes = blob_client.download_blob().readall()
             return pd.read_parquet(io.BytesIO(data))
         except ResourceNotFoundError:
             pass  # fall through to fallback
@@ -450,7 +550,7 @@ class StorageManager:
             )
 
         # Fallback to local tmp
-        fallback = FALLBACK_ROOT / blob_path
+        fallback: Path = FALLBACK_ROOT / blob_path
         if fallback.exists():
             try:
                 return pd.read_parquet(fallback)
@@ -468,12 +568,16 @@ class StorageManager:
         """
         Write *table* to ``/tmp/fallback/{blob_path}``, merging with any
         existing local file.
+
+        Args:
+            blob_path: Relative path (used as subdirectory under fallback root).
+            table: PyArrow table to spill.
         """
-        dest = FALLBACK_ROOT / blob_path
+        dest: Path = FALLBACK_ROOT / blob_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             try:
-                existing = pq.read_table(str(dest))
+                existing: pa.Table = pq.read_table(str(dest))
                 table = pa.concat_tables([existing, table])
             except Exception:
                 pass
@@ -481,8 +585,13 @@ class StorageManager:
         logger.info({"event": "spilled_to_tmp", "path": str(dest)})
 
     def _clear_fallback(self, blob_path: str) -> None:
-        """Remove a fallback file after a successful blob upload."""
-        fallback = FALLBACK_ROOT / blob_path
+        """
+        Remove a fallback file after a successful blob upload.
+
+        Args:
+            blob_path: Blob path whose fallback to remove.
+        """
+        fallback: Path = FALLBACK_ROOT / blob_path
         if fallback.exists():
             try:
                 fallback.unlink()
@@ -499,7 +608,10 @@ class StorageManager:
             try:
                 self._client.create_container(self._container)
                 logger.info(
-                    {"event": "container_created", "container": self._container}
+                    {
+                        "event": "container_created",
+                        "container": self._container,
+                    }
                 )
             except Exception as exc:
                 logger.error(
@@ -517,10 +629,29 @@ class StorageManager:
 
     @staticmethod
     def _tick_blob_path(pair: str, year: int, month: int) -> str:
-        """Return the blob path for a tick data file."""
+        """
+        Return the blob path for a tick data file.
+
+        Args:
+            pair: Currency pair.
+            year: Four-digit year.
+            month: Month number (1–12).
+
+        Returns:
+            Blob path like ``data/EUR_USD/2025-01.parquet``.
+        """
         return f"data/{pair}/{year}-{month:02d}.parquet"
 
     @staticmethod
     def _result_blob_path(pair: str, ts: datetime) -> str:
-        """Return the blob path for a result data file."""
+        """
+        Return the blob path for a result data file.
+
+        Args:
+            pair: Currency pair.
+            ts: Datetime used to determine the year/month partition.
+
+        Returns:
+            Blob path like ``data/results/EUR_USD/2025-01.parquet``.
+        """
         return f"data/results/{pair}/{ts.year}-{ts.month:02d}.parquet"

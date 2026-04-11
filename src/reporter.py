@@ -57,7 +57,9 @@ class OrchestratorProtocol(Protocol):
 # ── HTML report generator ─────────────────────────────────────────────────────
 
 
-def build_html_report(session_summary: dict[str, Any], status: dict[str, Any]) -> str:
+def build_html_report(
+    session_summary: dict[str, Any], status: dict[str, Any]
+) -> str:
     """
     Build an HTML session performance report.
 
@@ -72,32 +74,32 @@ def build_html_report(session_summary: dict[str, Any], status: dict[str, Any]) -
     Returns:
         A self-contained HTML string with inline styles.
     """
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    wins = session_summary.get("wins", 0)
-    losses = session_summary.get("losses", 0)
-    fired = session_summary.get("signals_fired", 0)
-    net = session_summary.get("net_profit", 0.0)
-    target_wins = session_summary.get("target_wins", 10)
-    target_profit = session_summary.get("target_profit", 20.0)
-    elapsed = session_summary.get("elapsed_minutes", 0)
-    streak = status.get("martingale_streak", 0)
-    threshold = status.get("confidence_threshold", 0.65)
-    active = session_summary.get("is_active", False)
-    reached = session_summary.get("target_reached", False)
+    now: str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    wins: int = session_summary.get("wins", 0)
+    losses: int = session_summary.get("losses", 0)
+    fired: int = session_summary.get("signals_fired", 0)
+    net: float = session_summary.get("net_profit", 0.0)
+    target_wins: int = session_summary.get("target_wins", 10)
+    target_profit: float = session_summary.get("target_profit", 20.0)
+    elapsed: int = session_summary.get("elapsed_minutes", 0)
+    streak: int = status.get("martingale_streak", 0)
+    threshold: float = status.get("confidence_threshold", 0.65)
+    active: bool = session_summary.get("is_active", False)
+    reached: bool = session_summary.get("target_reached", False)
 
-    win_rate = round(wins / max(wins + losses, 1) * 100, 1)
+    win_rate: float = round(wins / max(wins + losses, 1) * 100, 1)
 
     if active:
-        status_badge = "ACTIVE"
+        status_badge: str = "ACTIVE"
     elif reached:
         status_badge = "TARGET REACHED"
     else:
         status_badge = "CLOSED"
 
-    profit_color = "#00ff88" if net >= 0 else "#ff4444"
-    streak_color = "#ff8800" if streak > 0 else "#00ff88"
+    profit_color: str = "#00ff88" if net >= 0 else "#ff4444"
+    streak_color: str = "#ff8800" if streak > 0 else "#00ff88"
 
-    html = f"""
+    html: str = f"""
 <html><body style="font-family:monospace;background:#0d0d0d;color:#e0e0e0;padding:20px;">
 <h2 style="color:#00ff88;">Trader AI - Daily Session Report</h2>
 <p style="color:#888;">{now}</p>
@@ -151,18 +153,18 @@ def build_telegram_message(
     Returns:
         HTML-formatted string ready for Telegram sendMessage.
     """
-    wins = session_summary.get("wins", 0)
-    losses = session_summary.get("losses", 0)
-    net = session_summary.get("net_profit", 0.0)
-    target_wins = session_summary.get("target_wins", 10)
-    target_profit = session_summary.get("target_profit", 20.0)
-    streak = status.get("martingale_streak", 0)
-    threshold = status.get("confidence_threshold", 0.65)
-    elapsed = session_summary.get("elapsed_minutes", 0)
+    wins: int = session_summary.get("wins", 0)
+    losses: int = session_summary.get("losses", 0)
+    net: float = session_summary.get("net_profit", 0.0)
+    target_wins: int = session_summary.get("target_wins", 10)
+    target_profit: float = session_summary.get("target_profit", 20.0)
+    streak: int = status.get("martingale_streak", 0)
+    threshold: float = status.get("confidence_threshold", 0.65)
+    elapsed: int = session_summary.get("elapsed_minutes", 0)
 
-    win_rate = round(wins / max(wins + losses, 1) * 100, 1)
-    profit_icon = "🟢" if net >= 0 else "🔴"
-    streak_icon = "🟠" if streak > 0 else "✅"
+    win_rate: float = round(wins / max(wins + losses, 1) * 100, 1)
+    profit_icon: str = "🟢" if net >= 0 else "🔴"
+    streak_icon: str = "🟠" if streak > 0 else "✅"
 
     return (
         f"<b>📊 Trader AI Session Report</b>\n"
@@ -170,9 +172,51 @@ def build_telegram_message(
         f"✅ Wins: <code>{wins}/{target_wins}</code>\n"
         f"❌ Losses: <code>{losses}</code>\n"
         f"📈 Win Rate: <code>{win_rate}%</code>\n"
-        f"{profit_icon} Net Profit: <code>${net:.2f}</code> / <code>${target_profit:.2f}</code>\n"
+        f"{profit_icon} Net Profit: <code>${net:.2f}</code> / "
+        f"<code>${target_profit:.2f}</code>\n"
         f"{streak_icon} Streak: <code>{streak}</code> consecutive losses\n"
         f"🎯 Threshold: <code>{threshold:.0%}</code>\n"
+    )
+
+
+def build_discord_message(
+    session_summary: dict[str, Any], status: dict[str, Any]
+) -> str:
+    """
+    Build a plain-text session summary for Discord embeds.
+
+    Discord embed descriptions support markdown, not HTML.  This function
+    produces a clean string with no HTML tags.
+
+    Args:
+        session_summary: Session stats dict.
+        status: Global status dict.
+
+    Returns:
+        Plain-text string safe for Discord embed description.
+    """
+    wins: int = session_summary.get("wins", 0)
+    losses: int = session_summary.get("losses", 0)
+    net: float = session_summary.get("net_profit", 0.0)
+    target_wins: int = session_summary.get("target_wins", 10)
+    target_profit: float = session_summary.get("target_profit", 20.0)
+    streak: int = status.get("martingale_streak", 0)
+    threshold: float = status.get("confidence_threshold", 0.65)
+    elapsed: int = session_summary.get("elapsed_minutes", 0)
+
+    win_rate: float = round(wins / max(wins + losses, 1) * 100, 1)
+    profit_icon: str = "🟢" if net >= 0 else "🔴"
+    streak_icon: str = "🟠" if streak > 0 else "✅"
+
+    return (
+        f"**📊 Trader AI Session Report**\n"
+        f"🕐 Elapsed: `{elapsed} min`\n\n"
+        f"✅ Wins: `{wins}/{target_wins}`\n"
+        f"❌ Losses: `{losses}`\n"
+        f"📈 Win Rate: `{win_rate}%`\n"
+        f"{profit_icon} Net Profit: `${net:.2f}` / `${target_profit:.2f}`\n"
+        f"{streak_icon} Streak: `{streak}` consecutive losses\n"
+        f"🎯 Threshold: `{threshold:.0%}`\n"
     )
 
 
@@ -194,11 +238,16 @@ class DiscordReporter:
     }
 
     def __init__(self, webhook_url: str) -> None:
-        self._url = webhook_url
+        self._url: str = webhook_url
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Lazily create and return a reusable aiohttp session."""
+        """
+        Lazily create and return a reusable aiohttp session.
+
+        Returns:
+            An open :class:`aiohttp.ClientSession`.
+        """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -211,6 +260,9 @@ class DiscordReporter:
         """
         Send a rich embed summarising the current trading session.
 
+        Uses :func:`build_discord_message` (plain-text, no HTML) so the
+        embed description renders correctly in Discord.
+
         Args:
             session_summary: Session stats dict.
             status: Global status dict.
@@ -218,13 +270,13 @@ class DiscordReporter:
         if not self._url:
             return
 
-        text = build_telegram_message(session_summary, status)
-        net = session_summary.get("net_profit", 0)
-        payload = {
+        text: str = build_discord_message(session_summary, status)
+        net: float = session_summary.get("net_profit", 0)
+        payload: dict[str, Any] = {
             "embeds": [
                 {
                     "title": "📊 Trader AI — Daily Session Report",
-                    "description": text.replace("<b>", "**").replace("</b>", "**"),
+                    "description": text,
                     "color": 0x00FF88 if net >= 0 else 0xFF4444,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "footer": {"text": "Trader AI Signal Engine"},
@@ -238,24 +290,30 @@ class DiscordReporter:
                 await resp.text()
             logger.info({"event": "discord_report_sent"})
         except Exception as exc:
-            logger.warning({"event": "discord_report_failed", "error": str(exc)})
+            logger.warning(
+                {"event": "discord_report_failed", "error": str(exc)}
+            )
 
-    async def send_alert_async(self, message: str, level: str = "info") -> None:
+    async def send_alert_async(
+        self, message: str, level: str = "info"
+    ) -> None:
         """
         Send a short alert embed to Discord.
 
         Args:
-            message: Alert body text.
+            message: Alert body text (plain text, no HTML).
             level: One of ``"info"``, ``"warning"``, or ``"error"``.
         """
         if not self._url:
             return
 
-        payload = {
+        payload: dict[str, Any] = {
             "embeds": [
                 {
                     "description": message,
-                    "color": self.ALERT_COLORS.get(level, self.ALERT_COLORS["info"]),
+                    "color": self.ALERT_COLORS.get(
+                        level, self.ALERT_COLORS["info"]
+                    ),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             ]
@@ -266,7 +324,9 @@ class DiscordReporter:
             async with session.post(self._url, json=payload) as resp:
                 await resp.text()
         except Exception as exc:
-            logger.warning({"event": "discord_alert_failed", "error": str(exc)})
+            logger.warning(
+                {"event": "discord_alert_failed", "error": str(exc)}
+            )
 
     async def close(self) -> None:
         """Close the underlying aiohttp session."""
@@ -291,7 +351,9 @@ class TelegramBot:
     Reuses a single :class:`aiohttp.ClientSession` for all API calls.
     """
 
-    BASE_URL = "https://api.telegram.org/bot{token}/{method}"
+    BASE_URL: str = "https://api.telegram.org/bot{token}/{method}"
+    MAX_RETRIES: int = 3
+    RETRY_DELAY: float = 2.0
 
     def __init__(
         self,
@@ -307,94 +369,131 @@ class TelegramBot:
             orchestrator: Object that controls signal generation.
             discord_reporter: Optional Discord reporter for dual-channel output.
         """
-        self._token = token
-        self._chat_id = str(chat_id)
-        self._orchestrator = orchestrator
-        self._discord = discord_reporter
+        self._token: str = token
+        self._chat_id: str = str(chat_id)
+        self._orchestrator: OrchestratorProtocol = orchestrator
+        self._discord: DiscordReporter | None = discord_reporter
         self._offset: int = 0
         self._running: bool = False
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Lazily create and return a reusable aiohttp session."""
+        """
+        Lazily create and return a reusable aiohttp session.
+
+        Returns:
+            An open :class:`aiohttp.ClientSession` with 60s timeout.
+        """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=60)
             )
         return self._session
 
-    # ── low-level helpers ──────────────────────────────────────────────────
+    # ── Low-level helpers ──────────────────────────────────────────────────
 
-    async def _api_async(self, method: str, **kwargs: Any) -> dict[str, Any] | None:
+    async def _api_async(
+        self,
+        method: str,
+        max_retries: int | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
         """
-        Call a Telegram Bot API method.
+        Call a Telegram Bot API method with retry on rate limit.
+
+        On HTTP 429, sleeps for the ``retry_after`` duration and retries
+        up to *max_retries* times before giving up.
 
         Args:
             method: API method name (e.g. ``"sendMessage"``).
+            max_retries: Override for retry count (default :attr:`MAX_RETRIES`).
             **kwargs: Parameters forwarded as JSON body.
 
         Returns:
-            Parsed JSON response dict, or ``None`` on failure.
+            Parsed JSON response dict, or ``None`` on permanent failure.
         """
-        url = self.BASE_URL.format(token=self._token, method=method)
+        if max_retries is None:
+            max_retries = self.MAX_RETRIES
 
-        try:
-            session = await self._get_session()
-            async with session.post(url, json=kwargs) as resp:
-                if resp.status == 429:
-                    retry_after = 5
-                    try:
-                        body = await resp.json()
-                        retry_after = int(
-                            body.get("parameters", {}).get("retry_after", 5)
+        url: str = self.BASE_URL.format(token=self._token, method=method)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                session = await self._get_session()
+                async with session.post(url, json=kwargs) as resp:
+                    if resp.status == 429:
+                        retry_after: int = 5
+                        try:
+                            body: dict[str, Any] = await resp.json()
+                            retry_after = int(
+                                body.get("parameters", {}).get(
+                                    "retry_after", 5
+                                )
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            {
+                                "event": "telegram_rate_limited",
+                                "method": method,
+                                "attempt": attempt,
+                                "retry_after": retry_after,
+                            }
                         )
-                    except Exception:
-                        pass
-                    logger.warning(
-                        {
-                            "event": "telegram_rate_limited",
-                            "method": method,
-                            "retry_after": retry_after,
-                        }
-                    )
-                    await asyncio.sleep(retry_after)
-                    return None
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_after)
+                            continue
+                        return None
 
-                data = await resp.json()
-                if not data.get("ok"):
-                    logger.warning(
-                        {
-                            "event": "telegram_api_error",
-                            "method": method,
-                            "response": data,
-                        }
-                    )
-                return data
+                    data: dict[str, Any] = await resp.json()
+                    if not data.get("ok"):
+                        logger.warning(
+                            {
+                                "event": "telegram_api_error",
+                                "method": method,
+                                "response": data,
+                            }
+                        )
+                    return data
 
-        except asyncio.TimeoutError:
-            logger.warning({"event": "telegram_timeout", "method": method})
-        except aiohttp.ClientError as exc:
-            logger.warning(
-                {
-                    "event": "telegram_client_error",
-                    "method": method,
-                    "error": str(exc),
-                }
-            )
-        except Exception as exc:
-            logger.warning(
-                {
-                    "event": "telegram_request_failed",
-                    "method": method,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                }
-            )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    {
+                        "event": "telegram_timeout",
+                        "method": method,
+                        "attempt": attempt,
+                    }
+                )
+            except aiohttp.ClientError as exc:
+                logger.warning(
+                    {
+                        "event": "telegram_client_error",
+                        "method": method,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    {
+                        "event": "telegram_request_failed",
+                        "method": method,
+                        "attempt": attempt,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+
+            if attempt < max_retries:
+                await asyncio.sleep(self.RETRY_DELAY)
+
         return None
 
-    # ── public interface ───────────────────────────────────────────────────
+    # ── Public interface ───────────────────────────────────────────────────
 
-    async def send_message(self, text: str, parse_mode: str = "HTML") -> None:
+    async def send_message(
+        self, text: str, parse_mode: str = "HTML"
+    ) -> None:
         """
         Send a text message to the configured chat.
 
@@ -413,23 +512,35 @@ class TelegramBot:
         )
 
     async def send_report(self) -> None:
-        """Build and send the current session report to Telegram (and Discord)."""
-        status = self._orchestrator.get_status()
-        session = status.get("session", {})
-        msg = build_telegram_message(session, status)
+        """
+        Build and send the current session report to Telegram (and Discord).
+
+        Uses :func:`build_telegram_message` for Telegram (HTML) and
+        :func:`build_discord_message` for Discord (plain text).
+        """
+        status: dict[str, Any] = self._orchestrator.get_status()
+        session: dict[str, Any] = status.get("session", {})
+        msg: str = build_telegram_message(session, status)
         await self.send_message(msg)
 
         if self._discord:
             await self._discord.send_report_async(session, status)
 
     async def poll_loop(self) -> None:
-        """Long-polling loop — run as an ``asyncio.Task``."""
+        """
+        Long-polling loop — run as an ``asyncio.Task``.
+
+        Continuously fetches updates from Telegram and dispatches
+        commands from the authorized chat.
+        """
         self._running = True
-        logger.info({"event": "telegram_bot_started", "chat_id": self._chat_id})
+        logger.info(
+            {"event": "telegram_bot_started", "chat_id": self._chat_id}
+        )
 
         while self._running:
             try:
-                data = await self._api_async(
+                data: dict[str, Any] | None = await self._api_async(
                     "getUpdates",
                     offset=self._offset,
                     timeout=30,
@@ -442,34 +553,42 @@ class TelegramBot:
 
                 for update in data.get("result", []):
                     self._offset = update["update_id"] + 1
-                    msg = update.get("message", {})
+                    msg: dict[str, Any] = update.get("message", {})
 
-                    if str(msg.get("chat", {}).get("id", "")) != self._chat_id:
+                    if (
+                        str(msg.get("chat", {}).get("id", ""))
+                        != self._chat_id
+                    ):
                         continue
 
-                    text = msg.get("text", "")
+                    text: str = msg.get("text", "")
                     if not text.startswith("/"):
                         continue
 
-                    reply = await self._handle_command(text)
+                    reply: str = await self._handle_command(text)
                     if reply:
                         await self.send_message(reply)
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.warning({"event": "telegram_poll_error", "error": str(exc)})
+                logger.warning(
+                    {"event": "telegram_poll_error", "error": str(exc)}
+                )
                 await asyncio.sleep(10)
 
     async def stop(self) -> None:
-        """Signal the polling loop to exit on the next iteration."""
+        """
+        Signal the polling loop to exit on the next iteration.
+
+        Closes the aiohttp session to unblock any in-flight long-poll.
+        """
         self._running = False
-        # Close session to unblock any in-flight request
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
 
-    # ── command dispatch ───────────────────────────────────────────────────
+    # ── Command dispatch ───────────────────────────────────────────────────
 
     async def _handle_command(self, text: str) -> str:
         """
@@ -479,22 +598,21 @@ class TelegramBot:
             text: Raw message text starting with ``/``.
 
         Returns:
-            Human-readable reply to send back.
+            Human-readable reply to send back, or empty string for
+            commands that handle their own sending (e.g. ``/report``).
         """
-        cmd = text.strip().split()[0].lower().lstrip("/")
+        cmd: str = text.strip().split()[0].lower().lstrip("/")
 
         if cmd == "status":
-            status = self._orchestrator.get_status()
-            session = status.get("session", {})
+            status: dict[str, Any] = self._orchestrator.get_status()
+            session: dict[str, Any] = status.get("session", {})
             return build_telegram_message(session, status)
 
         if cmd == "stop":
-            result = self._orchestrator.stop()
+            result: str = self._orchestrator.stop()
             return result if result else "Signals halted."
 
         if cmd in ("start", "resume"):
-            # Try resume first (handles session-expired case),
-            # fall back to start_session
             try:
                 result = self._orchestrator.resume()
             except AttributeError:
@@ -507,9 +625,12 @@ class TelegramBot:
 
         if cmd == "threshold":
             status = self._orchestrator.get_status()
-            t = status.get("confidence_threshold", 0.65)
-            streak = status.get("martingale_streak", 0)
-            return f"Current threshold: <code>{t:.0%}</code> (streak: {streak} losses)"
+            t: float = status.get("confidence_threshold", 0.65)
+            streak: int = status.get("martingale_streak", 0)
+            return (
+                f"Current threshold: <code>{t:.0%}</code> "
+                f"(streak: {streak} losses)"
+            )
 
         return (
             "Available commands:\n"
@@ -539,14 +660,14 @@ async def scheduled_report_loop(bot: TelegramBot) -> None:
     while True:
         await asyncio.sleep(60)
         try:
-            now = datetime.now(timezone.utc)
+            now: datetime = datetime.now(timezone.utc)
 
             if now.weekday() > 4:  # skip weekends
                 continue
             if now.hour != 23 or now.minute != 58:
                 continue
 
-            today = now.strftime("%Y-%m-%d")
+            today: str = now.strftime("%Y-%m-%d")
             if today == last_sent_date:
                 continue
 
@@ -555,4 +676,6 @@ async def scheduled_report_loop(bot: TelegramBot) -> None:
             logger.info({"event": "daily_report_sent", "date": today})
 
         except Exception as exc:
-            logger.warning({"event": "scheduled_report_error", "error": str(exc)})
+            logger.warning(
+                {"event": "scheduled_report_error", "error": str(exc)}
+            )

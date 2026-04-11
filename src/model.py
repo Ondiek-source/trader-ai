@@ -26,7 +26,7 @@ import logging
 import os
 import pickle
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -43,14 +43,14 @@ from sklearn.preprocessing import StandardScaler
 try:
     import lightgbm as lgb
 
-    LGBM_AVAILABLE = True
+    LGBM_AVAILABLE: bool = True
 except ImportError:
     LGBM_AVAILABLE = False
 
 try:
     import xgboost as xgb
 
-    XGB_AVAILABLE = True
+    XGB_AVAILABLE: bool = True
 except ImportError:
     XGB_AVAILABLE = False
 
@@ -58,18 +58,20 @@ try:
     import torch
     import torch.nn as nn
 
-    TORCH_AVAILABLE = True
+    TORCH_AVAILABLE: bool = True
 except ImportError:
     TORCH_AVAILABLE = False
 
-from features import get_feature_columns, get_indicator_feature_groups, compute_features
+from features import get_feature_columns, get_indicator_feature_groups
 
 logger = logging.getLogger(__name__)
 
-SEQ_LEN = 30  # lookback bars for LSTM / Transformer
-EXPIRY_OPTIONS = [60, 120, 300]
-MIN_TRAIN_BARS = 5_000
-MAX_RF_ROWS = 100_000
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+SEQ_LEN: int = 30  # lookback bars for LSTM / Transformer
+EXPIRY_OPTIONS: list[int] = [60, 120, 300]
+MIN_TRAIN_BARS: int = 5_000
+MAX_RF_ROWS: int = 100_000
 
 
 # ── Expiry Optimizer ──────────────────────────────────────────────────────────
@@ -90,31 +92,39 @@ class ExpiryOptimizer:
 
     def optimize(self, pair: str, tick_df: pd.DataFrame) -> dict[str, Any]:
         """
-        Test all expiry options against tick_df using a fast RandomForest.
+        Test all expiry options against *tick_df* using a fast RandomForest.
 
         Args:
             pair: Internal pair name.
             tick_df: Raw tick DataFrame.
 
         Returns:
-            Dict with ``best_expiry`` and ``results`` mapping.
+            Dict with ``best_expiry`` (int) and ``results``
+            (``{expiry: win_rate}``).
         """
+        from features import compute_features
+
         results: dict[int, float] = {}
         for expiry in EXPIRY_OPTIONS:
             try:
-                feature_df = compute_features(tick_df, expiry_seconds=expiry)
+                feature_df: pd.DataFrame = compute_features(
+                    tick_df, expiry_seconds=expiry
+                )
                 if len(feature_df) < MIN_TRAIN_BARS // 10:
                     continue
-                feature_cols = get_feature_columns()
-                available = [c for c in feature_cols if c in feature_df.columns]
-                df = feature_df.dropna(subset=["label"] + available)
+
+                feature_cols: list[str] = get_feature_columns()
+                available: list[str] = [
+                    c for c in feature_cols if c in feature_df.columns
+                ]
+                df: pd.DataFrame = feature_df.dropna(subset=["label"] + available)
                 if len(df) < 200:
                     continue
 
-                X = df[available].values
-                y = df["label"].values
+                X: np.ndarray = df[available].to_numpy(dtype=np.float64)
+                y: np.ndarray = df["label"].to_numpy(dtype=np.float64)
 
-                split = int(len(X) * 0.75)
+                split: int = int(len(X) * 0.75)
                 X_tr, X_te = X[:split], X[split:]
                 y_tr, y_te = y[:split], y[split:]
 
@@ -126,16 +136,20 @@ class ExpiryOptimizer:
                     n_estimators=100, max_depth=6, random_state=42, n_jobs=-1
                 )
                 rf.fit(X_tr, y_tr)
-                proba = rf.predict_proba(X_te)[:, 1]
+                proba: np.ndarray = rf.predict_proba(X_te)[:, 1]
 
                 # Only count "confident" predictions to simulate real signal filter
-                confident_mask = (proba >= 0.60) | (proba <= 0.40)
+                confident_mask: np.ndarray = (proba >= 0.60) | (proba <= 0.40)
                 if confident_mask.sum() < 20:
-                    win_rate = accuracy_score(y_te, (proba >= 0.5).astype(int))
+                    win_rate: float = float(
+                        accuracy_score(y_te, (proba >= 0.5).astype(int))
+                    )
                 else:
-                    win_rate = accuracy_score(
-                        y_te[confident_mask],
-                        (proba[confident_mask] >= 0.5).astype(int),
+                    win_rate = float(
+                        accuracy_score(
+                            y_te[confident_mask],
+                            (proba[confident_mask] >= 0.5).astype(int),
+                        )
                     )
 
                 results[expiry] = round(float(win_rate), 4)
@@ -152,6 +166,7 @@ class ExpiryOptimizer:
                 logger.warning(
                     {
                         "event": "expiry_test_failed",
+                        "pair": pair,
                         "expiry": expiry,
                         "error": str(exc),
                     }
@@ -159,7 +174,7 @@ class ExpiryOptimizer:
 
         self._results[pair] = results
         if results:
-            best = max(results, key=lambda e: results[e])
+            best: int = max(results, key=lambda e: results[e])
             self._best[pair] = best
             logger.info(
                 {
@@ -168,14 +183,25 @@ class ExpiryOptimizer:
                     "best_expiry_seconds": best,
                     "win_rate": results[best],
                     "all_results": results,
-                    "recommendation": f"Set your Quotex bot expiry to {best}s for {pair}",
+                    "recommendation": (
+                        f"Set your Quotex bot expiry to {best}s for {pair}"
+                    ),
                 }
             )
             return {"best_expiry": best, "results": results}
         return {"best_expiry": 60, "results": {}}
 
     def best_expiry(self, pair: str, default: int = 60) -> int:
-        """Return the best expiry for *pair*, or *default* if not optimized."""
+        """
+        Return the best expiry for *pair*, or *default* if not optimized.
+
+        Args:
+            pair: Internal pair name.
+            default: Fallback expiry in seconds.
+
+        Returns:
+            Optimal expiry in seconds.
+        """
         return self._best.get(pair, default)
 
     def summary(self) -> dict[str, Any]:
@@ -225,11 +251,11 @@ class RegimeDetector:
             or ``"volatile"``.
         """
         try:
-            atr_pct = float(feature_row.get("atr_pct") or 0.001)
-            momentum = float(feature_row.get("momentum") or 0.0)
-            bb_bw = float(feature_row.get("bb_bandwidth") or 0.01)
-            ema_cross = float(feature_row.get("ema_cross") or 0.0)
-            rsi = float(feature_row.get("rsi") or 50.0)
+            atr_pct: float = float(feature_row.get("atr_pct") or 0.001)
+            momentum: float = float(feature_row.get("momentum") or 0.0)
+            bb_bw: float = float(feature_row.get("bb_bandwidth") or 0.01)
+            ema_cross: float = float(feature_row.get("ema_cross") or 0.0)
+            rsi: float = float(feature_row.get("rsi") or 50.0)
 
             if atr_pct > 0.003:
                 return "volatile"
@@ -245,7 +271,15 @@ class RegimeDetector:
             return "ranging"
 
     def preferred_indicators(self, regime: str) -> list[str]:
-        """Return indicators most predictive in the given regime."""
+        """
+        Return indicators most predictive in the given regime.
+
+        Args:
+            regime: Regime string from :meth:`detect`.
+
+        Returns:
+            List of indicator group names.
+        """
         return self.REGIME_INDICATOR_AFFINITY.get(
             regime, list(get_indicator_feature_groups().keys())
         )
@@ -261,7 +295,7 @@ class MartingaleTracker:
     Threshold formula:
         ``current = base_threshold + (streak × step_size)``, capped at max_threshold.
 
-    A win OR reaching max_streak resets the streak to 0.
+    A win OR reaching ``max_streak`` resets the streak to 0.
     """
 
     def __init__(
@@ -271,10 +305,10 @@ class MartingaleTracker:
         step_size: float = 0.05,
         max_threshold: float = 0.90,
     ) -> None:
-        self._base = base_threshold
-        self._max_streak = max_streak
-        self._step = step_size
-        self._max = max_threshold
+        self._base: float = base_threshold
+        self._max_streak: int = max_streak
+        self._step: float = step_size
+        self._max: float = max_threshold
         self._streak: int = 0
 
     def record_result(self, win: bool) -> None:
@@ -343,7 +377,7 @@ if TORCH_AVAILABLE:
                 hidden,
                 num_layers=layers,
                 batch_first=True,
-                dropout=dropout,
+                dropout=dropout if layers > 1 else 0.0,
             )
             self.fc = nn.Linear(hidden, 1)
             self.sigmoid = nn.Sigmoid()
@@ -399,26 +433,26 @@ def _train_pytorch_model(
         y: Shape ``(n,)`` binary labels.
         epochs: Max training epochs.
         lr: Learning rate.
-        patience: Early stopping patience.
+        patience: Early stopping patience (epochs without improvement).
 
     Returns:
-        The trained model (with best weights restored).
+        The trained model with best weights restored.
     """
     device = torch.device("cpu")
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.BCELoss()
 
-    n = len(X_seq)
-    split = int(n * 0.85)
+    n: int = len(X_seq)
+    split: int = int(n * 0.85)
     X_tr = torch.tensor(X_seq[:split], dtype=torch.float32).to(device)
     y_tr = torch.tensor(y[:split], dtype=torch.float32).to(device)
     X_val = torch.tensor(X_seq[split:], dtype=torch.float32).to(device)
     y_val = torch.tensor(y[split:], dtype=torch.float32).to(device)
 
-    best_val_loss = float("inf")
-    best_state: dict[str, Any] | None = None
-    no_improve = 0
+    best_val_loss: float = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    no_improve: int = 0
 
     for epoch in range(epochs):
         model.train()
@@ -431,7 +465,7 @@ def _train_pytorch_model(
         model.eval()
         with torch.no_grad():
             val_preds = model(X_val)
-            val_loss = criterion(val_preds, y_val).item()
+            val_loss: float = criterion(val_preds, y_val).item()
 
         if val_loss < best_val_loss - 1e-4:
             best_val_loss = val_loss
@@ -459,13 +493,13 @@ def _make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
     Convert ``(n, n_features)`` to ``(n - seq_len + 1, seq_len, n_features)``.
 
     Args:
-        X: Feature matrix.
+        X: Feature matrix of shape ``(n, n_features)``.
         seq_len: Lookback window length.
 
     Returns:
-        3D array of sequences, or empty array if *n < seq_len*.
+        3D array of sequences, or empty array if ``n < seq_len``.
     """
-    n = len(X)
+    n: int = len(X)
     if n < seq_len:
         return np.empty((0, seq_len, X.shape[1]))
     return np.stack([X[i : i + seq_len] for i in range(n - seq_len + 1)])
@@ -480,10 +514,10 @@ def _predict_sequence_model(
     """
     Run a single-row prediction through a sequence model.
 
-    Since sequence models need history, we replicate the current bar
+    Since sequence models need history, the current bar is replicated
     across the full sequence length.  This is a known approximation —
     for true sequence inference, the caller should pass the last
-    SEQ_LEN bars.
+    :data:`SEQ_LEN` bars.
 
     Args:
         model: Trained LSTM or Transformer.
@@ -496,13 +530,15 @@ def _predict_sequence_model(
     """
     try:
         # Repeat the single row across SEQ_LEN timesteps
-        seq = np.tile(feature_row_scaled, (SEQ_LEN, 1))  # (SEQ_LEN, n_features)
+        row_2d: np.ndarray = feature_row_scaled.reshape(1, n_features)
+        seq: np.ndarray = np.tile(row_2d, (SEQ_LEN, 1))  # (SEQ_LEN, n_features)
         seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(
             0
         )  # (1, SEQ_LEN, n_features)
+
         model.eval()
         with torch.no_grad():
-            prob = float(model(seq_tensor).item())
+            prob: float = float(model(seq_tensor).item())
         return prob
     except Exception as exc:
         logger.debug(
@@ -521,7 +557,7 @@ def _predict_sequence_model(
 def walk_forward_evaluate(
     feature_df: pd.DataFrame,
     model_name: str,
-    build_model_fn: Any,
+    build_model_fn: Callable[[], Any],
     feature_cols: list[str],
     step_days: int = 30,
     min_train_rows: int = 500,
@@ -533,47 +569,55 @@ def walk_forward_evaluate(
     ``predict_proba``).
 
     Args:
-        feature_df: Full feature DataFrame sorted by time.
+        feature_df: Full feature DataFrame sorted by time.  Must contain
+            a ``timestamp`` column and a ``label`` column.
         model_name: Name for logging.
-        build_model_fn: Callable returning an unfitted model.
-        feature_cols: Feature column names.
-        step_days: Days per test fold.
+        build_model_fn: Callable returning an unfitted model instance.
+        feature_cols: Feature column names to use.
+        step_days: Days per test fold (converted to bar count at 1 bar/min).
         min_train_rows: Minimum training rows before first fold.
 
     Returns:
-        Mean metrics across folds, or empty dict on failure.
+        Mean metrics across folds (``accuracy``, ``precision``, ``recall``,
+        ``f1``, ``brier``), or empty dict on failure.
     """
-    df = feature_df.dropna(subset=["label"] + feature_cols).copy()
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    df: pd.DataFrame = feature_df.dropna(subset=["label"] + feature_cols).copy()
 
-    total = len(df)
-    initial_train = int(total * 0.7)
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+
+    total: int = len(df)
+    initial_train: int = int(total * 0.7)
+    # Convert step_days to bar count (1 bar per minute)
+    step_bars: int = step_days * 24 * 60
 
     fold_metrics: list[dict[str, float]] = []
-    train_end = initial_train
+    train_end: int = initial_train
 
     while train_end + min_train_rows // 5 < total:
-        train_df = df.iloc[:train_end]
-        test_end = min(train_end + step_days * 24 * 60, total)
-        test_df = df.iloc[train_end:test_end]
+        train_df: pd.DataFrame = df.iloc[:train_end]
+        test_end: int = min(train_end + step_bars, total)
+        test_df: pd.DataFrame = df.iloc[train_end:test_end]
 
         if len(train_df) < min_train_rows or len(test_df) < 20:
             break
 
-        X_train = train_df[feature_cols].values
-        y_train = train_df["label"].to_numpy(dtype=np.float64)
-        X_test = test_df[feature_cols].values
-        y_test = test_df["label"].to_numpy(dtype=np.float64)
+        X_train: np.ndarray = train_df[feature_cols].to_numpy(dtype=np.float64)
+        y_train: np.ndarray = train_df["label"].to_numpy(dtype=np.float64)
+        X_test: np.ndarray = test_df[feature_cols].to_numpy(dtype=np.float64)
+        y_test: np.ndarray = test_df["label"].to_numpy(dtype=np.float64)
 
         try:
             scaler = StandardScaler()
             X_train = scaler.fit_transform(X_train)
             X_test = scaler.transform(X_test)
 
-            mdl = build_model_fn()
+            mdl: Any = build_model_fn()
             mdl.fit(X_train, y_train)
-            proba = mdl.predict_proba(X_test)[:, 1]
-            preds = (proba >= 0.5).astype(int)
+            proba: np.ndarray = mdl.predict_proba(X_test)[:, 1]
+            preds: np.ndarray = (proba >= 0.5).astype(int)
 
             fold_metrics.append(
                 {
@@ -599,7 +643,9 @@ def walk_forward_evaluate(
     if not fold_metrics:
         return {}
 
-    means = {k: float(np.mean([m[k] for m in fold_metrics])) for k in fold_metrics[0]}
+    means: dict[str, float] = {
+        k: float(np.mean([m[k] for m in fold_metrics])) for k in fold_metrics[0]
+    }
     logger.info(
         {
             "event": "walk_forward_complete",
@@ -619,28 +665,36 @@ class IndicatorAccuracyTracker:
     Tracks historical prediction accuracy per indicator.
 
     Uses a decaying moving average (alpha=0.05) to weight recent results
-    more heavily.
+    more heavily than stale ones.
     """
 
     def __init__(self, indicator_names: list[str]) -> None:
         self._accuracy: dict[str, float] = {name: 0.55 for name in indicator_names}
-        self._alpha = 0.05
+        self._alpha: float = 0.05
 
     def update(self, indicator: str, correct: bool) -> None:
         """
         Update the accuracy weight for *indicator*.
 
         Args:
-            indicator: Indicator name.
+            indicator: Indicator name (e.g. ``"rsi"``).
             correct: Whether the indicator's signal was correct.
         """
-        current = self._accuracy.get(indicator, 0.55)
+        current: float = self._accuracy.get(indicator, 0.55)
         self._accuracy[indicator] = (
             current * (1 - self._alpha) + float(correct) * self._alpha
         )
 
     def get_confidence_weight(self, indicator: str) -> float:
-        """Return the current accuracy weight for *indicator*."""
+        """
+        Return the current accuracy weight for *indicator*.
+
+        Args:
+            indicator: Indicator name.
+
+        Returns:
+            Accuracy weight in [0, 1], default 0.55.
+        """
         return self._accuracy.get(indicator, 0.55)
 
     def all_weights(self) -> dict[str, float]:
@@ -663,29 +717,29 @@ class ModelManager:
     """
 
     def __init__(self, config: Any, martingale_tracker: MartingaleTracker) -> None:
-        self._config = config
-        self._mt = martingale_tracker
-        self._feature_cols = get_feature_columns()
-        self._indicator_groups = get_indicator_feature_groups()
-        self._max_sequences = getattr(config, "max_sequences", 20000)
+        self._config: Any = config
+        self._mt: MartingaleTracker = martingale_tracker
+        self._feature_cols: list[str] = get_feature_columns()
+        self._indicator_groups: dict[str, list[str]] = get_indicator_feature_groups()
+        self._max_sequences: int = getattr(config, "max_sequences", 20000)
 
         # Nested dict: {pair: {expiry: {model_name: fitted_model}}}
         self._models: dict[str, dict[int, dict[str, Any]]] = {}
         self._scalers: dict[str, dict[int, StandardScaler]] = {}
-        self._metrics: dict[str, dict[int, dict[str, dict]]] = {}
+        self._metrics: dict[str, dict[int, dict[str, dict[str, float]]]] = {}
         self._indicator_tracker: dict[str, IndicatorAccuracyTracker] = {}
 
-        self._regime_detector = RegimeDetector()
-        self._expiry_optimizer = ExpiryOptimizer()
+        self._regime_detector: RegimeDetector = RegimeDetector()
+        self._expiry_optimizer: ExpiryOptimizer = ExpiryOptimizer()
 
         # Retrain tracking
         self._result_counts: dict[str, int] = {}
         self._last_train_counts: dict[str, int] = {}
-        self._retrain_threshold = 500
+        self._retrain_threshold: int = 500
 
         # Prediction audit log (rolling window per pair)
-        self._prediction_log: dict[str, list[dict]] = {}
-        self._max_log_size = 1000
+        self._prediction_log: dict[str, list[dict[str, Any]]] = {}
+        self._max_log_size: int = 1000
 
     # ── Training ──────────────────────────────────────────────────────────────
 
@@ -695,7 +749,7 @@ class ModelManager:
         expiry_seconds: int,
         feature_df: pd.DataFrame,
         feature_df_recent: pd.DataFrame | None = None,
-    ) -> dict[str, dict]:
+    ) -> dict[str, dict[str, float]]:
         """
         Train all model candidates on *feature_df*.  Run walk-forward
         validation for sklearn models.
@@ -705,13 +759,19 @@ class ModelManager:
             expiry_seconds: Option expiry in seconds.
             feature_df: Full feature DataFrame for tree models.
             feature_df_recent: Optional recent data for sequence models
-                (LSTM/Transformer).
+                (LSTM/Transformer).  If ``None``, sequence models are skipped.
 
         Returns:
             Dict of walk-forward metrics per model name.
         """
-        df = feature_df.dropna(subset=["label"] + self._feature_cols).copy()
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        df: pd.DataFrame = feature_df.dropna(
+            subset=["label"] + self._feature_cols
+        ).copy()
+
+        if "timestamp" in df.columns:
+            df = df.sort_values("timestamp").reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
 
         if len(df) < 200:
             logger.warning(
@@ -723,15 +783,15 @@ class ModelManager:
             )
             return {}
 
-        X = df[self._feature_cols].to_numpy(dtype=np.float64)
-        y = df["label"].to_numpy(dtype=np.float64)
+        X: np.ndarray = df[self._feature_cols].to_numpy(dtype=np.float64)
+        y: np.ndarray = df["label"].to_numpy(dtype=np.float64)
 
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        X_scaled: np.ndarray = scaler.fit_transform(X)
         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
 
         trained: dict[str, Any] = {}
-        wf_metrics: dict[str, dict] = {}
+        wf_metrics: dict[str, dict[str, float]] = {}
 
         # ── LightGBM ──────────────────────────────────────────────────────
         if LGBM_AVAILABLE:
@@ -795,7 +855,7 @@ class ModelManager:
 
         # ── RandomForest (subset for memory) ──────────────────────────────
         if len(df) > MAX_RF_ROWS:
-            df_rf = df.tail(MAX_RF_ROWS).copy()
+            df_rf: pd.DataFrame = df.tail(MAX_RF_ROWS).copy()
             logger.info(
                 {
                     "event": "randomforest_subset",
@@ -810,11 +870,11 @@ class ModelManager:
             rf_model = RandomForestClassifier(
                 n_estimators=100, max_depth=6, random_state=42, n_jobs=2
             )
-            X_rf = df_rf[self._feature_cols].to_numpy(dtype=np.float64)
-            y_rf = df_rf["label"].to_numpy(dtype=np.float64)
+            X_rf: np.ndarray = df_rf[self._feature_cols].to_numpy(dtype=np.float64)
+            y_rf: np.ndarray = df_rf["label"].to_numpy(dtype=np.float64)
 
             # Use the SAME scaler fitted on full data — not a new one
-            X_rf_scaled = scaler.transform(X_rf)
+            X_rf_scaled: np.ndarray = scaler.transform(X_rf)
 
             rf_model.fit(X_rf_scaled, y_rf)
             trained["randomforest"] = rf_model
@@ -827,7 +887,11 @@ class ModelManager:
                 self._feature_cols,
             )
             logger.info(
-                {"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)}
+                {
+                    "event": "randomforest_trained",
+                    "pair": pair,
+                    "rows_used": len(df_rf),
+                }
             )
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
@@ -838,7 +902,7 @@ class ModelManager:
             and feature_df_recent is not None
             and not feature_df_recent.empty
         ):
-            seq_result = self._train_sequence_models(
+            seq_result: dict[str, Any] = self._train_sequence_models(
                 pair=pair,
                 feature_df_recent=feature_df_recent,
                 scaler=scaler,
@@ -877,22 +941,27 @@ class ModelManager:
 
         Args:
             pair: Internal pair name.
-            feature_df_recent: Recent feature DataFrame.
-            scaler: Already-fitted StandardScaler.
+            feature_df_recent: Recent feature DataFrame with ``label`` column.
+            scaler: Already-fitted :class:`StandardScaler`.
 
         Returns:
-            Dict mapping model name to trained model.
+            Dict mapping model name (``"lstm"``, ``"transformer"``) to
+            trained model, or empty dict on failure.
         """
-        df_recent = feature_df_recent.dropna(
+        df_recent: pd.DataFrame = feature_df_recent.dropna(
             subset=["label"] + self._feature_cols
         ).copy()
 
         # Cap sequences to prevent OOM
-        max_rows = self._max_sequences + SEQ_LEN
+        max_rows: int = self._max_sequences + SEQ_LEN
         if len(df_recent) > max_rows:
             df_recent = df_recent.tail(max_rows)
             logger.info(
-                {"event": "sequence_data_capped", "pair": pair, "rows": len(df_recent)}
+                {
+                    "event": "sequence_data_capped",
+                    "pair": pair,
+                    "rows": len(df_recent),
+                }
             )
 
         if len(df_recent) < SEQ_LEN + 50:
@@ -906,17 +975,17 @@ class ModelManager:
             )
             return {}
 
-        X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
-        y_recent = df_recent["label"].to_numpy(dtype=np.float64)
-        X_recent_scaled = scaler.transform(X_recent)
-        X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
-        y_seq = y_recent[SEQ_LEN - 1 :]
+        X_recent: np.ndarray = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
+        y_recent: np.ndarray = df_recent["label"].to_numpy(dtype=np.float64)
+        X_recent_scaled: np.ndarray = scaler.transform(X_recent)
+        X_seq: np.ndarray = _make_sequences(X_recent_scaled, SEQ_LEN)
+        y_seq: np.ndarray = y_recent[SEQ_LEN - 1 :]
 
         if len(X_seq) == 0:
             logger.warning({"event": "no_sequences_produced", "pair": pair})
             return {}
 
-        n_features = len(self._feature_cols)
+        n_features: int = len(self._feature_cols)
         trained: dict[str, Any] = {}
 
         for model_name, model_cls in [
@@ -924,7 +993,7 @@ class ModelManager:
             ("transformer", _TransformerModel),
         ]:
             try:
-                model = model_cls(n_features=n_features)
+                model: Any = model_cls(n_features=n_features)
                 model = _train_pytorch_model(model, X_seq, y_seq, epochs=10)
                 trained[model_name] = model
                 logger.info(
@@ -949,7 +1018,10 @@ class ModelManager:
     # ── Prediction ────────────────────────────────────────────────────────────
 
     def predict(
-        self, pair: str, expiry_seconds: int, feature_row: pd.Series
+        self,
+        pair: str,
+        expiry_seconds: int,
+        feature_row: pd.Series,
     ) -> dict[str, Any] | None:
         """
         Generate a signal for *(pair, expiry_seconds)* using the best
@@ -961,31 +1033,34 @@ class ModelManager:
             feature_row: Single-row Series of feature values.
 
         Returns:
-            Signal dict, or ``None`` if no models are available.
-            The confidence threshold check is delegated to the orchestrator.
+            Signal dict with keys ``pair``, ``direction``, ``confidence``,
+            ``model_used``, ``expiry_seconds``, ``timestamp``,
+            ``indicator_signals``, ``regime``, ``preferred_indicators``,
+            ``martingale_streak``, ``threshold_applied``.
+            Returns ``None`` if no models are available.
         """
-        models = self._models.get(pair, {}).get(expiry_seconds)
+        models: dict[str, Any] | None = self._models.get(pair, {}).get(expiry_seconds)
         if not models:
             return None
 
-        scaler = self._scalers.get(pair, {}).get(expiry_seconds)
+        scaler: StandardScaler | None = self._scalers.get(pair, {}).get(expiry_seconds)
         if scaler is None:
             return None
 
-        feat = (
+        feat: np.ndarray = (
             feature_row.reindex(self._feature_cols)
             .fillna(0.0)
             .to_numpy(dtype=np.float64)
             .reshape(1, -1)
         )
-        feat_scaled = scaler.transform(feat)
+        feat_scaled: np.ndarray = scaler.transform(feat)
 
         # ── Per-model predictions ──────────────────────────────────────────
         model_probs: dict[str, float] = {}
         for model_name, mdl in models.items():
             try:
                 if model_name in ("lstm", "transformer") and TORCH_AVAILABLE:
-                    prob = _predict_sequence_model(
+                    prob: float | None = _predict_sequence_model(
                         mdl, feat_scaled, len(self._feature_cols), model_name
                     )
                     if prob is not None:
@@ -1007,21 +1082,23 @@ class ModelManager:
             return None
 
         # Best model: highest deviation from 0.5 (most decisive)
-        best_model = max(model_probs, key=lambda m: abs(model_probs[m] - 0.5))
-        best_prob = model_probs[best_model]
-        best_direction = "UP" if best_prob >= 0.5 else "DOWN"
-        best_confidence = 0.5 + abs(best_prob - 0.5)
+        best_model: str = max(model_probs, key=lambda m: abs(model_probs[m] - 0.5))
+        best_prob: float = model_probs[best_model]
+        best_direction: str = "UP" if best_prob >= 0.5 else "DOWN"
+        best_confidence: float = 0.5 + abs(best_prob - 0.5)
 
         # ── Market regime ──────────────────────────────────────────────────
-        regime = self._regime_detector.detect(feature_row)
-        preferred = self._regime_detector.preferred_indicators(regime)
+        regime: str = self._regime_detector.detect(feature_row)
+        preferred: list[str] = self._regime_detector.preferred_indicators(regime)
 
         # ── Per-indicator consensus ────────────────────────────────────────
-        indicator_signals: dict[str, dict] = {}
-        indicator_tracker = self._indicator_tracker.get(pair)
+        indicator_signals: dict[str, dict[str, Any]] = {}
+        indicator_tracker: IndicatorAccuracyTracker | None = (
+            self._indicator_tracker.get(pair)
+        )
         weighted_votes: dict[str, float] = {}
 
-        tabular_model = (
+        tabular_model: Any | None = (
             models.get("lightgbm")
             or models.get("xgboost")
             or models.get("randomforest")
@@ -1029,29 +1106,30 @@ class ModelManager:
 
         if tabular_model is not None:
             for indicator, cols in self._indicator_groups.items():
-                available_cols = [c for c in cols if c in feature_row.index]
+                available_cols: list[str] = [c for c in cols if c in feature_row.index]
                 if not available_cols:
                     continue
 
                 try:
-                    # Build indicator-only feature vector (zero out non-indicator cols)
-                    ind_feat = np.zeros_like(feat_scaled)
+                    # Build indicator-only feature vector
+                    # (zero out non-indicator cols)
+                    ind_feat: np.ndarray = np.zeros_like(feat_scaled)
                     for col in available_cols:
                         if col in self._feature_cols:
-                            idx = self._feature_cols.index(col)
+                            idx: int = self._feature_cols.index(col)
                             ind_feat[0, idx] = feat_scaled[0, idx]
 
-                    ind_prob = float(tabular_model.predict_proba(ind_feat)[0, 1])
-                    ind_direction = "UP" if ind_prob >= 0.5 else "DOWN"
-                    ind_confidence = 0.5 + abs(ind_prob - 0.5)
+                    ind_prob: float = float(tabular_model.predict_proba(ind_feat)[0, 1])
+                    ind_direction: str = "UP" if ind_prob >= 0.5 else "DOWN"
+                    ind_confidence: float = 0.5 + abs(ind_prob - 0.5)
 
-                    base_weight = (
+                    base_weight: float = (
                         indicator_tracker.get_confidence_weight(indicator)
                         if indicator_tracker
                         else 0.55
                     )
-                    regime_multiplier = 1.5 if indicator in preferred else 1.0
-                    weight = base_weight * regime_multiplier
+                    regime_multiplier: float = 1.5 if indicator in preferred else 1.0
+                    weight: float = base_weight * regime_multiplier
 
                     indicator_signals[indicator] = {
                         "direction": ind_direction,
@@ -1069,26 +1147,28 @@ class ModelManager:
 
         # Blend model confidence with indicator consensus (70/30)
         if weighted_votes:
-            consensus_direction = max(weighted_votes, key=lambda k: weighted_votes[k])
-            total_weight = sum(weighted_votes.values())
-            consensus_confidence = (
+            consensus_direction: str = max(
+                weighted_votes, key=lambda k: weighted_votes[k]
+            )
+            total_weight: float = sum(weighted_votes.values())
+            consensus_confidence: float = (
                 weighted_votes[consensus_direction] / total_weight
                 if total_weight > 0
                 else 0.5
             )
-            final_direction = (
+            final_direction: str = (
                 best_direction
                 if best_confidence >= consensus_confidence
                 else consensus_direction
             )
-            final_confidence = round(
+            final_confidence: float = round(
                 0.70 * best_confidence + 0.30 * consensus_confidence, 4
             )
         else:
             final_direction = best_direction
             final_confidence = round(best_confidence, 4)
 
-        result = {
+        result: dict[str, Any] = {
             "pair": pair,
             "direction": final_direction,
             "confidence": final_confidence,
@@ -1103,7 +1183,7 @@ class ModelManager:
         }
 
         # Audit log
-        log = self._prediction_log.setdefault(pair, [])
+        log: list[dict[str, Any]] = self._prediction_log.setdefault(pair, [])
         log.append(
             {
                 "ts": result["timestamp"],
@@ -1134,21 +1214,41 @@ class ModelManager:
     def update_indicator_accuracy(
         self, pair: str, indicator: str, correct: bool
     ) -> None:
-        """Update indicator accuracy after a trade result is known."""
-        tracker = self._indicator_tracker.get(pair)
+        """
+        Update indicator accuracy after a trade result is known.
+
+        Args:
+            pair: Internal pair name.
+            indicator: Indicator name (e.g. ``"rsi"``).
+            correct: Whether the indicator's signal was correct.
+        """
+        tracker: IndicatorAccuracyTracker | None = self._indicator_tracker.get(pair)
         if tracker:
             tracker.update(indicator, correct)
 
     # ── Retrain tracking ──────────────────────────────────────────────────────
 
     def record_result(self, pair: str) -> None:
-        """Increment result counter for *pair* (used to trigger retraining)."""
+        """
+        Increment result counter for *pair* (used to trigger retraining).
+
+        Args:
+            pair: Internal pair name.
+        """
         self._result_counts[pair] = self._result_counts.get(pair, 0) + 1
 
     def should_retrain(self, pair: str) -> bool:
-        """Return ``True`` if enough new results accumulated since last train."""
-        last = self._last_train_counts.get(pair, 0)
-        current = self._result_counts.get(pair, 0)
+        """
+        Return ``True`` if enough new results accumulated since last train.
+
+        Args:
+            pair: Internal pair name.
+
+        Returns:
+            ``True`` if ``current - last >= retrain_threshold``.
+        """
+        last: int = self._last_train_counts.get(pair, 0)
+        current: int = self._result_counts.get(pair, 0)
         return (current - last) >= self._retrain_threshold
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -1179,7 +1279,7 @@ class ModelManager:
                     else:
                         serializable_models[pair][expiry][name] = mdl
 
-        payload = {
+        payload: dict[str, Any] = {
             "models": serializable_models,
             "scalers": self._scalers,
             "metrics": self._metrics,
@@ -1188,12 +1288,12 @@ class ModelManager:
             "last_train_counts": self._last_train_counts,
         }
 
-        pkl_path = os.path.join(path, "model_manager.pkl")
+        pkl_path: str = os.path.join(path, "model_manager.pkl")
         with open(pkl_path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         if TORCH_AVAILABLE and torch_state:
-            torch_path = os.path.join(path, "pytorch_models.pt")
+            torch_path: str = os.path.join(path, "pytorch_models.pt")
             torch.save(torch_state, torch_path)
 
         if storage:
@@ -1217,15 +1317,16 @@ class ModelManager:
             path: Local directory to load from.
             storage: Optional :class:`~storage.StorageManager` for blob fallback.
         """
-        pkl_path = os.path.join(path, "model_manager.pkl")
-        torch_path = os.path.join(path, "pytorch_models.pt")
+        pkl_path: str = os.path.join(path, "model_manager.pkl")
+        torch_path: str = os.path.join(path, "pytorch_models.pt")
 
+        payload: dict[str, Any]
         if os.path.exists(pkl_path):
             with open(pkl_path, "rb") as f:
                 payload = pickle.load(f)
             logger.info({"event": "models_loaded_from_local", "path": path})
         elif storage:
-            data = storage.load_model()
+            data: bytes | None = storage.load_model()
             if data:
                 os.makedirs(path, exist_ok=True)
                 with open(pkl_path, "wb") as f:
@@ -1250,13 +1351,17 @@ class ModelManager:
         # Load PyTorch weights
         if TORCH_AVAILABLE and os.path.exists(torch_path):
             try:
-                torch_state = torch.load(
+                torch_state: dict[str, Any] = torch.load(
                     torch_path, map_location="cpu", weights_only=True
                 )
                 for key, state in torch_state.items():
-                    pair, expiry_str, model_name = key.split("/")
-                    expiry = int(expiry_str)
-                    model = self._models.get(pair, {}).get(expiry, {}).get(model_name)
+                    parts: list[str] = key.split("/")
+                    pair: str = parts[0]
+                    expiry: int = int(parts[1])
+                    model_name: str = parts[2]
+                    model: Any | None = (
+                        self._models.get(pair, {}).get(expiry, {}).get(model_name)
+                    )
                     if model is not None:
                         model.load_state_dict(state)
                         logger.info({"event": "pytorch_weights_loaded", "key": key})

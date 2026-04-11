@@ -14,7 +14,16 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-VALID_PAIRS: set[str] = {"EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"}
+VALID_PAIRS: set[str] = {
+    "EUR_USD",
+    "GBP_USD",
+    "USD_JPY",
+    "AUD_USD",
+    "USD_CAD",
+    "USD_CHF",
+    "NZD_USD",
+    "XAU_USD",
+}
 VALID_EXPIRIES: set[int] = {60, 120, 300}
 
 
@@ -34,7 +43,7 @@ def _require(name: str) -> str:
     Raises:
         ValueError: If the variable is unset or empty.
     """
-    val = os.environ.get(name, "").strip()
+    val: str = os.environ.get(name, "").strip()
     if not val:
         raise ValueError(f"Required environment variable '{name}' is not set or empty.")
     return val
@@ -66,8 +75,12 @@ def _bool(name: str, default: bool = True) -> bool:
     Args:
         name: Environment variable name.
         default: Value to use when the variable is not set at all.
+
+    Returns:
+        ``True`` if the variable is set to a truthy value, ``False`` if set
+        to any other non-empty value, or *default* if absent.
     """
-    raw = os.environ.get(name)
+    raw: str | None = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
@@ -77,19 +90,28 @@ def _int(name: str, default: int) -> int:
     """
     Read an integer environment variable.
 
+    If the variable is absent **or** set to an empty string, *default* is
+    returned.  This mirrors the behaviour of :func:`_bool` which treats
+    empty strings as falsy rather than raising.
+
     Args:
         name: Environment variable name.
-        default: Value to use when the variable is not set.
+        default: Value to use when the variable is not set or empty.
+
+    Returns:
+        Parsed integer value.
 
     Raises:
-        ValueError: If the variable is set but not a valid integer.
+        ValueError: If the variable is set to a non-empty, non-integer value.
     """
-    val = os.environ.get(name, str(default)).strip()
+    raw: str | None = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
     try:
-        return int(val)
+        return int(raw.strip())
     except ValueError:
         raise ValueError(
-            f"Environment variable '{name}' must be an integer, got: '{val}'"
+            f"Environment variable '{name}' must be an integer, got: '{raw.strip()}'"
         )
 
 
@@ -97,18 +119,28 @@ def _float(name: str, default: float) -> float:
     """
     Read a float environment variable.
 
+    If the variable is absent **or** set to an empty string, *default* is
+    returned.
+
     Args:
         name: Environment variable name.
-        default: Value to use when the variable is not set.
+        default: Value to use when the variable is not set or empty.
+
+    Returns:
+        Parsed float value.
 
     Raises:
-        ValueError: If the variable is set but not a valid float.
+        ValueError: If the variable is set to a non-empty, non-float value.
     """
-    val = os.environ.get(name, str(default)).strip()
+    raw: str | None = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
     try:
-        return float(val)
+        return float(raw.strip())
     except ValueError:
-        raise ValueError(f"Environment variable '{name}' must be a float, got: '{val}'")
+        raise ValueError(
+            f"Environment variable '{name}' must be a float, got: '{raw.strip()}'"
+        )
 
 
 # ── Configuration dataclass ───────────────────────────────────────────────────
@@ -175,7 +207,13 @@ class Config:
     poll_interval: float
 
     def __post_init__(self) -> None:
-        """Run cross-field validation after construction."""
+        """
+        Run cross-field validation after construction.
+
+        Raises:
+            ValueError: If confidence threshold, dashboard port, or log
+                level are out of range / invalid.
+        """
         # Pairs
         for p in self.pairs:
             if p not in VALID_PAIRS:
@@ -209,15 +247,16 @@ class Config:
         # Quotex credentials required when direct reading is enabled
         if not self.quotex_email or not self.quotex_password:
             logger.info(
-                "Quotex credentials not set — result reading via pyquotex disabled. "
-                "Set QUOTEX_EMAIL and QUOTEX_PASSWORD to enable."
+                "Quotex credentials not set — result reading via pyquotex "
+                "disabled. Set QUOTEX_EMAIL and QUOTEX_PASSWORD to enable."
             )
 
         # Log level validation (don't configure logging here — main.py owns that)
-        level = getattr(logging, self.log_level, None)
+        level: int | None = getattr(logging, self.log_level, None)
         if level is None:
             raise ValueError(
-                f"LOG_LEVEL must be a valid Python logging level, got: '{self.log_level}'"
+                f"LOG_LEVEL must be a valid Python logging level, "
+                f"got: '{self.log_level}'"
             )
 
         # Live mode warning
@@ -228,7 +267,8 @@ class Config:
             )
         else:
             logger.info(
-                "[PRACTICE MODE] — Signals will fire but treat results as simulation."
+                "[PRACTICE MODE] — Signals will fire but treat results as "
+                "simulation."
             )
 
 
@@ -241,10 +281,19 @@ def _parse_backfill_pairs(raw: str) -> list[str]:
         "EUR_USD,GBP_USD,USD_JPY"
 
     Defaults to ``["EUR_USD"]`` if empty to conserve API credits.
+
+    Args:
+        raw: Raw comma-separated string from the environment variable.
+
+    Returns:
+        List of pair names.
+
+    Raises:
+        ValueError: If the variable is set but contains no valid pairs.
     """
     if not raw.strip():
         return ["EUR_USD"]
-    pairs = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    pairs: list[str] = [p.strip().upper() for p in raw.split(",") if p.strip()]
     if not pairs:
         raise ValueError("BACKFILL_PAIRS is set but contains no valid pairs.")
     return pairs
@@ -260,10 +309,16 @@ def _parse_otc_pairs(raw: str) -> list[str]:
 
     If empty, symbols are derived from ``PAIRS`` at stream start time
     (``EUR_USD`` → ``EURUSD-OTC``).
+
+    Args:
+        raw: Raw comma-separated string from the environment variable.
+
+    Returns:
+        List of OTC symbol names, or empty list if unset.
     """
     if not raw.strip():
         return []
-    pairs = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    pairs: list[str] = [p.strip().upper() for p in raw.split(",") if p.strip()]
     if not pairs:
         raise ValueError("OTC_PAIRS is set but contains no valid pairs.")
     return pairs
@@ -274,14 +329,15 @@ def load_config() -> Config:
     Parse all environment variables and return a validated :class:`Config`.
 
     Raises:
-        ValueError: If any required variable is missing or any value is invalid.
+        ValueError: If any required variable is missing or any value is
+            invalid.
     """
-    pairs_raw = _optional("PAIRS", "EUR_USD,GBP_USD,USD_JPY,XAU_USD")
-    pairs = [p.strip().upper() for p in pairs_raw.split(",") if p.strip()]
+    pairs_raw: str = _optional("PAIRS", "EUR_USD,GBP_USD,USD_JPY,XAU_USD")
+    pairs: list[str] = [p.strip().upper() for p in pairs_raw.split(",") if p.strip()]
     if not pairs:
         raise ValueError("PAIRS must contain at least one currency pair.")
 
-    target_profit_raw = _optional("TARGET_NET_PROFIT", "")
+    target_profit_raw: str = _optional("TARGET_NET_PROFIT", "")
     target_net_profit: float | None = None
     if target_profit_raw:
         try:

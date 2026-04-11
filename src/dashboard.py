@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -156,7 +156,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
   const activity = [];
-  let lastSeenEvent = '';
 
   function classifyEvent(text) {
     const lower = (text || '').toLowerCase();
@@ -165,6 +164,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (lower.includes('loss')) return 'loss';
     if (lower.includes('draw')) return 'draw';
     return 'info';
+  }
+
+  function renderLog() {
+    const el = document.getElementById('activity-log');
+    if (activity.length === 0) {
+      el.innerHTML = '<div class="log-entry info">Waiting for data...</div>';
+      return;
+    }
+    el.innerHTML = activity.map(e =>
+      '<div class="log-entry ' + e.cls + '">[' + e.time + '] ' + e.text + '</div>'
+    ).join('');
   }
 
   async function refresh() {
@@ -227,23 +237,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('quotex-balance').textContent =
         quotex.balance ? '$' + quotex.balance.toFixed(2) : '—';
 
-      // Activity log — only append when event changes
+      // Activity log — append every unique event
       const currentEvent = d.last_event || '';
-      if (currentEvent && currentEvent !== lastSeenEvent) {
-        lastSeenEvent = currentEvent;
+      if (currentEvent) {
+        const lastEntry = activity.length > 0 ? activity[0] : null;
         const now = new Date().toLocaleTimeString();
         const cls = classifyEvent(currentEvent);
-        activity.unshift({ time: now, text: currentEvent, cls });
-        if (activity.length > 20) activity.pop();
+        if (!lastEntry || lastEntry.text !== currentEvent) {
+          activity.unshift({ time: now, text: currentEvent, cls });
+          if (activity.length > 20) activity.pop();
+        }
       }
-
-      // Always render (handles initial load + empty state)
-      if (activity.length > 0) {
-        document.getElementById('activity-log').innerHTML =
-          activity.map(e =>
-            '<div class="log-entry ' + e.cls + '">[' + e.time + '] ' + e.text + '</div>'
-          ).join('');
-      }
+      renderLog();
 
       const now = new Date().toLocaleTimeString();
       document.getElementById('last-update').textContent =
@@ -265,7 +270,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
 class StatusStore:
-    """Thread-safe store for live system status. Updated by main loop."""
+    """
+    Thread-safe store for live system status.
+
+    Updated by the main trading loop via :meth:`update`.  Read by the
+    HTTP handler on every ``/status`` request.
+
+    The orchestrator **must** call ``status_store.update({"last_event": ...})``
+    after every significant event for the activity log to populate.
+    """
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {
@@ -282,26 +295,46 @@ class StatusStore:
         }
 
     def update(self, data: dict[str, Any]) -> None:
+        """
+        Merge *data* into the current status.
+
+        Args:
+            data: Partial status dict.  Keys not present are left unchanged.
+        """
         self._data.update(data)
 
     def get(self) -> dict[str, Any]:
+        """
+        Return a snapshot of the current status with a ``server_time`` field.
+
+        Returns:
+            Copy of the status dict safe for JSON serialisation.
+        """
         return {**self._data, "server_time": datetime.now(timezone.utc).isoformat()}
 
 
 # Singleton — imported by main.py
-status_store = StatusStore()
+status_store: StatusStore = StatusStore()
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
 
 
 class _Handler(BaseHTTPRequestHandler):
+    """Serves the dashboard HTML, JSON status, and health check."""
 
     def do_GET(self) -> None:  # noqa: N802
+        """
+        Route GET requests to the appropriate handler.
+
+        ``/`` and ``/index.html`` return the dashboard HTML.
+        ``/status`` returns the live JSON status.
+        ``/health`` returns a plain-text ``"ok"``.
+        """
         if self.path in ("/", "/index.html"):
             self._respond(200, "text/html", DASHBOARD_HTML.encode())
         elif self.path == "/status":
-            payload = json.dumps(status_store.get()).encode()
+            payload: bytes = json.dumps(status_store.get()).encode()
             self._respond(200, "application/json", payload)
         elif self.path == "/health":
             self._respond(200, "text/plain", b"ok")
@@ -309,6 +342,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"not found")
 
     def _respond(self, code: int, content_type: str, body: bytes) -> None:
+        """
+        Send an HTTP response with CORS headers.
+
+        Args:
+            code: HTTP status code.
+            content_type: ``Content-Type`` header value.
+            body: Response body bytes.
+        """
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -317,16 +358,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        pass  # silence default HTTP logs
+        """Suppress default HTTP server log output to stderr."""
+        pass
 
 
 # ── Async runner ───────────────────────────────────────────────────────────────
 
 
 async def run_dashboard(port: int = 8080) -> None:
-    """Run the HTTP dashboard in a background thread."""
-    server = HTTPServer(("0.0.0.0", port), _Handler)
-    thread = Thread(target=server.serve_forever, daemon=True, name="dashboard")
+    """
+    Run the HTTP dashboard in a daemon background thread.
+
+    The thread is daemonised so it dies automatically when the process
+    exits.  The coroutine sleeps forever to keep the task alive.
+
+    Args:
+        port: TCP port to bind (default 8080).
+    """
+    server: HTTPServer = HTTPServer(("0.0.0.0", port), _Handler)
+    thread: Thread = Thread(target=server.serve_forever, daemon=True, name="dashboard")
     thread.start()
     logger.info(
         {
@@ -335,6 +385,6 @@ async def run_dashboard(port: int = 8080) -> None:
             "url": f"http://0.0.0.0:{port}",
         }
     )
-    # Keep coroutine alive
+    # Keep coroutine alive — daemon thread handles the actual serving
     while True:
         await asyncio.sleep(60)

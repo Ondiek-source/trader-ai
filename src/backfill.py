@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -36,16 +35,47 @@ PAIR_TO_TD: dict[str, str] = {
     "EUR_USD": "EUR/USD",
     "GBP_USD": "GBP/USD",
     "USD_JPY": "USD/JPY",
+    "AUD_USD": "AUD/USD",
+    "USD_CAD": "USD/CAD",
+    "USD_CHF": "USD/CHF",
+    "NZD_USD": "NZD/USD",
     "XAU_USD": "XAU/USD",
 }
 
-TD_BASE = "https://api.twelvedata.com/time_series"
-CHUNK_SIZE = 5000  # bars per request (Twelve Data max)
-REQUEST_INTERVAL = 10.0  # seconds between requests (8/min = free tier limit)
-DEFAULT_BACKFILL_YEARS = 2
+TD_BASE: str = "https://api.twelvedata.com/time_series"
+CHUNK_SIZE: int = 5000  # bars per request (Twelve Data max)
+REQUEST_INTERVAL: float = 10.0  # seconds between requests (8/min = free tier limit)
+DEFAULT_BACKFILL_YEARS: int = 2
+RATE_LIMIT_WAIT: int = 60  # seconds to wait on 429
+REQUEST_ERROR_WAIT: int = 30  # seconds to wait on connection error
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _parse_bar_datetime(raw: str) -> datetime:
+    """
+    Parse a Twelve Data datetime string into a timezone-aware UTC datetime.
+
+    Handles formats:
+        - ``"2025-01-15 12:00:00"``
+        - ``"2025-01-15 12:00:00.000"``
+        - ``"2025-01-15T12:00:00"``
+
+    Args:
+        raw: Raw datetime string from Twelve Data.
+
+    Returns:
+        Timezone-aware UTC datetime.
+
+    Raises:
+        ValueError: If no known format matches.
+    """
+    # Strip milliseconds if present
+    cleaned: str = raw.split(".")[0].replace("T", " ")
+    return datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=timezone.utc
+    )
 
 
 def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
@@ -59,28 +89,39 @@ def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
 
     Args:
         bars: List of dicts from Twelve Data ``values`` array.
+            Each must have keys ``datetime``, ``open``, ``high``,
+            ``low``, ``close``.
         pair: Internal pair name (``"EUR_USD"``).
 
     Returns:
-        Sorted, deduplicated DataFrame with tick columns.
+        Sorted, deduplicated DataFrame with tick columns
+        (``timestamp``, ``bid``, ``ask``, ``spread``, ``pair``).
     """
     rows: list[dict[str, Any]] = []
     for bar in bars:
         try:
-            dt = datetime.strptime(bar["datetime"], "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
+            dt: datetime = _parse_bar_datetime(bar["datetime"])
+            o: float = float(bar["open"])
+            h: float = float(bar["high"])
+            l_: float = float(bar["low"])
+            c: float = float(bar["close"])
+        except (KeyError, ValueError) as exc:
+            logger.debug(
+                {
+                    "event": "bar_parse_error",
+                    "pair": pair,
+                    "error": str(exc),
+                    "bar": str(bar)[:200],
+                }
             )
-            o = float(bar["open"])
-            h = float(bar["high"])
-            l_ = float(bar["low"])
-            c = float(bar["close"])
-        except (KeyError, ValueError):
             continue
 
         for offset_s, price in [(0, o), (15, h), (30, l_), (45, c)]:
             rows.append(
                 {
-                    "timestamp": pd.Timestamp(dt + timedelta(seconds=offset_s)),
+                    "timestamp": pd.Timestamp(
+                        dt + timedelta(seconds=offset_s), tz="UTC"
+                    ),
                     "bid": price,
                     "ask": price,
                     "spread": 0.0,
@@ -89,15 +130,21 @@ def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
             )
 
     if not rows:
-        return pd.DataFrame(columns=["timestamp", "bid", "ask", "spread", "pair"])
+        return pd.DataFrame(
+            columns=["timestamp", "bid", "ask", "spread", "pair"]
+        )
 
-    df = pd.DataFrame(rows)
+    df: pd.DataFrame = pd.DataFrame(rows)
     return (
-        df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        df.sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
     )
 
 
-def check_data_coverage(pair: str, storage: Any, min_days: int = 365) -> bool:
+def check_data_coverage(
+    pair: str, storage: Any, min_days: int = 365
+) -> bool:
     """
     Check whether *pair* has at least *min_days* of data in blob storage.
 
@@ -112,14 +159,14 @@ def check_data_coverage(pair: str, storage: Any, min_days: int = 365) -> bool:
     Returns:
         ``True`` if enough monthly blobs exist.
     """
-    months_needed = max(1, min_days // 22 + 1)
-    now = datetime.now(timezone.utc)
-    found = 0
+    months_needed: int = max(1, min_days // 22 + 1)
+    now: datetime = datetime.now(timezone.utc)
+    found: int = 0
 
     for m in range(months_needed):
-        year = now.year if now.month - m > 0 else now.year - 1
-        month = (now.month - m - 1) % 12 + 1
-        blob_path = f"data/{pair}/{year}-{month:02d}.parquet"
+        year: int = now.year if now.month - m > 0 else now.year - 1
+        month: int = (now.month - m - 1) % 12 + 1
+        blob_path: str = f"data/{pair}/{year}-{month:02d}.parquet"
         if storage.blob_exists(blob_path):
             found += 1
 
@@ -158,7 +205,7 @@ async def backfill_pair(
         storage: :class:`~storage.StorageManager` instance.
         years_back: How many years of history to fetch.
     """
-    symbol = PAIR_TO_TD.get(pair)
+    symbol: str | None = PAIR_TO_TD.get(pair)
     if not symbol:
         logger.error({"event": "backfill_unknown_pair", "pair": pair})
         return
@@ -174,8 +221,8 @@ async def backfill_pair(
         )
         return
 
-    end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=365 * years_back)
+    end_date: datetime = datetime.now(timezone.utc)
+    start_date: datetime = end_date - timedelta(days=365 * years_back)
 
     logger.info(
         {
@@ -192,18 +239,20 @@ async def backfill_pair(
     # re-checking blob existence for every chunk.
     written_months: set[str] = set()
 
-    total_bars = 0
-    request_count = 0
-    current_end = end_date
+    total_bars: int = 0
+    request_count: int = 0
+    current_end: datetime = end_date
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": "TraderAI/1.0"},
         timeout=aiohttp.ClientTimeout(total=30),
     ) as session:
         while current_end > start_date:
-            current_start = max(current_end - timedelta(days=7), start_date)
+            current_start: datetime = max(
+                current_end - timedelta(days=7), start_date
+            )
 
-            params = {
+            params: dict[str, Any] = {
                 "symbol": symbol,
                 "interval": "1min",
                 "start_date": current_start.strftime("%Y-%m-%d %H:%M:%S"),
@@ -215,24 +264,24 @@ async def backfill_pair(
             }
 
             try:
-                t0 = time.monotonic()
+                t0: float = time.monotonic()
                 async with session.get(TD_BASE, params=params) as resp:
                     resp.raise_for_status()
-                    data = await resp.json()
+                    data: dict[str, Any] = await resp.json()
                 request_count += 1
 
                 if data.get("status") == "error":
-                    code = data.get("code", "")
-                    msg = data.get("message", "")
+                    code: Any = data.get("code", "")
+                    msg: str = data.get("message", "")
                     if "429" in str(code) or "rate" in msg.lower():
                         logger.warning(
                             {
                                 "event": "backfill_rate_limited",
                                 "pair": pair,
-                                "waiting_s": 60,
+                                "waiting_s": RATE_LIMIT_WAIT,
                             }
                         )
-                        await asyncio.sleep(60)
+                        await asyncio.sleep(RATE_LIMIT_WAIT)
                         continue
                     logger.warning(
                         {
@@ -244,12 +293,12 @@ async def backfill_pair(
                     )
                     break
 
-                bars = data.get("values", [])
+                bars: list[dict[str, Any]] = data.get("values", [])
                 if not bars:
                     current_end = current_start - timedelta(minutes=1)
                     continue
 
-                tick_df = _bars_to_ticks(bars, pair)
+                tick_df: pd.DataFrame = _bars_to_ticks(bars, pair)
                 if tick_df.empty:
                     current_end = current_start - timedelta(minutes=1)
                     continue
@@ -263,20 +312,22 @@ async def backfill_pair(
                     # use int() to extract scalar values explicitly.
                     period_year: int = int(period.year)  # type: ignore[union-attr]
                     period_month: int = int(period.month)  # type: ignore[union-attr]
-                    month_key = f"{period_year}-{period_month:02d}"
+                    month_key: str = f"{period_year}-{period_month:02d}"
 
                     # Skip months we've already written in this run
                     if month_key in written_months:
                         continue
 
-                    blob_path = f"data/{pair}/{month_key}.parquet"
+                    blob_path: str = f"data/{pair}/{month_key}.parquet"
 
                     # Also skip if blob already existed before this run
                     if storage.blob_exists(blob_path):
                         written_months.add(month_key)
                         continue
 
-                    storage.write_raw_parquet(blob_path, grp.drop(columns=["_ym"]))
+                    storage.write_raw_parquet(
+                        blob_path, grp.drop(columns=["_ym"])
+                    )
                     written_months.add(month_key)
                     logger.info(
                         {
@@ -304,14 +355,14 @@ async def backfill_pair(
                 )
 
                 # Walk backwards: oldest bar becomes new end
-                oldest_dt_str = bars[-1]["datetime"]
-                current_end = datetime.strptime(
-                    oldest_dt_str, "%Y-%m-%d %H:%M:%S"
-                ).replace(tzinfo=timezone.utc) - timedelta(minutes=1)
+                oldest_dt_str: str = bars[-1]["datetime"]
+                current_end = _parse_bar_datetime(
+                    oldest_dt_str
+                ) - timedelta(minutes=1)
 
                 # Rate-limit: sleep remainder of REQUEST_INTERVAL
-                elapsed = time.monotonic() - t0
-                wait = max(0.0, REQUEST_INTERVAL - elapsed)
+                elapsed: float = time.monotonic() - t0
+                wait: float = max(0.0, REQUEST_INTERVAL - elapsed)
                 if wait > 0:
                     await asyncio.sleep(wait)
 
@@ -323,7 +374,7 @@ async def backfill_pair(
                         "error": str(exc),
                     }
                 )
-                await asyncio.sleep(30)
+                await asyncio.sleep(REQUEST_ERROR_WAIT)
                 continue
 
     logger.info(
@@ -340,6 +391,7 @@ async def backfill_all(
     pairs: list[str],
     storage: Any,
     years_back: int = DEFAULT_BACKFILL_YEARS,
+    api_key: str = "",
 ) -> None:
     """
     Run backfill for all pairs sequentially (to respect rate limits).
@@ -348,11 +400,20 @@ async def backfill_all(
         pairs: List of internal pair names.
         storage: :class:`~storage.StorageManager` instance.
         years_back: How many years of history to fetch per pair.
+        api_key: Twelve Data API key.  Falls back to
+            ``TWELVEDATA_API_KEY`` env var if empty.
     """
-    api_key = os.environ.get("TWELVEDATA_API_KEY", "")
+    if not api_key:
+        import os
+
+        api_key = os.environ.get("TWELVEDATA_API_KEY", "")
+
     if not api_key:
         logger.error(
-            {"event": "backfill_no_api_key", "reason": "TWELVEDATA_API_KEY not set"}
+            {
+                "event": "backfill_no_api_key",
+                "reason": "No API key provided and TWELVEDATA_API_KEY not set",
+            }
         )
         return
 

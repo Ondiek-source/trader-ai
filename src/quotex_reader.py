@@ -5,23 +5,23 @@ Uses pyquotex (cleitonleonel/pyquotex) unofficial WebSocket API.
 Module: pyquotex.stable_api (NOT quotexapi — package renamed in v1.0)
 Install: pip install git+https://github.com/cleitonleonel/pyquotex.git
 
-CONFIRMED API (from pyquotex source / research):
+CONFIRMED API (from pyquotex docs):
     - Quotex(email, password, lang="en")
     - await client.connect() → (bool, reason_str)
     - client.change_account("PRACTICE" | "REAL")
+    - client.set_account_mode("PRACTICE" | "REAL")
     - await client.get_balance() → float
+    - await client.get_history() → [{"ticket": id, "profitAmount": float, ...}, ...]
+    - await client.get_result(operation_id) → ("win"|"loss", details)
+    - await client.check_win(operation_id) → True (profit) | False (loss)
+    - client.get_profit() → float (after check_win)
     - Direction strings: "call" (UP/buy) | "put" (DOWN/sell)
     - Asset format: "EURUSD_otc" (OTC, 24/7) | "EURUSD" (market hours)
 
-UNCONFIRMED (needs live introspection — raw logs will reveal):
-    - Trade history method name (get_history / get_closed_deals / etc.)
-    - WebSocket trade-close message schema field names
-
 Strategy (no trade ID available — our bot places trades, not us):
     1. Balance-delta: monitor account balance; change at expiry = trade result.
-    2. WebSocket introspection: log ALL messages from client.api for schema discovery.
-    3. Time-windowed match: at expiry+2s, scan buffered WS messages for
-    the asset+direction that matches our pending signal.
+    2. get_history(): scan recent trades for matching asset + profitAmount.
+    3. get_result(id): get win/loss for a specific operation ID from history.
 """
 
 from __future__ import annotations
@@ -48,16 +48,15 @@ PAIR_TO_ASSETS: dict[str, list[str]] = {
     "XAU_USD": ["XAUUSD", "XAUUSD_otc"],
 }
 
-
 # Direction: our internal → Quotex API
 DIRECTION_TO_QUOTEX: dict[str, str] = {"UP": "call", "DOWN": "put"}
 QUOTEX_TO_DIRECTION: dict[str, str] = {"call": "UP", "put": "DOWN"}
 
 # ── Library import ─────────────────────────────────────────────────────────────
-_QuotexClient: Any = None  # replaced at import time if library is present
+_QuotexClient: Any = None
 QUOTEX_LIB_AVAILABLE = False
 try:
-    from pyquotex.stable_api import Quotex as _QuotexClient  # type: ignore[import-unresolved]
+    from pyquotex.stable_api import Quotex as _QuotexClient
 
     QUOTEX_LIB_AVAILABLE = True
 except Exception as _qx_err:
@@ -73,11 +72,10 @@ class QuotexReader:
     """
     Connects to Quotex WebSocket and reads closed trade results.
 
-    Two complementary detection strategies run in parallel:
-        A) Balance-delta: reliable signal that *some* trade closed.
-        B) WebSocket stream: richer data (asset, direction, profit).
-
-    Both are correlated against pending signals using expiry time window.
+    Detection strategies (tried in order):
+        A) Balance-delta: fast, no API calls, reliable signal that *some* trade closed.
+        B) get_history(): scan recent trades for matching asset + profitAmount.
+        C) get_result(id): get win/loss for a specific operation from history.
 
     Args:
         email: Quotex account email.
@@ -87,9 +85,8 @@ class QuotexReader:
 
     RESULT_BUFFER_SECONDS = 2  # wait after signal expiry before checking
     BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
-    MAX_WS_MESSAGES = 300  # ring buffer size for raw WS messages
-    MAX_RECONNECT_DELAY = 120  # seconds
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
+    MAX_RECONNECT_DELAY = 120  # seconds
 
     def __init__(self, email: str, password: str, practice_mode: bool = True) -> None:
         self._email = email
@@ -105,14 +102,12 @@ class QuotexReader:
         # {signal_id → {signal, expiry_time, balance_before, attempts, resolved}}
         self._pending: dict[str, dict[str, Any]] = {}
 
-        # Ring buffer of raw WebSocket messages for introspection
-        self._ws_messages: list[dict[str, Any]] = []
+        # Cached history from last get_history() call
+        self._cached_history: list[dict[str, Any]] = []
+        self._history_cache_time: float = 0.0
 
         # Results ready for consumption by main loop
         self._result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-        # Track which history methods actually work (populated at runtime)
-        self._working_history_methods: list[str] = []
 
     # ── Connection ─────────────────────────────────────────────────────────────
 
@@ -152,9 +147,6 @@ class QuotexReader:
                         "reason": str(reason),
                     }
                 )
-
-                # Log all available client methods (aids schema discovery)
-                self._introspect_client()
                 return True
             else:
                 logger.error({"event": "quotex_connect_failed", "reason": str(reason)})
@@ -177,47 +169,12 @@ class QuotexReader:
             except Exception:
                 pass
 
-    def _introspect_client(self) -> None:
-        """Log all public client methods — helps discover history/result APIs."""
-        try:
-            methods = [m for m in dir(self._client) if not m.startswith("_")]
-            logger.info(
-                {
-                    "event": "quotex_client_methods_discovered",
-                    "methods": methods,
-                    "note": "Look for get_history / get_closed_deals / get_result / "
-                    "closed_trades in this list",
-                }
-            )
-            # Also log api sub-object if it exists
-            if hasattr(self._client, "api"):
-                api_methods = [
-                    m for m in dir(self._client.api) if not m.startswith("_")
-                ]
-                logger.info(
-                    {
-                        "event": "quotex_api_object_methods",
-                        "api_methods": api_methods,
-                    }
-                )
-        except Exception as exc:
-            logger.debug({"event": "introspect_failed", "error": str(exc)})
-
     # ── Signal registration ────────────────────────────────────────────────────
 
     def register_pending(
         self, signal_id: str, signal: dict[str, Any], expiry_time: datetime
     ) -> None:
-        """
-        Register a signal that needs result matching at *expiry_time*.
-
-        Args:
-            signal_id: UUID from :class:`SignalOrchestrator`.
-            signal: Internal signal metadata dict (has ``pair``, ``direction``,
-                ``confidence``, ``expiry_seconds``, ``fired_at``).
-            expiry_time: UTC datetime when the option expires.
-        """
-        # Snapshot balance NOW so the delta is accurate later
+        """Register a signal that needs result matching at *expiry_time*."""
         balance_snapshot = self._balance
         self._pending[signal_id] = {
             "signal": signal,
@@ -242,16 +199,15 @@ class QuotexReader:
         """
         Background task: runs forever.
 
-        - Polls balance every :attr:`BALANCE_POLL_INTERVAL` seconds.
-        - At expiry + :attr:`RESULT_BUFFER_SECONDS`, attempts to match a result
-          to each pending signal using balance-delta + WS message scan.
-        - Puts matched results onto :attr:`_result_queue`.
+        - Polls balance every BALANCE_POLL_INTERVAL seconds.
+        - At expiry + RESULT_BUFFER_SECONDS, attempts to match a result
+          to each pending signal.
+        - Puts matched results onto _result_queue.
         """
         balance_task: asyncio.Task[None] | None = None
 
         while True:
             if not self._connected:
-                # Cancel balance monitor, reconnect, then restart it
                 if balance_task is not None and not balance_task.done():
                     balance_task.cancel()
                     try:
@@ -267,7 +223,6 @@ class QuotexReader:
 
                 balance_task = asyncio.create_task(self._balance_monitor())
 
-            # Ensure balance task is running
             if balance_task is None or balance_task.done():
                 balance_task = asyncio.create_task(self._balance_monitor())
 
@@ -279,8 +234,7 @@ class QuotexReader:
                 for sid, data in self._pending.items()
                 if not data["resolved"]
                 and now
-                >= data["expiry_time"]
-                + timedelta(seconds=self.RESULT_BUFFER_SECONDS)
+                >= data["expiry_time"] + timedelta(seconds=self.RESULT_BUFFER_SECONDS)
                 and data["attempts"] < self.MAX_HISTORY_ATTEMPTS
             }
 
@@ -297,9 +251,10 @@ class QuotexReader:
                             "event": "result_unresolved",
                             "signal_id": signal_id,
                             "pair": data["signal"].get("pair"),
-                            "message": "No matching trade found after "
-                            f"{self.MAX_HISTORY_ATTEMPTS} attempts. "
-                            "Check [QUOTEX_RAW_MSG] logs for schema hints.",
+                            "message": (
+                                f"No matching trade found after "
+                                f"{self.MAX_HISTORY_ATTEMPTS} attempts."
+                            ),
                         }
                     )
 
@@ -307,8 +262,7 @@ class QuotexReader:
             self._pending = {
                 sid: d
                 for sid, d in self._pending.items()
-                if not d["resolved"]
-                or (now - d["expiry_time"]).total_seconds() < 60
+                if not d["resolved"] or (now - d["expiry_time"]).total_seconds() < 60
             }
 
             await asyncio.sleep(0.5)
@@ -316,13 +270,7 @@ class QuotexReader:
     # ── Balance monitor ────────────────────────────────────────────────────────
 
     async def _balance_monitor(self) -> None:
-        """
-        Continuously polls balance to detect trade closes via delta.
-
-        Runs as a child task of :meth:`poll_results`.  Exits when
-        :attr:`_connected` becomes ``False``.
-        """
-        # Set initial balance without logging a delta
+        """Continuously polls balance to detect trade closes via delta."""
         if self._balance == 0.0:
             self._balance = await self._safe_get_balance()
             self._prev_balance = self._balance
@@ -344,18 +292,14 @@ class QuotexReader:
                     )
                     self._balance = new_balance
             except Exception as exc:
-                logger.debug(
-                    {"event": "balance_poll_error", "error": str(exc)}
-                )
+                logger.debug({"event": "balance_poll_error", "error": str(exc)})
 
     async def _safe_get_balance(self) -> float:
         """Fetch balance with a 5-second timeout; returns cached value on failure."""
         if not self._client or not self._connected:
             return self._balance
         try:
-            bal = await asyncio.wait_for(
-                self._client.get_balance(), timeout=5.0
-            )
+            bal = await asyncio.wait_for(self._client.get_balance(), timeout=5.0)
             return float(bal) if bal is not None else self._balance
         except Exception:
             return self._balance
@@ -368,7 +312,10 @@ class QuotexReader:
         """
         Try all strategies to resolve a trade result for this signal.
 
-        Returns a result dict or ``None`` if unresolved.
+        Order:
+            1. Balance delta (fast, no API calls)
+            2. get_history() scan (matches asset + profitAmount)
+            3. get_result(id) for specific operation from history
         """
         signal = data["signal"]
         pair = signal.get("pair", "")
@@ -376,16 +323,7 @@ class QuotexReader:
         expiry_time = data["expiry_time"]
         balance_before = data["balance_before"]
 
-        # ── Strategy 1: WebSocket message scan ────────────────────────────────
-        ws_result = self._scan_ws_messages(pair, direction, expiry_time)
-        if ws_result:
-            return {
-                **ws_result,
-                "signal_id": signal_id,
-                "detection": "websocket",
-            }
-
-        # ── Strategy 2: Balance delta (fast, no API calls) ───────────────────
+        # ── Strategy 1: Balance delta (fast, no API calls) ─────────────────
         current = await self._safe_get_balance()
         delta = current - balance_before
         if abs(delta) > 0.001:
@@ -397,311 +335,135 @@ class QuotexReader:
                     "pair": pair,
                     "delta": round(delta, 4),
                     "outcome": outcome,
-                    "note": "Balance delta match — pair/direction inferred",
                 }
             )
-            return self._make_result(
-                signal_id, pair, direction, outcome, abs(delta)
-            )
+            return self._make_result(signal_id, pair, direction, outcome, abs(delta))
 
-        # ── Strategy 3: Try history methods (expensive — last resort) ─────────
-        if self._working_history_methods or data["attempts"] >= 2:
-            api_result = await self._try_history_methods(
-                pair, direction, expiry_time
-            )
-            if api_result:
-                return {
-                    **api_result,
-                    "signal_id": signal_id,
-                    "detection": "api_history",
-                }
+        # ── Strategy 2: get_history() scan ─────────────────────────────────
+        history_result = await self._match_from_history(pair, direction, expiry_time)
+        if history_result:
+            return {
+                **history_result,
+                "signal_id": signal_id,
+                "detection": "api_history",
+            }
 
         return None
 
-    # ── WebSocket message scanning ─────────────────────────────────────────────
+    # ── History-based matching ─────────────────────────────────────────────────
 
-    def _scan_ws_messages(
+    async def _match_from_history(
         self, pair: str, direction: str, expiry_time: datetime
     ) -> dict[str, Any] | None:
         """
-        Scan buffered WebSocket messages for a trade result matching
-        this signal's asset, direction, and time window.
-        """
-        asset_candidates = {
-            a.upper()
-            for a in PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])
-        }
-        quotex_direction = DIRECTION_TO_QUOTEX.get(direction, "call")
-        window_start = expiry_time - timedelta(seconds=30)
-        window_end = expiry_time + timedelta(seconds=10)
+        Call get_history() and match against our pending signal.
 
-        for msg in reversed(self._ws_messages):
-            try:
-                parsed = self._parse_ws_message(msg)
-                if parsed is None:
-                    continue
-
-                # Asset match
-                msg_asset = str(parsed.get("asset", "")).upper()
-                if not any(
-                    candidate in msg_asset or msg_asset in candidate
-                    for candidate in asset_candidates
-                ):
-                    continue
-
-                # Direction match (skip if direction unknown in message)
-                msg_direction = str(parsed.get("direction", "")).lower()
-                if msg_direction and msg_direction != quotex_direction:
-                    continue
-
-                # Time proximity — only check if close_time was actually found
-                msg_time = parsed.get("close_time")
-                if msg_time is not None:
-                    if not (window_start <= msg_time <= window_end):
-                        continue
-
-                outcome = str(parsed.get("result", "")).lower()
-                payout = float(parsed.get("profit", 0.0))
-                if outcome in ("win", "loss", "draw"):
-                    return self._make_result("", pair, direction, outcome, payout)
-
-            except Exception:
-                continue
-        return None
-
-    def _parse_ws_message(self, msg: Any) -> dict[str, Any] | None:
-        """
-        Parse a raw WebSocket message into a normalised dict.
-
-        Field names here are best-effort.  Run the system and check
-        ``[QUOTEX_RAW_MSG]`` logs to verify/correct these.
-        """
-        if not isinstance(msg, dict):
-            return None
-
-        # Log raw for schema discovery
-        msg_type = msg.get(
-            "type", msg.get("name", msg.get("status", "unknown"))
-        )
-        logger.debug(
-            {
-                "event": "[QUOTEX_RAW_MSG]",
-                "type": msg_type,
-                "keys": list(msg.keys())[:15],
-                "preview": str(msg)[:300],
-            }
-        )
-
-        result_candidates: dict[str, Any] = {
-            "profit": msg.get(
-                "profit", msg.get("win_amount", msg.get("payout"))
-            ),
-            "result": msg.get(
-                "result", msg.get("status", msg.get("outcome"))
-            ),
-            "asset": msg.get(
-                "asset", msg.get("symbol", msg.get("active"))
-            ),
-            "direction": msg.get(
-                "direction", msg.get("call_put", msg.get("option_type"))
-            ),
-            "close_time": None,
-        }
-
-        # Parse close time from any known timestamp field
-        for time_key in (
-            "close_time",
-            "closed_at",
-            "expiration",
-            "exp_time",
-            "time",
-        ):
-            raw_time = msg.get(time_key)
-            if raw_time:
-                try:
-                    result_candidates["close_time"] = datetime.fromtimestamp(
-                        float(raw_time), tz=timezone.utc
-                    )
-                    break
-                except Exception:
-                    pass
-
-        # Normalise result string
-        raw_result = result_candidates["result"]
-        if raw_result is not None:
-            raw_lower = str(raw_result).lower()
-            if raw_lower in ("win", "1", "true", "won"):
-                result_candidates["result"] = "win"
-            elif raw_lower in ("loss", "lose", "lost", "0", "false"):
-                result_candidates["result"] = "loss"
-            elif raw_lower in ("draw", "tie", "equal"):
-                result_candidates["result"] = "draw"
-
-        # Normalise profit
-        raw_profit = result_candidates["profit"]
-        if raw_profit is not None:
-            try:
-                result_candidates["profit"] = float(raw_profit)
-            except Exception:
-                result_candidates["profit"] = 0.0
-
-        return result_candidates
-
-    # ── History method probing ─────────────────────────────────────────────────
-
-    async def _try_history_methods(
-        self,
-        pair: str,
-        direction: str,
-        _expiry_time: datetime,  # noqa: ARG002
-    ) -> dict[str, Any] | None:
-        """
-        Try known history / result methods on the client object.
-
-        On first success the working method is cached in
-        :attr:`_working_history_methods` so future calls skip dead methods.
+        Per docs, get_history() returns a list like:
+            [{"ticket": 12345, "profitAmount": 5.50, "asset": "EURUSD_otc", ...}, ...]
         """
         if not self._client:
             return None
 
-        asset_candidates = PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])
+        try:
+            history = await asyncio.wait_for(self._client.get_history(), timeout=8.0)
 
-        # Use cached working methods if we've found any; otherwise try all
-        methods_to_try = (
-            self._working_history_methods
-            if self._working_history_methods
-            else [
-                "get_history",
-                "get_history_v2",
-                "get_closed_deals",
-                "get_closed_options",
-                "get_result",
-                "get_trade_history",
-                "get_user_deals",
-            ]
-        )
+            if not history or not isinstance(history, list):
+                return None
 
-        call_count = 0
-        for method_name in methods_to_try:
-            if not hasattr(self._client, method_name):
-                continue
-            for asset in asset_candidates:
-                try:
-                    method = getattr(self._client, method_name)
-                    # Try with just asset first (most likely to work)
+            # Log first call for schema discovery
+            if not hasattr(self, "_logged_history"):
+                logger.info(
+                    {
+                        "event": "quotex_history_sample",
+                        "type": type(history).__name__,
+                        "count": len(history),
+                        "sample": str(history[:2])[:500],
+                    }
+                )
+                self._logged_history = True
+
+            asset_candidates = {
+                a.upper() for a in PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])
+            }
+            window_start = expiry_time - timedelta(seconds=60)
+
+            for item in reversed(history):
+                if not isinstance(item, dict):
+                    continue
+
+                # Asset match
+                item_asset = str(
+                    item.get("asset", item.get("symbol", item.get("active", "")))
+                ).upper()
+                if not any(
+                    c in item_asset or item_asset in c for c in asset_candidates
+                ):
+                    continue
+
+                # Profit — per docs the field is "profitAmount"
+                profit = None
+                for key in ("profitAmount", "profit", "payout", "amount"):
+                    if key in item:
+                        try:
+                            profit = float(item[key])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+
+                if profit is None:
+                    continue
+
+                # Result from get_result(id) if we have a ticket
+                ticket = item.get("ticket")
+                if ticket is not None:
                     try:
-                        raw = await asyncio.wait_for(
-                            method(asset), timeout=8.0
+                        status, details = await asyncio.wait_for(
+                            self._client.get_result(ticket), timeout=5.0
                         )
-                        call_count += 1
                         logger.info(
                             {
-                                "event": "[QUOTEX_RAW_RESPONSE]",
-                                "method": method_name,
-                                "args": (asset,),
-                                "raw_type": type(raw).__name__,
-                                "raw_preview": str(raw)[:600],
+                                "event": "quotex_result_detail",
+                                "ticket": ticket,
+                                "status": status,
+                                "profit": profit,
                             }
                         )
-                        result = self._extract_from_history(
-                            raw, pair, direction
-                        )
-                        if result:
-                            # Cache this working method
-                            if method_name not in self._working_history_methods:
-                                self._working_history_methods.append(
-                                    method_name
-                                )
-                                logger.info(
-                                    {
-                                        "event": "history_method_cached",
-                                        "method": method_name,
-                                    }
-                                )
-                            return result
+                        outcome = "win" if str(status).lower() == "win" else "loss"
+                        return self._make_result("", pair, direction, outcome, profit)
                     except Exception:
                         pass
 
-                    if call_count >= self.MAX_HISTORY_ATTEMPTS:
-                        return None
+                # Infer outcome from profit sign
+                if profit > 0:
+                    outcome = "win"
+                elif profit == 0:
+                    outcome = "draw"
+                else:
+                    outcome = "loss"
 
-                except Exception as exc:
-                    logger.debug(
-                        {
-                            "event": "history_method_failed",
-                            "method": method_name,
-                            "error": str(exc),
-                        }
-                    )
-
-        return None
-
-    def _extract_from_history(
-        self, raw: Any, pair: str, direction: str
-    ) -> dict[str, Any] | None:
-        """Extract a matching trade from a history response of unknown schema."""
-        if raw is None:
-            return None
-
-        asset_candidates = {
-            a.upper() for a in PAIR_TO_ASSETS.get(pair, [])
-        }
-
-        def _check_item(item: Any) -> dict[str, Any] | None:
-            if not isinstance(item, dict):
-                return None
-            # Asset check
-            item_asset = str(
-                item.get(
-                    "asset",
-                    item.get("symbol", item.get("active", "")),
+                logger.info(
+                    {
+                        "event": "quotex_history_match",
+                        "pair": pair,
+                        "asset": item_asset,
+                        "profit": profit,
+                        "outcome": outcome,
+                        "ticket": item.get("ticket"),
+                    }
                 )
-            ).upper()
-            if asset_candidates and not any(
-                c in item_asset or item_asset in c
-                for c in asset_candidates
-            ):
-                return None
-            # Find profit/result
-            profit: float | None = None
-            for k in ("profit", "win", "payout", "income", "amount"):
-                if k in item:
-                    try:
-                        profit = float(item[k])
-                        break
-                    except Exception:
-                        pass
-            if profit is None:
-                return None
-            if profit > 0:
-                outcome = "win"
-            elif profit == 0:
-                outcome = "draw"
-            else:
-                outcome = "loss"
-            return self._make_result("", pair, direction, outcome, profit)
+                return self._make_result("", pair, direction, outcome, profit)
 
-        if isinstance(raw, list):
-            for item in reversed(raw):
-                r = _check_item(item)
-                if r:
-                    return r
-        elif isinstance(raw, dict):
-            # Might be wrapped: {"deals": [...], "history": [...]}
-            for key in (
-                "deals",
-                "history",
-                "trades",
-                "operations",
-                "data",
-                "items",
-            ):
-                if key in raw and isinstance(raw[key], list):
-                    for item in reversed(raw[key]):
-                        r = _check_item(item)
-                        if r:
-                            return r
-            return _check_item(raw)
+        except asyncio.TimeoutError:
+            logger.warning({"event": "quotex_history_timeout", "pair": pair})
+        except Exception as exc:
+            logger.error(
+                {
+                    "event": "quotex_history_error",
+                    "pair": pair,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
 
         return None
 
@@ -715,7 +477,17 @@ class QuotexReader:
         outcome: str,
         payout: float,
     ) -> dict[str, Any]:
-        """Build a standardised result dict for :meth:`SignalOrchestrator.on_result`."""
+        """Build a standardised result dict for SignalOrchestrator.on_result."""
+        logger.info(
+            {
+                "event": "result_made",
+                "signal_id": signal_id,
+                "pair": pair,
+                "direction": direction,
+                "outcome": outcome,
+                "payout": round(abs(payout), 4),
+            }
+        )
         return {
             "signal_id": signal_id,
             "pair": pair,
@@ -729,30 +501,11 @@ class QuotexReader:
     # ── Public consumer ────────────────────────────────────────────────────────
 
     async def get_result(self, timeout: float = 0.1) -> dict[str, Any] | None:
-        """
-        Non-blocking read of the next resolved result.
-
-        Returns:
-            Result dict or ``None`` if nothing available within *timeout*.
-        """
+        """Non-blocking read of the next resolved result."""
         try:
-            return await asyncio.wait_for(
-                self._result_queue.get(), timeout=timeout
-            )
+            return await asyncio.wait_for(self._result_queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
-
-    def add_ws_message(self, msg: dict[str, Any]) -> None:
-        """
-        Feed a raw WebSocket message into the introspection buffer.
-
-        Call this from your WebSocket message handler::
-
-            reader.add_ws_message(raw_ws_dict)
-        """
-        self._ws_messages.append(msg)
-        if len(self._ws_messages) > self.MAX_WS_MESSAGES:
-            self._ws_messages = self._ws_messages[-self.MAX_WS_MESSAGES :]
 
     def health(self) -> dict[str, Any]:
         """Return a serialisable health snapshot."""
@@ -760,9 +513,7 @@ class QuotexReader:
             "connected": self._connected,
             "balance": self._balance,
             "pending_signals": len(self._pending),
-            "ws_messages_buffered": len(self._ws_messages),
             "result_queue_size": self._result_queue.qsize(),
-            "working_history_methods": self._working_history_methods,
         }
 
     # ── Reconnection ──────────────────────────────────────────────────────────
@@ -771,16 +522,12 @@ class QuotexReader:
         """Exponential-backoff reconnection loop."""
         delay = 2.0
         while not self._connected:
-            logger.info(
-                {"event": "quotex_reconnecting", "delay_seconds": delay}
-            )
+            logger.info({"event": "quotex_reconnecting", "delay_seconds": delay})
             await asyncio.sleep(delay)
             try:
                 await self.connect()
             except Exception as exc:
-                logger.warning(
-                    {"event": "quotex_reconnect_error", "error": str(exc)}
-                )
+                logger.warning({"event": "quotex_reconnect_error", "error": str(exc)})
             delay = min(delay * 2, self.MAX_RECONNECT_DELAY)
 
 
@@ -788,11 +535,7 @@ class QuotexReader:
 
 
 async def run_quotex_reader(reader: QuotexReader) -> None:
-    """
-    Top-level entry point for :func:`asyncio.create_task`.
-
-    If pyquotex is not installed, sleeps forever without reconnect spam.
-    """
+    """Top-level entry point for asyncio.create_task."""
     if not QUOTEX_LIB_AVAILABLE:
         logger.info(
             {

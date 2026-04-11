@@ -29,8 +29,13 @@ PAIR_TO_SYMBOL: dict[str, str] = {
     "EUR_USD": "EURUSD",
     "GBP_USD": "GBPUSD",
     "USD_JPY": "USDJPY",
+    "AUD_USD": "AUDUSD",
+    "USD_CAD": "USDCAD",
+    "USD_CHF": "USDCHF",
+    "NZD_USD": "NZDUSD",
     "XAU_USD": "XAUUSD",
 }
+
 
 # How long a signal stays in the pending queue before expiring.
 PENDING_SIGNAL_TTL_SECONDS = 300  # 5 minutes
