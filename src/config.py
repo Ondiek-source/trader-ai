@@ -166,6 +166,7 @@ class Config:
 
     # ── Training ──────────────────────────────────────────────────────────
     backfill_years: int
+    backfill_pairs: list[str]
     max_sequences: int
 
     # ── Data source routing ──────────────────────────────────────────────
@@ -229,6 +230,24 @@ class Config:
             logger.info(
                 "[PRACTICE MODE] — Signals will fire but treat results as simulation."
             )
+
+
+def _parse_backfill_pairs(raw: str) -> list[str]:
+    """
+    Parse ``BACKFILL_PAIRS`` env var.
+
+    Accepts comma-separated internal pair names, e.g.::
+
+        "EUR_USD,GBP_USD,USD_JPY"
+
+    Defaults to ``["EUR_USD"]`` if empty to conserve API credits.
+    """
+    if not raw.strip():
+        return ["EUR_USD"]
+    pairs = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    if not pairs:
+        raise ValueError("BACKFILL_PAIRS is set but contains no valid pairs.")
+    return pairs
 
 
 def _parse_otc_pairs(raw: str) -> list[str]:
@@ -306,6 +325,7 @@ def load_config() -> Config:
         dashboard_port=_int("DASHBOARD_PORT", 8080),
         # Training
         backfill_years=_int("BACKFILL_YEARS", 2),
+        backfill_pairs=_parse_backfill_pairs(_optional("BACKFILL_PAIRS", "EUR_USD")),
         max_sequences=_int("MAX_SEQUENCES", 20000),
         # Data source routing
         use_quotex_streaming=_bool("USE_QUOTEX_STREAMING", True),

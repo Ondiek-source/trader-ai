@@ -278,7 +278,7 @@ async def signal_task(
         prediction = model_manager.predict(pair, config.expiry_seconds, feature_row)
         if prediction is None:
             continue
-        
+
         prediction["otc"] = config.use_quotex_streaming
         payload = orchestrator.try_signal(prediction)
         if payload is None:
@@ -419,9 +419,12 @@ async def health_task(
 
 
 async def backfill_task(config: Any, storage: StorageManager) -> None:
-    """One-shot backfill at startup if less than 1 year of data exists."""
+    """One-shot backfill at startup for configured pairs only."""
+
+    pairs = config.backfill_pairs
+
     needs_backfill = any(
-        not check_data_coverage(pair, storage, min_days=365) for pair in config.pairs
+        not check_data_coverage(pair, storage, min_days=365) for pair in pairs
     )
     if not needs_backfill:
         # Count parquet files for logging (optional but helpful)
@@ -482,11 +485,11 @@ async def backfill_task(config: Any, storage: StorageManager) -> None:
     logger.info(
         {
             "event": "backfill_starting",
-            "pairs": config.pairs,
+            "pairs": pairs,
             "years": config.backfill_years,
         }
     )
-    await backfill_all(config.pairs, storage, years_back=config.backfill_years)
+    await backfill_all(pairs, storage, years_back=config.backfill_years)
     logger.info({"event": "backfill_done"})
 
 
