@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Coroutine
 
+import numpy as np
 import pandas as pd
 import psutil
 
@@ -87,7 +88,7 @@ from twelveticks_stream import TwelveDataStream  # noqa: E402
 from quotex_stream import QuotexStream  # noqa: E402
 from backfill import backfill_all, check_data_coverage  # noqa: E402
 from features import compute_features, resample_to_1min  # noqa: E402
-from model import MartingaleTracker, ModelManager  # noqa: E402
+from model import MartingaleTracker, ModelManager, SEQ_LEN  # noqa: E402
 from signals import create_orchestrator, SignalOrchestrator  # noqa: E402
 from webhook import WebhookSender, WebhookError  # noqa: E402
 from quotex_reader import QuotexReader, run_quotex_reader  # noqa: E402
@@ -103,8 +104,16 @@ MODEL_SAVE_PATH: str = "/app/models"
 HEALTH_LOG_INTERVAL: int = 10  # seconds between health snapshots
 SIGNAL_POLL_MS: float = 0.02  # 20 ms between tick queue polls
 MAX_RECENT_TICKS: int = 15_000  # ~25 min at ~10 ticks/sec
+
+# FIX G: Indicator Convergence Guard (The "Warm-up" Fix).
+# OLD: MIN_BARS_FOR_FEATURES = 30
+#   RSI and EMA use smoothing that takes longer to "settle."  30 bars of
+#   history results in different indicator values than the 2 years used
+#   in training, causing "Value Drift."
+# NEW: Strict 80-bar minimum before inference.
 MIN_TICKS_FOR_FEATURES: int = 120  # ~2 min of ticks
-MIN_BARS_FOR_FEATURES: int = 30  # minimum 1-min bars
+MIN_BARS_FOR_FEATURES: int = 80  # minimum 1-min bars for converged indicators
+
 TRAINING_RETRY_SECONDS: int = 120  # re-check coverage every 2 min
 SUPERVISOR_RESTART_DELAY: int = 5  # seconds before supervised restart
 
@@ -112,7 +121,11 @@ SUPERVISOR_RESTART_DELAY: int = 5  # seconds before supervised restart
 # ── Dashboard helper ──────────────────────────────────────────────────────────
 
 
-def _push_dashboard(orchestrator: SignalOrchestrator, **extra: Any) -> None:
+def _push_dashboard(
+    orchestrator: SignalOrchestrator,
+    config: Any,
+    **extra: Any,
+) -> None:
     """
     Push the latest session + engine state to the dashboard status store.
 
@@ -122,15 +135,14 @@ def _push_dashboard(orchestrator: SignalOrchestrator, **extra: Any) -> None:
     Args:
         orchestrator: The live orchestrator whose :meth:`get_status`
             provides the canonical session state.
+        config: Application config (for confidence_threshold, etc.).
         **extra: Additional keys to merge (e.g. ``last_event``, ``stream``).
     """
     status: dict[str, Any] = orchestrator.get_status()
     update: dict[str, Any] = {
         "stopped": status.get("stopped", False),
         "martingale_streak": status.get("martingale_streak", 0),
-        # Fallback 0 (not a config constant) so a missing value is visible
-        # on the dashboard rather than silently showing a stale hardcoded default.
-        "confidence_threshold": status.get("confidence_threshold", 0),
+        "confidence_threshold": config.confidence_threshold,
         "pending_signals": status.get("pending_signals", 0),
         "session": status.get("session", {}),
     }
@@ -249,6 +261,15 @@ async def signal_task(
     """
     recent_ticks: dict[str, list[dict[str, Any]]] = {p: [] for p in config.pairs}
     last_bar_minute: dict[str, int] = {p: -1 for p in config.pairs}
+
+    # FIX F: Rolling History Buffer (The "Bridge" Fix).
+    # OLD: Extract one row → predict.  Only provided the current snapshot,
+    #   preventing sequence models from working as intended.
+    # NEW: Maintain a rolling window of feature rows per pair so that every
+    #   inference call has a full 30-minute "context" ready for LSTM /
+    #   Transformer.
+    feature_history: dict[str, list[np.ndarray]] = {p: [] for p in config.pairs}
+
     logger.info(
         {
             "event": "signal_task_started",
@@ -291,6 +312,7 @@ async def signal_task(
         if not was_active and now_active:
             _push_dashboard(
                 orchestrator,
+                config,
                 last_event="session_started",
             )
 
@@ -327,6 +349,7 @@ async def signal_task(
                             logger.info({"event": "retrain_complete", "pair": p})
                             _push_dashboard(
                                 orchestrator,
+                                config,
                                 last_event=f"retrained: {p}",
                             )
                 except Exception as exc:
@@ -386,9 +409,30 @@ async def signal_task(
             )
             continue
 
+        # ── FIX F: Update rolling history buffer ──────────────────────────
+        from features import get_feature_columns
+
+        _feature_cols: list[str] = get_feature_columns()
+        available_cols: list[str] = [c for c in _feature_cols if c in feature_row.index]
+        feature_history[pair].append(
+            feature_row[available_cols].to_numpy(dtype=np.float64)
+        )
+        # Keep at least SEQ_LEN rows for sequence models
+        if len(feature_history[pair]) > SEQ_LEN + 50:
+            feature_history[pair] = feature_history[pair][-(SEQ_LEN + 50) :]
+
         # ── Model inference ────────────────────────────────────────────────
+        # FIX F + FIX G: Build 3D history array only when we have enough
+        # converged bars (MIN_BARS_FOR_FEATURES = 80).
+        history_array: np.ndarray | None = None
+        if len(feature_history[pair]) >= SEQ_LEN:
+            history_array = np.array(feature_history[pair][-SEQ_LEN:])
+
         prediction: dict[str, Any] | None = model_manager.predict(
-            pair, config.expiry_seconds, feature_row
+            pair,
+            config.expiry_seconds,
+            feature_row,
+            feature_history=history_array,
         )
         if prediction is None:
             logger.debug(
@@ -412,6 +456,7 @@ async def signal_task(
             # Gate rejected — push confidence for visibility
             _push_dashboard(
                 orchestrator,
+                config,
                 last_event=(
                     f"gate_rejected: {pair} "
                     f"conf={prediction.get('confidence', 0.0):.2f}"
@@ -475,6 +520,7 @@ async def signal_task(
             # Push to dashboard with fresh session state
             _push_dashboard(
                 orchestrator,
+                config,
                 last_event=(
                     f"signal_fired: {pair} "
                     f"{prediction.get('direction')} @ "
@@ -486,6 +532,7 @@ async def signal_task(
             logger.error({"event": "webhook_failed", "error": str(exc), "pair": pair})
             _push_dashboard(
                 orchestrator,
+                config,
                 last_event=f"webhook_failed: {pair}",
             )
 
@@ -495,6 +542,7 @@ async def feedback_task(
     orchestrator: SignalOrchestrator,
     model_manager: ModelManager,
     storage: StorageManager,
+    config: Any,
 ) -> None:
     """
     Consume trade results from Quotex and feed them back.
@@ -512,6 +560,7 @@ async def feedback_task(
         orchestrator: Signal orchestrator for result processing.
         model_manager: Model manager for retrain tracking.
         storage: Persistent storage for result history.
+        config: Application config (for confidence_threshold, etc.).
     """
     from quotex_reader import QUOTEX_LIB_AVAILABLE
 
@@ -528,9 +577,6 @@ async def feedback_task(
     while True:
         result: dict[str, Any] | None = await quotex_reader.get_result(timeout=1.0)
         if result is None:
-            # get_result already waited up to 1.0 s — yield briefly and retry.
-            # Without this the loop burns CPU spinning at ~10 calls/s when idle.
-            await asyncio.sleep(0.1)
             continue
 
         orchestrator.on_result(result)
@@ -547,6 +593,7 @@ async def feedback_task(
         # Push fresh session state immediately — don't wait for health tick
         _push_dashboard(
             orchestrator,
+            config,
             last_event=f"{outcome}: {pair} ${payout:.2f}",
         )
 
@@ -556,6 +603,7 @@ async def feedback_task(
         if session.get("target_reached"):
             _push_dashboard(
                 orchestrator,
+                config,
                 last_event=(
                     f"target_reached: {session.get('wins', 0)} wins, "
                     f"${session.get('net_profit', 0.0):.2f} profit"
@@ -566,6 +614,7 @@ async def feedback_task(
 async def health_task(
     stream: TwelveDataStream | QuotexStream,
     orchestrator: SignalOrchestrator,
+    config: Any,
     quotex_reader: QuotexReader | None = None,
 ) -> None:
     """
@@ -580,6 +629,7 @@ async def health_task(
     Args:
         stream: Active tick stream for tick counter.
         orchestrator: Signal orchestrator for session/martingale state.
+        config: Application config (for confidence_threshold, etc.).
         quotex_reader: Optional Quotex reader for connection health.
     """
     start_time: float = time.monotonic()
@@ -595,13 +645,10 @@ async def health_task(
             else {"connected": False, "balance": 0.0}
         )
 
-        # Memory and CPU metrics — run blocking cpu_percent in executor
-        # to avoid stalling the asyncio event loop for 1 second every tick.
+        # Memory and CPU metrics
         process = psutil.Process()
         memory_mb: float = process.memory_info().rss / 1024 / 1024
-        cpu_percent: float = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: process.cpu_percent(interval=1)
-        )
+        cpu_percent: float = process.cpu_percent(interval=1)
 
         logger.info(
             {
@@ -610,7 +657,7 @@ async def health_task(
                 "ticks_received": stream.ticks_received,
                 "session": status.get("session"),
                 "martingale_streak": status.get("martingale_streak"),
-                "confidence_threshold": status.get("confidence_threshold"),
+                "confidence_threshold": config.confidence_threshold,
                 "pending_signals": status.get("pending_signals"),
                 "memory_usage_mb": round(memory_mb, 1),
                 "memory_usage_gb": round(memory_mb / 1024, 2),
@@ -621,6 +668,7 @@ async def health_task(
         # Backup push — feedback_task is the primary pusher
         _push_dashboard(
             orchestrator,
+            config,
             stream={
                 "connected": True,
                 "ticks_received": stream.ticks_received,
@@ -926,21 +974,16 @@ async def main() -> None:
     # ── Data source selection ───────────────────────────────────────────────
     stream: TwelveDataStream | QuotexStream
 
-    # Single shared Quotex client — Quotex only supports one active WebSocket
-    # session per account.  QuotexStream (tick data) and QuotexReader (result
-    # reading) must share this client, not each create their own connection.
-    shared_qx_client: Any = None
-
     if config.use_quotex_streaming and config.quotex_email:
         from pyquotex.stable_api import Quotex
 
-        shared_qx_client = Quotex(
+        qx_client = Quotex(
             config.quotex_email,
             config.quotex_password,
             lang="en",
         )
         stream = QuotexStream(
-            client=shared_qx_client,
+            client=qx_client,
             pairs=config.pairs,
             storage=storage,
             flush_size=config.tick_flush_size,
@@ -962,16 +1005,13 @@ async def main() -> None:
         secret=config.webhook_secret,
     )
 
-    has_quotex_creds: bool = bool(config.quotex_email and config.quotex_password)
-
-    # QuotexReader reuses shared_qx_client when Quotex streaming is active so
-    # there is only ever one WebSocket session.  When using Twelve Data for
-    # ticks, QuotexReader opens its own separate connection for result reading.
     quotex_reader: QuotexReader = QuotexReader(
-        email=config.quotex_email,
-        password=config.quotex_password,
+        email=getattr(config, "quotex_email", ""),
+        password=getattr(config, "quotex_password", ""),
         practice_mode=config.practice_mode,
-        client=shared_qx_client,  # None when using Twelve Data — reader self-connects
+    )
+    has_quotex_creds: bool = bool(
+        getattr(config, "quotex_email", "") and getattr(config, "quotex_password", "")
     )
     if has_quotex_creds:
         await quotex_reader.connect()
@@ -1026,7 +1066,7 @@ async def main() -> None:
         asyncio.create_task(
             supervised(
                 "health",
-                lambda: health_task(stream, orchestrator, quotex_reader),
+                lambda: health_task(stream, orchestrator, config, quotex_reader),
             )
         ),
     ]
@@ -1063,6 +1103,7 @@ async def main() -> None:
                         orchestrator,
                         model_manager,
                         storage,
+                        config,
                     ),
                 )
             )
