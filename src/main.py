@@ -247,7 +247,14 @@ async def signal_task(
     """
     recent_ticks: dict[str, list[dict[str, Any]]] = {p: [] for p in config.pairs}
     last_bar_minute: dict[str, int] = {p: -1 for p in config.pairs}
-
+    logger.info(
+        {
+            "event": "signal_task_started",
+            "pairs": list(recent_ticks.keys()),
+            "min_ticks": MIN_TICKS_FOR_FEATURES,
+            "min_bars": MIN_BARS_FOR_FEATURES,
+        }
+    )
     while True:
         # ── Drain tick queue ───────────────────────────────────────────────
         try:
@@ -334,14 +341,35 @@ async def signal_task(
         # ── Build feature row from recent in-memory ticks ──────────────────
         tick_df: pd.DataFrame = pd.DataFrame(recent_ticks[pair])
         if len(tick_df) < MIN_TICKS_FOR_FEATURES:
+            logger.debug(
+                {
+                    "event": "signal_debug",
+                    "pair": pair,
+                    "stage": "too_few_ticks",
+                    "count": len(tick_df),
+                    "need": MIN_TICKS_FOR_FEATURES,
+                }
+            )
             continue
 
         try:
             bars = resample_to_1min(tick_df)
             if len(bars) < MIN_BARS_FOR_FEATURES:
+                logger.debug(
+                    {
+                        "event": "signal_debug",
+                        "pair": pair,
+                        "stage": "too_few_bars",
+                        "bars": len(bars),
+                        "need": MIN_BARS_FOR_FEATURES,
+                    }
+                )
                 continue
             feature_df: pd.DataFrame = compute_features(tick_df, config.expiry_seconds)
             if feature_df.empty:
+                logger.debug(
+                    {"event": "signal_debug", "pair": pair, "stage": "feature_df_empty"}
+                )
                 continue
             feature_row: pd.Series[Any] = feature_df.iloc[-1]
             del feature_df, tick_df
@@ -361,8 +389,19 @@ async def signal_task(
             pair, config.expiry_seconds, feature_row
         )
         if prediction is None:
+            logger.debug(
+                {"event": "signal_debug", "pair": pair, "stage": "prediction_none"}
+            )
             continue
-
+        logger.info(
+            {
+                "event": "signal_debug",
+                "pair": pair,
+                "stage": "prediction_result",
+                "direction": prediction.get("direction"),
+                "confidence": prediction.get("confidence"),
+            }
+        )
         prediction["otc"] = config.use_quotex_streaming
 
         # ── Signal gate ────────────────────────────────────────────────────
@@ -375,6 +414,14 @@ async def signal_task(
                     f"gate_rejected: {pair} "
                     f"conf={prediction.get('confidence', 0.0):.2f}"
                 ),
+            )
+            logger.debug(
+                {
+                    "event": "signal_debug",
+                    "pair": pair,
+                    "stage": "gate_rejected",
+                    "confidence": prediction.get("confidence"),
+                }
             )
             continue
 
