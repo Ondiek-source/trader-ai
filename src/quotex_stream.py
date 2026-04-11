@@ -34,8 +34,13 @@ logger = logging.getLogger(__name__)
 
 
 def _to_quotex_symbol(pair: str) -> str:
-    """``EUR_USD`` → ``EURUSD-OTC``"""
+    """``EUR_USD`` → ``EURUSD-OTC`` (Quotex OTC format)."""
     return pair.replace("_", "") + "-OTC"
+
+
+def _to_quotex_symbol_lower(pair: str) -> str:
+    """``EUR_USD`` → ``eurusd-otc`` (Quotex lowercase format)."""
+    return pair.replace("_", "").lower() + "-otc"
 
 
 def _from_quotex_symbol(symbol: str) -> str:
@@ -193,23 +198,77 @@ class QuotexStream:
     # ── Polling loop ───────────────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
-        """
-        Poll each pair sequentially, emit a tick per poll.
+        # Try uppercase first, fallback to lowercase
+        symbols_upper = {p: _to_quotex_symbol(p) for p in self._pairs}
+        symbols_lower = {p: _to_quotex_symbol_lower(p) for p in self._pairs}
+        working_symbols: dict[str, str] = {}
 
-        Pairs are polled in sequence with ``poll_interval`` between each,
-        so the effective tick rate is ``poll_interval * len(pairs)`` per
-        full cycle.
-        """
-        symbols = {p: _to_quotex_symbol(p) for p in self._pairs}
+        # Probe: find which format works
+        for pair in self._pairs:
+            for label, symbol in [
+                ("upper", symbols_upper[pair]),
+                ("lower", symbols_lower[pair]),
+                ("plain", pair.replace("_", "")),
+            ]:
+                try:
+                    price = await self._get_price(symbol)
+                    if price is not None:
+                        working_symbols[pair] = symbol
+                        logger.info(
+                            {
+                                "event": "quotex_symbol_format_found",
+                                "pair": pair,
+                                "symbol": symbol,
+                                "format": label,
+                                "price": price,
+                            }
+                        )
+                        break
+                except Exception as exc:
+                    logger.debug(
+                        {
+                            "event": "quotex_symbol_probe_failed",
+                            "pair": pair,
+                            "symbol": symbol,
+                            "format": label,
+                            "error": str(exc),
+                        }
+                    )
 
+        if not working_symbols:
+            logger.error(
+                {
+                    "event": "quotex_no_working_symbols",
+                    "tried_upper": list(symbols_upper.values()),
+                    "tried_lower": list(symbols_lower.values()),
+                    "tried_plain": [p.replace("_", "") for p in self._pairs],
+                }
+            )
+            return
+
+        logger.info(
+            {
+                "event": "quotex_polling_started",
+                "symbols": working_symbols,
+            }
+        )
+
+        # Main poll loop with working symbols
         while not self._stop_event.is_set():
-            for pair, qx_symbol in symbols.items():
+            for pair, symbol in working_symbols.items():
                 if self._stop_event.is_set():
                     return
 
                 try:
-                    price = await self._get_price(qx_symbol)
+                    price = await self._get_price(symbol)
                     if price is None:
+                        logger.warning(
+                            {
+                                "event": "quotex_no_price",
+                                "pair": pair,
+                                "symbol": symbol,
+                            }
+                        )
                         continue
 
                     tick = self._make_tick(pair, price)
@@ -220,54 +279,82 @@ class QuotexStream:
                         {
                             "event": "quotex_poll_error",
                             "pair": pair,
-                            "symbol": qx_symbol,
+                            "symbol": symbol,
                             "error": str(exc),
+                            "error_type": type(exc).__name__,
                         }
                     )
-                    # Don't break — try next pair, reconnect will happen
-                    # if the connection is actually dead
 
                 await asyncio.sleep(self._poll_interval)
 
     async def _get_price(self, symbol: str) -> float | None:
-        """
-        Fetch the current price for a Quotex symbol.
+        errors = []
 
-        Tries the most common pyquotex API shapes:
-        1. ``client.get_realtime_price(symbol)`` → float
-        2. ``client.get_candles(symbol, 60, 1)[-1]["close"]`` → float
-        3. ``client.get_price(symbol)`` → float
-        """
-        # Try realtime price first (fastest path)
+        # Try realtime price first
         try:
             price = await self._client.get_realtime_price(symbol)
             if price is not None:
+                logger.debug(
+                    {
+                        "event": "quotex_price_hit",
+                        "method": "get_realtime_price",
+                        "symbol": symbol,
+                        "price": price,
+                    }
+                )
                 return float(price)
+            errors.append("get_realtime_price returned None")
         except AttributeError:
-            pass
+            errors.append("get_realtime_price method not found")
         except Exception as exc:
-            logger.debug("get_realtime_price failed for %s: %s", symbol, exc)
+            errors.append(f"get_realtime_price: {exc}")
 
         # Fallback: latest candle close
         try:
             candles = await self._client.get_candles(symbol, 60, 1)
             if candles and len(candles) > 0:
-                return float(candles[-1].get("close", 0))
+                close = float(candles[-1].get("close", 0))
+                logger.debug(
+                    {
+                        "event": "quotex_price_hit",
+                        "method": "get_candles",
+                        "symbol": symbol,
+                        "price": close,
+                    }
+                )
+                return close
+            errors.append("get_candles returned empty")
         except (AttributeError, TypeError, KeyError, IndexError):
-            pass
+            errors.append("get_candles parse error")
         except Exception as exc:
-            logger.debug("get_candles fallback failed for %s: %s", symbol, exc)
+            errors.append(f"get_candles: {exc}")
 
         # Last resort: generic get_price
         try:
             price = await self._client.get_price(symbol)
             if price is not None:
+                logger.debug(
+                    {
+                        "event": "quotex_price_hit",
+                        "method": "get_price",
+                        "symbol": symbol,
+                        "price": price,
+                    }
+                )
                 return float(price)
+            errors.append("get_price returned None")
         except AttributeError:
-            pass
+            errors.append("get_price method not found")
         except Exception as exc:
-            logger.debug("get_price fallback failed for %s: %s", symbol, exc)
+            errors.append(f"get_price: {exc}")
 
+        logger.warning(
+            {
+                "event": "quotex_all_price_methods_failed",
+                "symbol": symbol,
+                "errors": errors,
+            }
+        )
         return None
 
     # ── Tick construction ──────────────────────────────────────────────────────
