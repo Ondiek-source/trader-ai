@@ -25,9 +25,8 @@ GITHUB_REPO="${GITHUB_REPO:-Ondiek-source/trader-ai}"
 CONTAINER_PORT="${CONTAINER_PORT:-8080}"
 DNS_LABEL="${DNS_LABEL:-trader-ai-bot}"
 
-# How long to wait (seconds) for the container to train & save models.
-MODEL_WAIT_TIMEOUT="${MODEL_WAIT_TIMEOUT:-1200}"   # 20 minutes
-MODEL_POLL_INTERVAL="${MODEL_POLL_INTERVAL:-30}"    # check every 30 s
+MODEL_WAIT_TIMEOUT="${MODEL_WAIT_TIMEOUT:-1200}"
+MODEL_POLL_INTERVAL="${MODEL_POLL_INTERVAL:-30}"
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 
@@ -55,7 +54,6 @@ fi
 
 source "$AZURE_ENV"
 
-# Validate that the sourced env file populated the variables we need.
 _REQUIRED_VARS=(
   ACR_NAME ACR_LOGIN_SERVER ACR_USERNAME ACR_PASSWORD
   STORAGE_ACCOUNT CONTAINER_NAME RESOURCE_GROUP LOCATION
@@ -80,7 +78,7 @@ _upsert_env() {
   local key="$1" val="$2" file="$3"
   local tmp
   tmp=$(mktemp)
-  grep -vF "^${key}=" "$file" > "$tmp" 2>/dev/null || true
+  grep -v "^${key}=" "$file" > "$tmp" 2>/dev/null || true
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
   mv "$tmp" "$file"
 }
@@ -203,7 +201,6 @@ done
 echo "[1/2] Reading .env..."
 
 # Keys whose values should be hidden in portal / az container show output.
-# Everything else goes into --environment-variables (visible).
 _SECURE_KEYS=(
   AZURE_STORAGE_CONN
   QUOTEX_PASSWORD
@@ -227,7 +224,6 @@ _ENV_KV_PAIRS=()
 _SECURE_KV_PAIRS=()
 
 while IFS= read -r line; do
-  # Skip comments and blanks
   [[ "$line" =~ ^[[:space:]]*# ]] && continue
   line="${line#"${line%%[![:space:]]*}"}"   # lstrip
   line="${line%"${line##*[![:space:]]}"}"   # rstrip
@@ -244,6 +240,12 @@ while IFS= read -r line; do
 
   [[ -z "$val" ]] && continue
 
+  # Validate key: must start with letter or underscore, rest alphanumeric or underscore
+  if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "  SKIPPING invalid key name: '$key'"
+    continue
+  fi
+
   if _is_secure_key "$key"; then
     _SECURE_KV_PAIRS+=("${key}=${val}")
   else
@@ -257,32 +259,6 @@ fi
 
 echo "  Plain vars : ${#_ENV_KV_PAIRS[@]}"
 echo "  Secure vars: ${#_SECURE_KV_PAIRS[@]}"
-
-# Build a JSON file for --secure-environment-variables.
-# Azure CLI supports @path syntax which reads the file as the argument value.
-# This avoids any shell metacharacter issues with ; in connection strings.
-_SECURE_ENV_FILE=$(mktemp /tmp/aci-secure-env.XXXXXX.json)
-
-{
-  printf '{'
-  _first=true
-  for kv in "${_SECURE_KV_PAIRS[@]}"; do
-    k="${kv%%=*}"
-    v="${kv#*=}"
-    # Minimal JSON escaping: backslash and double-quote
-    v="${v//\\/\\\\}"
-    v="${v//\"/\\\"}"
-    if [[ "$_first" == true ]]; then
-      _first=false
-    else
-      printf ','
-    fi
-    printf '"%s":"%s"' "$k" "$v"
-  done
-  printf '}\n'
-} > "$_SECURE_ENV_FILE"
-
-trap 'rm -f "$_SECURE_ENV_FILE"' EXIT
 
 # ── Step 5: Deploy to ACI ─────────────────────────────────────────────────────
 
@@ -309,9 +285,6 @@ if az container show \
     --output none
 fi
 
-# Build the create command as an array.
-# Plain env vars → --environment-variables (visible in portal).
-# Secrets → --secure-environment-variables @file (masked in portal).
 _CREATE_CMD=(
   az container create
     --name "$ACI_NAME"
@@ -335,7 +308,9 @@ if (( ${#_ENV_KV_PAIRS[@]} > 0 )); then
   _CREATE_CMD+=(--environment-variables "${_ENV_KV_PAIRS[@]}")
 fi
 
-_CREATE_CMD+=(--secure-environment-variables "@${_SECURE_ENV_FILE}")
+if (( ${#_SECURE_KV_PAIRS[@]} > 0 )); then
+  _CREATE_CMD+=(--secure-environment-variables "${_SECURE_KV_PAIRS[@]}")
+fi
 
 "${_CREATE_CMD[@]}"
 
@@ -359,16 +334,31 @@ while (( elapsed < MODEL_WAIT_TIMEOUT )); do
     --output tsv 2>/dev/null || echo "0")
 
   if (( model_count > 0 )); then
+    echo "  ✅ $model_count model file(s) saved to blob storage (${elapsed}s elapsed)."
     break
   fi
 
   echo "  ... ${elapsed}s elapsed, no models yet (checking every ${MODEL_POLL_INTERVAL}s)"
 done
 
-if (( model_count > 0 )); then
-  echo "  ✅ $model_count model file(s) saved to blob storage."
-else
-  echo "  ⚠️  No models found after ${MODEL_WAIT_TIMEOUT}s — check container logs."
+if (( model_count == 0 )); then
+  echo ""
+  echo "❌ FAILED: No models found after ${MODEL_WAIT_TIMEOUT}s."
+  echo ""
+  echo "  Check container logs:"
+  echo "    az container logs --name $ACI_NAME --resource-group $RESOURCE_GROUP --follow"
+  echo ""
+  echo "  Check container status:"
+  echo "    az container show --name $ACI_NAME --resource-group $RESOURCE_GROUP --query instanceView.state"
+  echo ""
+
+  echo "  Last 30 lines of container logs:"
+  az container logs \
+    --name "$ACI_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --tail 30 2>/dev/null || echo "  (could not retrieve logs)"
+
+  exit 1
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────────

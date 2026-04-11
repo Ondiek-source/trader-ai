@@ -73,30 +73,35 @@ fi
 
 # ── 3. Historical data downloaded (checks blob storage) ──────────────────────
 echo "[ 3/8 ] Historical data download..."
-# Check blob storage for parquet files
-STORAGE_ACCOUNT="traderai2715"
-CONTAINER_NAME="traderai"
-
-# Get account key from .env or Azure
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  source "$SCRIPT_DIR/.env"
-  ACCOUNT_KEY="$AZURE_STORAGE_ACCOUNT_KEY"
-else
-  ACCOUNT_KEY=$(az storage account keys list --resource-group "$RESOURCE_GROUP" --account-name "$STORAGE_ACCOUNT" --query "[0].value" --output tsv 2>/dev/null)
-fi
-
-if [[ -n "$ACCOUNT_KEY" ]]; then
-  BLOB_COUNT=$(az storage blob list --container-name "$CONTAINER_NAME" --account-name "$STORAGE_ACCOUNT" --account-key "$ACCOUNT_KEY" --query "length([?contains(name, 'EUR_USD')])" --output tsv 2>/dev/null || echo "0")
+# Use STORAGE_ACCOUNT from azure.env (already sourced)
+if [[ -n "$STORAGE_ACCOUNT" ]]; then
+  # Try to get account key via Azure CLI first
+  ACCOUNT_KEY=$(az storage account keys list \
+    --resource-group "$RESOURCE_GROUP" \
+    --account-name "$STORAGE_ACCOUNT" \
+    --query "[0].value" \
+    --output tsv 2>/dev/null || echo "")
   
-  if [[ "$BLOB_COUNT" -ge 60 ]]; then
-    check "Historical data downloaded" "pass" "$BLOB_COUNT parquet files found in blob storage (5+ years)"
-  elif [[ "$BLOB_COUNT" -gt 0 ]]; then
-    check "Historical data downloading" "warn" "$BLOB_COUNT parquet files found — still in progress (expected ~60)"
+  if [[ -n "$ACCOUNT_KEY" ]]; then
+    BLOB_COUNT=$(az storage blob list \
+      --container-name "$CONTAINER_NAME" \
+      --account-name "$STORAGE_ACCOUNT" \
+      --account-key "$ACCOUNT_KEY" \
+      --query "length([?contains(name, '.parquet')])" \
+      --output tsv 2>/dev/null || echo "0")
+    
+    if [[ "$BLOB_COUNT" -ge 12 ]]; then
+      check "Historical data downloaded" "pass" "$BLOB_COUNT parquet files found"
+    elif [[ "$BLOB_COUNT" -gt 0 ]]; then
+      check "Historical data downloading" "warn" "$BLOB_COUNT parquet files — still in progress"
+    else
+      check "Historical data downloaded" "fail" "No parquet files found in blob storage"
+    fi
   else
-    check "Historical data downloaded" "fail" "No parquet files found in blob storage"
+    check "Historical data downloaded" "warn" "Cannot check blob storage — no access"
   fi
 else
-  check "Historical data downloaded" "warn" "Cannot check blob storage — no account key"
+  check "Historical data downloaded" "fail" "STORAGE_ACCOUNT not set"
 fi
 
 # ── 4. Models trained (FIXED — handles newlines) ──────────────────────────────

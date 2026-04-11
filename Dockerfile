@@ -1,5 +1,5 @@
 # ============================================================================
-# Trader AI -- Binary Options Automated Trading System
+# Trader AI — Binary Options Automated Trading System
 # Multi-stage Docker build for Python 3.12
 # ============================================================================
 
@@ -12,10 +12,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install minimal system dependencies required by native pip packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        libgomp1 \
-        curl \
-        git \
+    build-essential \
+    libgomp1 \
+    curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -30,10 +30,19 @@ WORKDIR /app
 # Install Python dependencies (cached layer)
 # ---------------------------------------------------------------------------
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir "git+https://github.com/cleitonleonel/pyquotex.git" || \
-    echo "WARNING: pyquotex install failed — Quotex result reading disabled"
+
+RUN pip install --no-cache-dir --upgrade pip
+
+# Install requirements — the --extra-index-url for torch CPU must be passed
+# on the command line because pip inside Docker doesn't always respect the
+# directive inside requirements.txt when the file also has inline comments.
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r requirements.txt
+
+# Install pyquotex separately — failure here is non-fatal
+RUN pip install --no-cache-dir "git+https://github.com/cleitonleonel/pyquotex.git" \
+    || echo "WARNING: pyquotex install failed — Quotex result reading disabled"
 
 # ---------------------------------------------------------------------------
 # Copy application source
