@@ -266,7 +266,7 @@ PRACTICE_MODE=true         ← set to false when you are ready to go live
 ## Quick Reference
 
 | Task | Command |
-|---|---|
+| --- | --- |
 | Provision Azure (first time) | `bash deploy/provision.sh` |
 | Deploy / redeploy | `bash deploy/deploy.sh` |
 | Push update + redeploy | `git push` then `bash deploy/deploy.sh` |
@@ -275,7 +275,7 @@ PRACTICE_MODE=true         ← set to false when you are ready to go live
 | Tear down everything | `bash deploy/teardown.sh` |
 
 | Telegram Command | What it does |
-|---|---|
+| --- | --- |
 | `/status` | Current session wins, losses, profit, confidence |
 | `/report` | Send full report now |
 | `/threshold` | Show current confidence threshold |

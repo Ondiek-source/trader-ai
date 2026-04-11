@@ -290,7 +290,8 @@ class QuotexReader:
                             "likely_outcome": "win" if delta > 0 else "loss",
                         }
                     )
-                    self._balance = new_balance
+                # Always update so health() returns fresh balance
+                self._balance = new_balance
             except Exception as exc:
                 logger.debug({"event": "balance_poll_error", "error": str(exc)})
 

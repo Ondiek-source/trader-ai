@@ -100,7 +100,7 @@ logger = logging.getLogger("main")
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 MODEL_SAVE_PATH: str = "/app/models"
-HEALTH_LOG_INTERVAL: int = 60  # seconds between health snapshots
+HEALTH_LOG_INTERVAL: int = 10  # seconds between health snapshots
 SIGNAL_POLL_MS: float = 0.02  # 20 ms between tick queue polls
 MAX_RECENT_TICKS: int = 15_000  # ~25 min at ~10 ticks/sec
 MIN_TICKS_FOR_FEATURES: int = 120  # ~2 min of ticks

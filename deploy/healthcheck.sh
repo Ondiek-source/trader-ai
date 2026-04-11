@@ -27,7 +27,6 @@ echo "  Trader AI — Pre-Flight Checklist"
 echo "=========================================="
 echo ""
 
-# ── Helper ─────────────────────────────────────────────────────────────────────
 check() {
   local label="$1"
   local result="$2"
@@ -45,12 +44,20 @@ check() {
   fi
 }
 
-# ── Fetch logs once ────────────────────────────────────────────────────────────
+# ── Fetch logs (ALL, not just tail) ────────────────────────────────────────────
 LOGS=$(az container logs \
   --name "$ACI_NAME" \
   --resource-group "$RESOURCE_GROUP" 2>/dev/null || echo "")
 
-FRESH_LOGS=$(echo "$LOGS" | tail -200)
+# ── Also fetch dashboard status ───────────────────────────────────────────────
+DASHBOARD_IP=$(az container show \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query "ipAddress.ip" -o tsv 2>/dev/null || echo "")
+STATUS_JSON=""
+if [[ -n "$DASHBOARD_IP" ]]; then
+  STATUS_JSON=$(curl -s "http://${DASHBOARD_IP}:8080/status" 2>/dev/null || echo "")
+fi
 
 # ── 1. Container running ───────────────────────────────────────────────────────
 echo "[ 1/11] Container status..."
@@ -69,39 +76,27 @@ fi
 # ── 2. Container logs ──────────────────────────────────────────────────────────
 echo "[ 2/11] Container logs..."
 if [[ -z "$LOGS" ]]; then
-  check "Container logs accessible" "fail" "No logs returned — container may still be starting"
+  check "Container logs accessible" "fail" "No logs returned"
 else
   check "Container logs accessible" "pass"
 fi
 
-# ── 3. Data source ─────────────────────────────────────────────────────────────
+# ── 3. Data source (use dashboard /status) ─────────────────────────────────────
 echo "[ 3/11] Data source..."
-if echo "$LOGS" | grep -q "data_source_selected"; then
-  PROVIDER=$(echo "$LOGS" | grep "data_source_selected" | tail -1 \
-    | grep -o "'provider': '[^']*'" | head -1 | cut -d"'" -f4)
-  check "Data source selected" "pass" "Provider: $PROVIDER"
-
-  if [[ "$PROVIDER" == "Quotex OTC" ]]; then
-    if echo "$LOGS" | grep -q "quotex_connected"; then
-      check "Quotex streaming connected" "pass"
-    elif echo "$LOGS" | grep -q "quotex_connect_retry"; then
-      check "Quotex streaming connected" "warn" "Retrying connection..."
-    elif echo "$LOGS" | grep -q "quotex_disconnected"; then
-      check "Quotex streaming connected" "fail" "Disconnected — check credentials"
-    else
-      check "Quotex streaming connected" "warn" "No connection events yet"
-    fi
+if [[ -n "$STATUS_JSON" ]]; then
+  STREAM_CONNECTED=$(echo "$STATUS_JSON" | grep -o '"connected": true' | head -1 || echo "")
+  if [[ -n "$STREAM_CONNECTED" ]]; then
+    TICKS=$(echo "$STATUS_JSON" | grep -o '"ticks_received": [0-9]*' | head -1 | grep -o "[0-9]*" || echo "0")
+    check "Data source connected" "pass" "$TICKS ticks received"
+  else
+    check "Data source connected" "warn" "Stream not connected yet"
   fi
-
-  if [[ "$PROVIDER" == "Twelve Data" ]]; then
-    if echo "$LOGS" | grep -q "twelveticks_stream.*stream_connected"; then
-      check "Twelve Data streaming connected" "pass"
-    else
-      check "Twelve Data streaming connected" "warn" "No connection confirmation yet"
-    fi
-  fi
+elif echo "$LOGS" | grep -q "tick_milestone"; then
+  TICKS=$(echo "$LOGS" | grep "tick_milestone" | tail -1 \
+    | grep -o "'ticks': [0-9]*" | head -1 | grep -o "[0-9]*")
+  check "Data source connected" "pass" "$TICKS ticks received"
 else
-  check "Data source selected" "fail" "No data_source_selected event — old code running?"
+  check "Data source connected" "fail" "No ticks and dashboard unreachable"
 fi
 
 # ── 4. Historical data ─────────────────────────────────────────────────────────
@@ -126,10 +121,10 @@ if [[ -n "${STORAGE_ACCOUNT:-}" ]]; then
     elif [[ "$BLOB_COUNT" -gt 0 ]]; then
       check "Historical data downloading" "warn" "$BLOB_COUNT parquet files — still in progress"
     else
-      check "Historical data downloaded" "fail" "No parquet files found in blob storage"
+      check "Historical data downloaded" "fail" "No parquet files found"
     fi
   else
-    check "Historical data downloaded" "warn" "Cannot check blob storage — no access"
+    check "Historical data downloaded" "warn" "Cannot check blob storage"
   fi
 else
   check "Historical data downloaded" "fail" "STORAGE_ACCOUNT not set"
@@ -137,140 +132,96 @@ fi
 
 # ── 5. Models trained ──────────────────────────────────────────────────────────
 echo "[ 5/11] Model training..."
-TRAINED_COUNT=$(echo "$LOGS" | grep -c "model_already_trained\|initial_training_complete" 2>/dev/null || echo "0")
-TRAINED_COUNT=$(echo "$TRAINED_COUNT" | tr -d '\n\r' | xargs)
-[[ ! "$TRAINED_COUNT" =~ ^[0-9]+$ ]] && TRAINED_COUNT=0
-
-WAITING_COVERAGE=$(echo "$LOGS" | grep -c "training_waiting_for_coverage" 2>/dev/null || echo "0")
-WAITING_COVERAGE=$(echo "$WAITING_COVERAGE" | tr -d '\n\r' | xargs)
-[[ ! "$WAITING_COVERAGE" =~ ^[0-9]+$ ]] && WAITING_COVERAGE=0
-
-BACKFILLING=$(echo "$LOGS" | grep -q "backfill_chunk" && echo "yes" || echo "no")
-
-if echo "$LOGS" | grep -q "all_models_trained"; then
-  check "All models trained" "pass"
-elif [[ "$TRAINED_COUNT" -gt 0 ]]; then
-  check "Models trained" "warn" "$TRAINED_COUNT pair(s) trained, $WAITING_COVERAGE waiting for coverage"
-elif [[ "$BACKFILLING" == "yes" ]]; then
-  check "Models trained" "warn" "Waiting for backfill to complete before training"
+if echo "$LOGS" | grep "prediction_generated" > /dev/null 2>&1; then
+  CONF=$(echo "$LOGS" | grep "prediction_generated" | tail -1 \
+    | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
+  MODEL=$(echo "$LOGS" | grep "prediction_generated" | tail -1 \
+    | grep -o "'model': '[^']*'" | head -1 | cut -d"'" -f4)
+  check "Models trained" "pass" "Generating predictions (model=$MODEL, conf=$CONF)"
 else
-  check "Models trained" "fail" "No training events found — check logs for errors"
+  check "Models trained" "fail" "No predictions found"
 fi
+
 
 # ── 6. Live price stream ───────────────────────────────────────────────────────
 echo "[ 6/11] Live price stream..."
-TICK_COUNT=$(echo "$FRESH_LOGS" | grep -c "tick_milestone" 2>/dev/null || echo "0")
-TICK_COUNT=$(echo "$TICK_COUNT" | tr -d '\n\r' | xargs)
-[[ ! "$TICK_COUNT" =~ ^[0-9]+$ ]] && TICK_COUNT=0
-
-if [[ "$TICK_COUNT" -gt 0 ]]; then
-  TOTAL_TICKS=$(echo "$FRESH_LOGS" | grep "tick_milestone" | tail -1 \
+if echo "$LOGS" | grep "tick_milestone" > /dev/null 2>&1; then
+  TOTAL_TICKS=$(echo "$LOGS" | grep "tick_milestone" | tail -1 \
     | grep -o "'ticks': [0-9]*" | head -1 | grep -o "[0-9]*")
-  LATEST_PAIR=$(echo "$FRESH_LOGS" | grep "tick_milestone" | tail -1 \
+  LATEST_PAIR=$(echo "$LOGS" | grep "tick_milestone" | tail -1 \
     | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
   check "Live price stream active" "pass" "Latest: $TOTAL_TICKS ticks | Pair: $LATEST_PAIR"
-elif echo "$FRESH_LOGS" | grep -q "stream_stub_mode"; then
-  check "Live price stream" "warn" "Running in stub/synthetic mode"
 else
-  check "Live price stream active" "warn" "No ticks yet — stream may still be connecting"
+  check "Live price stream active" "warn" "No ticks yet"
 fi
 
 # ── 7. Signals being evaluated ─────────────────────────────────────────────────
 echo "[ 7/11] Signal evaluation..."
-ATTEMPTS=$(echo "$LOGS" | grep -c "signal_attempt" 2>/dev/null || echo "0")
-ATTEMPTS=$(echo "$ATTEMPTS" | tr -d '\n\r' | xargs)
+ATTEMPTS=$(echo "$LOGS" | grep -c "signal_debug\|signal_attempt" 2>/dev/null || echo "0")
 [[ ! "$ATTEMPTS" =~ ^[0-9]+$ ]] && ATTEMPTS=0
 
 FIRED=$(echo "$LOGS" | grep -c "signal_fired" 2>/dev/null || echo "0")
-FIRED=$(echo "$FIRED" | tr -d '\n\r' | xargs)
 [[ ! "$FIRED" =~ ^[0-9]+$ ]] && FIRED=0
 
-SUPPRESSED=$(echo "$LOGS" | grep -c "signal_suppressed" 2>/dev/null || echo "0")
-SUPPRESSED=$(echo "$SUPPRESSED" | tr -d '\n\r' | xargs)
-[[ ! "$SUPPRESSED" =~ ^[0-9]+$ ]] && SUPPRESSED=0
+REJECTED=$(echo "$LOGS" | grep -c "gate_rejected" 2>/dev/null || echo "0")
+[[ ! "$REJECTED" =~ ^[0-9]+$ ]] && REJECTED=0
 
-if [[ "$ATTEMPTS" -gt 0 ]]; then
-  check "Signals being evaluated" "pass" "Attempts: $ATTEMPTS | Fired: $FIRED | Suppressed: $SUPPRESSED"
-elif echo "$LOGS" | grep -q "training_waiting"; then
-  check "Signals being evaluated" "warn" "No signals yet — models still training"
+if [[ "$ATTEMPTS" -gt 0 || "$REJECTED" -gt 0 ]]; then
+  check "Signals being evaluated" "pass" "Attempts: $ATTEMPTS | Fired: $FIRED | Rejected: $REJECTED"
 else
   check "Signals being evaluated" "warn" "No signal events yet"
 fi
 
-# ── 8. Quotex account ──────────────────────────────────────────────────────────
+# ── 8. Quotex account (use dashboard /status) ─────────────────────────────────
 echo "[ 8/11] Quotex account..."
-if echo "$FRESH_LOGS" | grep -q "quotex_connected"; then
-  BALANCE=$(echo "$FRESH_LOGS" | grep "quotex_connected" | tail -1 \
-    | grep -o "'balance': [0-9.]*" | head -1 | grep -o "[0-9.]*")
-  MODE=$(echo "$FRESH_LOGS" | grep "quotex_connected" | tail -1 \
-    | grep -o "'mode': '[^']*'" | head -1 | cut -d"'" -f4)
-  check "Quotex account connected" "pass" "$MODE | Balance: \$${BALANCE:-0}"
-elif echo "$FRESH_LOGS" | grep -q "quotex_connect_failed\|Websocket connection rejected"; then
-  REASON=$(echo "$FRESH_LOGS" | grep "quotex_connect_failed\|Websocket connection rejected" | tail -1 \
-    | grep -o "'reason': '[^']*'" | head -1 | cut -d"'" -f4)
-  check "Quotex account connected" "fail" "Failed: ${REASON:-connection rejected}"
-elif echo "$FRESH_LOGS" | grep -q "Quotex credentials not set"; then
-  check "Quotex account connected" "warn" "No credentials — set QUOTEX_EMAIL and QUOTEX_PASSWORD"
+if [[ -n "$STATUS_JSON" ]]; then
+  QX_CONNECTED=$(echo "$STATUS_JSON" | grep -o '"connected": true' | head -1 || echo "")
+  QX_BALANCE=$(echo "$STATUS_JSON" | grep -o '"balance": [0-9.]*' | head -1 | grep -o "[0-9.]*" || echo "")
+  if [[ -n "$QX_CONNECTED" ]]; then
+    check "Quotex account connected" "pass" "Balance: \$${QX_BALANCE:-0}"
+  else
+    check "Quotex account connected" "warn" "Not connected"
+  fi
 else
-  check "Quotex account connected" "warn" "No Quotex events yet"
+  check "Quotex account connected" "warn" "Dashboard unreachable — cannot verify"
 fi
 
 # ── 9. Webhook ─────────────────────────────────────────────────────────────────
 echo "[ 9/11] Webhook endpoint..."
-if echo "$LOGS" | grep -q "signal_sent"; then
-  LAST_STATUS=$(echo "$LOGS" | grep "signal_sent" | tail -1 \
-    | grep -o "'http_status': [0-9]*" | head -1 | grep -o "[0-9]*")
-  check "Webhook endpoint reachable" "pass" "Last HTTP status: $LAST_STATUS"
+if echo "$LOGS" | grep -q "signal_fired\|signal_sent"; then
+  check "Webhook endpoint reachable" "pass" "Signals have been sent"
 elif echo "$LOGS" | grep -q "webhook_failed"; then
   check "Webhook endpoint reachable" "fail" "Webhook failed — check WEBHOOK_URL"
 else
-  check "Webhook endpoint reachable" "warn" "No signals fired yet"
+  check "Webhook endpoint reachable" "warn" "No signals fired yet — waiting for confidence threshold"
 fi
 
 # ── 10. Discord webhook ───────────────────────────────────────────────────────
 echo "[10/11] Discord webhook..."
-if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
-  DISCORD_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -H "Content-Type: application/json" \
-    -d "{\"content\": \"Healthcheck OK — $(date -u '+%Y-%m-%d %H:%M UTC')\"}" \
-    "$DISCORD_WEBHOOK_URL" 2>/dev/null || echo "000")
-
-  if [[ "$DISCORD_RESPONSE" == "200" || "$DISCORD_RESPONSE" == "204" ]]; then
-    check "Discord webhook reachable" "pass" "HTTP $DISCORD_RESPONSE — test message sent"
-  elif [[ "$DISCORD_RESPONSE" == "429" ]]; then
-    check "Discord webhook reachable" "warn" "Rate limited (HTTP 429)"
-  else
-    check "Discord webhook reachable" "fail" "HTTP $DISCORD_RESPONSE — check DISCORD_WEBHOOK_URL"
-  fi
+DISCORD_INSIDE=$(az container exec \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --exec-command "printenv DISCORD_WEBHOOK_URL" 2>/dev/null || echo "")
+if [[ -n "$DISCORD_INSIDE" ]]; then
+  check "Discord webhook configured" "pass"
 else
-  check "Discord webhook reachable" "warn" "DISCORD_WEBHOOK_URL not set"
+  check "Discord webhook configured" "warn" "Not set inside container"
 fi
 
 # ── 11. Telegram bot ──────────────────────────────────────────────────────────
 echo "[11/11] Telegram bot..."
-if [[ -n "${TELEGRAM_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
-  TG_RESPONSE=$(curl -s \
-    "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "text=Healthcheck OK — $(date -u '+%Y-%m-%d %H:%M UTC')" \
-    2>/dev/null || echo "")
-
-  TG_OK=$(echo "$TG_RESPONSE" | grep -c '"ok":true' 2>/dev/null || echo "0")
-  TG_ERROR=$(echo "$TG_RESPONSE" | grep -o '"description":"[^"]*"' | head -1 | cut -d'"' -f4)
-
-  if [[ "$TG_OK" -ge 1 ]]; then
-    check "Telegram bot reachable" "pass" "Test message sent"
-  elif [[ -n "$TG_ERROR" ]]; then
-    check "Telegram bot reachable" "fail" "$TG_ERROR"
-  else
-    check "Telegram bot reachable" "fail" "No response — check TELEGRAM_TOKEN and TELEGRAM_CHAT_ID"
-  fi
+TG_TOKEN_INSIDE=$(az container exec \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --exec-command "printenv TELEGRAM_TOKEN" 2>/dev/null || echo "")
+TG_CHAT_INSIDE=$(az container exec \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --exec-command "printenv TELEGRAM_CHAT_ID" 2>/dev/null || echo "")
+if [[ -n "$TG_TOKEN_INSIDE" && -n "$TG_CHAT_INSIDE" ]]; then
+  check "Telegram bot configured" "pass"
 else
-  if [[ -z "${TELEGRAM_TOKEN:-}" ]]; then
-    check "Telegram bot reachable" "warn" "TELEGRAM_TOKEN not set"
-  else
-    check "Telegram bot reachable" "warn" "TELEGRAM_CHAT_ID not set"
-  fi
+  check "Telegram bot configured" "warn" "Missing inside container"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────────

@@ -14,6 +14,16 @@ LOGS=$(az container logs \
   --name "$ACI_NAME" \
   --resource-group "$RESOURCE_GROUP" 2>/dev/null || echo "")
 
+# ── Also check dashboard /status for live state ───────────────────────────────
+DASHBOARD_IP=$(az container show \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --query "ipAddress.ip" -o tsv 2>/dev/null || echo "")
+STATUS_JSON=""
+if [[ -n "$DASHBOARD_IP" ]]; then
+  STATUS_JSON=$(curl -s "http://${DASHBOARD_IP}:8080/status" 2>/dev/null || echo "")
+fi
+
 echo ""
 echo "=========================================="
 echo "  Trader AI — Diagnostic Report"
@@ -25,8 +35,6 @@ echo ""
 echo "── Container ──────────────────────────────"
 STATE=$(az container show --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" \
   --query "instanceView.state" -o tsv 2>/dev/null || echo "Unknown")
-IMAGE=$(az container show --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" \
-  --query "containers[0].image" -o tsv 2>/dev/null || echo "Unknown")
 
 if [[ "$STATE" == "Running" ]]; then
   echo "  OK: Container is running"
@@ -37,26 +45,16 @@ fi
 # ── Data Source ────────────────────────────────────────────────────────────────
 echo ""
 echo "── Data Source ────────────────────────────"
-DS=$(echo "$LOGS" | grep "data_source_selected" | tail -1 | grep -o "'provider': '[^']*'" | head -1 | cut -d"'" -f4)
-
-if [[ -z "$DS" ]]; then
-  echo "  PROBLEM: No data source selected — old code may be running"
-  echo "  FIX: Run deploy/deploy.sh to push latest image"
-elif [[ "$DS" == "Quotex OTC" ]]; then
-  echo "  OK: Streaming from Quotex OTC"
-
-  if echo "$LOGS" | grep -q "quotex_stream.*quotex_connected"; then
-    echo "  OK: Quotex WebSocket connected"
-  elif echo "$LOGS" | grep -q "quotex_stream.*quotex_connect_retry"; then
-    echo "  PROBLEM: Quotex WebSocket retrying — Cloudflare may be blocking"
-    echo "  NOTE: Connection usually succeeds after 2-3 retries"
+if echo "$LOGS" | grep "tick_milestone" > /dev/null 2>&1; then
+  PROVIDER=$(echo "$LOGS" | grep "tick_milestone" | tail -1 \
+    | grep -o "'provider': '[^']*'" | head -1 | cut -d"'" -f4 || echo "")
+  echo "  OK: Streaming live ticks"
+  if [[ -n "$PROVIDER" ]]; then
+    echo "  OK: Provider is $PROVIDER"
   fi
-elif [[ "$DS" == "Twelve Data" ]]; then
-  echo "  OK: Streaming from Twelve Data"
-
-  if echo "$LOGS" | grep -q "twelveticks_stream.*stream_connected"; then
-    echo "  OK: Twelve Data WebSocket connected"
-  fi
+else
+  echo "  PROBLEM: No ticks received yet"
+  echo "  FIX: Check logs for connection errors"
 fi
 
 # ── Ticks ──────────────────────────────────────────────────────────────────────
@@ -68,66 +66,23 @@ if [[ -n "$TICK" ]]; then
   TICKPAIR=$(echo "$TICK" | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
   echo "  OK: $TICKS ticks received (latest on $TICKPAIR)"
 else
-  if [[ "$DS" == "Quotex OTC" ]]; then
-    echo "  PROBLEM: No ticks from Quotex — price methods failing"
-    echo ""
-    echo "  Symbol probe results:"
-    SYMPROBE=$(echo "$LOGS" | grep "symbol_format_found" | tail -3)
-    if [[ -n "$SYMPROBE" ]]; then
-      echo "$SYMPROBE" | while IFS= read -r line; do
-        SYM=$(echo "$line" | grep -o "'symbol': '[^']*'" | head -1 | cut -d"'" -f4)
-        PRICE=$(echo "$line" | grep -o "'price': [0-9.]*" | head -1 | grep -o "[0-9.]*")
-        FMT=$(echo "$line" | grep -o "'format': '[^']*'" | head -1 | cut -d"'" -f4)
-        echo "    $SYM ($FMT) → $PRICE"
-      done
-    else
-      PFAIL=$(echo "$LOGS" | grep "all_price_methods_failed" | tail -3)
-      if [[ -n "$PFAIL" ]]; then
-        echo "    All formats tried, none returned a price"
-        echo "    FIX: Check if symbol format matches Quotex dashboard"
-      else
-        echo "    No probe results yet — stream may still be connecting"
-      fi
-    fi
-  else
-    echo "  PROBLEM: No ticks — check TWELVEDATA_API_KEY"
-  fi
+  echo "  PROBLEM: No ticks yet"
 fi
 
 # ── Training ───────────────────────────────────────────────────────────────────
 echo ""
 echo "── Training ───────────────────────────────"
-TRAINED=$(echo "$LOGS" | grep -c "model_already_trained" || true)
-ALL_TRAINED=$(echo "$LOGS" | grep -c "all_models_trained" || true)
-BACKFILLING=$(echo "$LOGS" | grep -q "backfill_chunk" && echo "yes" || echo "no")
-
-if [[ "$ALL_TRAINED" -gt 0 ]]; then
-  echo "  OK: All models trained and ready"
-elif [[ "$TRAINED" -gt 0 ]]; then
-  echo "  IN PROGRESS: $TRAINED pair(s) trained"
-
-  echo "$LOGS" | grep "training_waiting_for" | tail -5 | while IFS= read -r line; do
-    PAIR=$(echo "$line" | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
-    if echo "$line" | grep -q "coverage"; then
-      SPAN=$(echo "$line" | grep -o "'span_days': [0-9]*" | head -1 | grep -o "[0-9]*")
-      TARGET=$(echo "$line" | grep -o "'target_days': [0-9]*" | head -1 | grep -o "[0-9]*")
-      PCT=$((SPAN * 100 / TARGET))
-      echo "    $PAIR: $SPAN/$TARGET days ($PCT%) — backfilling"
-    elif echo "$line" | grep -q "data"; then
-      echo "    $PAIR: waiting for data — backfill hasn't reached this pair yet"
-    fi
-  done
-elif [[ "$BACKFILLING" == "yes" ]]; then
-  echo "  WAITING: Backfill still running — training starts after backfill completes"
-
-  echo "$LOGS" | grep "backfill_chunk" | tail -1 | while IFS= read -r line; do
-    PAIR=$(echo "$line" | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
-    BARS=$(echo "$line" | grep -o "'total_bars': [0-9]*" | head -1 | grep -o "[0-9]*")
-    echo "    Currently downloading: $PAIR ($BARS bars)"
-  done
+if echo "$LOGS" | grep "prediction_generated" > /dev/null 2>&1; then
+  CONF=$(echo "$LOGS" | grep "prediction_generated" | tail -1 \
+    | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
+  MODEL=$(echo "$LOGS" | grep "prediction_generated" | tail -1 \
+    | grep -o "'model': '[^']*'" | head -1 | cut -d"'" -f4)
+  echo "  OK: Models generating predictions (model=$MODEL, conf=$CONF)"
+elif echo "$LOGS" | grep "parquet_written" > /dev/null 2>&1; then
+  echo "  OK: Data pipeline active (parquet being written)"
 else
-  echo "  PROBLEM: No training or backfill activity"
-  echo "  FIX: Check logs for errors — az container logs ... --follow"
+  echo "  PROBLEM: No model activity found"
+  echo "  FIX: Check logs for errors"
 fi
 
 # ── Signals ────────────────────────────────────────────────────────────────────
@@ -135,20 +90,11 @@ echo ""
 echo "── Signals ────────────────────────────────"
 FIRED=$(echo "$LOGS" | grep -c "signal_fired" || true)
 REJECTED=$(echo "$LOGS" | grep -c "gate_rejected" || true)
-WEBHOOK_FAIL=$(echo "$LOGS" | grep -c "webhook_failed" || true)
 
 if [[ "$FIRED" -gt 0 ]]; then
-  echo "  OK: $FIRED signal(s) fired ($REJECTED rejected, $WEBHOOK_FAIL webhook failures)"
-
-  echo "$LOGS" | grep "signal_fired" | tail -3 | while IFS= read -r line; do
-    SYM=$(echo "$line" | grep -o "'symbol': '[^']*'" | head -1 | cut -d"'" -f4)
-    SIDE=$(echo "$line" | grep -o "'side': '[^']*'" | head -1 | cut -d"'" -f4)
-    CONF=$(echo "$line" | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
-    echo "    Last: $SYM $SIDE (conf=$CONF)"
-  done
+  echo "  OK: $FIRED signal(s) fired ($REJECTED rejected)"
 elif [[ "$REJECTED" -gt 0 ]]; then
-  echo "  INFO: 0 fired, $REJECTED rejected — gate is blocking everything"
-
+  echo "  INFO: 0 fired, $REJECTED rejected — gate is blocking"
   echo "$LOGS" | grep "gate_rejected" | tail -5 | while IFS= read -r line; do
     PAIR=$(echo "$line" | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
     CONF=$(echo "$line" | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
@@ -156,25 +102,22 @@ elif [[ "$REJECTED" -gt 0 ]]; then
   done
   echo "  FIX: Lower CONFIDENCE_THRESHOLD or wait for model retrain"
 else
-  echo "  WAITING: No signal activity — models still training or stream not connected"
+  echo "  WAITING: No signal activity yet"
 fi
-
 
 # ── Quotex Account ─────────────────────────────────────────────────────────────
 echo ""
 echo "── Quotex Account ─────────────────────────"
-QXLINE=$(echo "$LOGS" | grep "quotex_connected" | grep "balance" | tail -1)
-if [[ -n "$QXLINE" ]]; then
-  BALANCE=$(echo "$QXLINE" | grep -o "'balance': [0-9.]*" | head -1 | grep -o "[0-9.]*")
-  MODE=$(echo "$QXLINE" | grep -o "'mode': '[^']*'" | head -1 | cut -d"'" -f4)
-  echo "  OK: Connected — $MODE — \$$BALANCE"
-else
-  if echo "$LOGS" | grep -q "quotex_connect_failed\|Websocket connection rejected"; then
-    echo "  PROBLEM: Quotex connection failed — Cloudflare blocking WebSocket"
-    echo "  NOTE: This usually resolves on retry. If persistent, consider a proxy."
+if [[ -n "$STATUS_JSON" ]]; then
+  QX_CONNECTED=$(echo "$STATUS_JSON" | grep -o '"connected": true' | head -1 || echo "")
+  QX_BALANCE=$(echo "$STATUS_JSON" | grep -o '"balance": [0-9.]*' | head -1 | grep -o "[0-9.]*" || echo "")
+  if [[ -n "$QX_CONNECTED" ]]; then
+    echo "  OK: Connected — Balance: \$${QX_BALANCE:-0}"
   else
-    echo "  WAITING: No Quotex connection events yet"
+    echo "  WARN: Quotex not connected"
   fi
+else
+  echo "  WARN: Dashboard unreachable — cannot check Quotex status"
 fi
 
 # ── Errors ─────────────────────────────────────────────────────────────────────
@@ -187,17 +130,14 @@ else
   echo "  $ERROR_COUNT error(s) — showing most recent:"
   echo "$LOGS" | grep '"level": "ERROR"' | tail -5 | while IFS= read -r line; do
     TS=$(echo "$line" | grep -o '"timestamp": "[^"]*"' | head -1 | cut -d'"' -f4 | cut -c1-19)
-    COMP=$(echo "$line" | grep -o '"component": "[^"]*"' | head -1 | cut -d'"' -f4)
-    MSG=$(echo "$line" | grep -o "'event': '[^']*'" | head -1 | cut -d"'" -f4)
-    [[ -z "$MSG" ]] && MSG=$(echo "$line" | grep -o '"message": "[^"]*"' | head -1 | cut -d'"' -f4 | cut -c1-60)
-    echo "    $TS  [$COMP]  $MSG"
+    echo "    $TS"
   done
 fi
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "── Health ─────────────────────────────────"
-HEALTH=$(echo "$LOGS" | grep '"event": "health"' | tail -1)
+HEALTH=$(echo "$LOGS" | grep "health" | grep "uptime_seconds" | tail -1)
 if [[ -n "$HEALTH" ]]; then
   UPTIME=$(echo "$HEALTH" | grep -o "'uptime_seconds': [0-9]*" | head -1 | grep -o "[0-9]*")
   TICKS=$(echo "$HEALTH" | grep -o "'ticks_received': [0-9]*" | head -1 | grep -o "[0-9]*")
