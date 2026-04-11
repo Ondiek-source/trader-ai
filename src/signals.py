@@ -39,7 +39,7 @@ PENDING_SIGNAL_TTL_SECONDS = 300  # 5 minutes
 def normalize_symbol(pair: str, otc: bool = False) -> str:
     """Convert internal pair format to webhook symbol (``EUR_USD`` → ``EURUSD``)."""
     base = PAIR_TO_SYMBOL.get(pair, pair.replace("_", "").replace("/", ""))
-    return f"{base}-OTC" if otc else base
+    return f"{base}_otc" if otc else base
 
 
 # ── Daily Session ─────────────────────────────────────────────────────────────

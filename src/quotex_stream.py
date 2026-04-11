@@ -30,23 +30,18 @@ logger = logging.getLogger(__name__)
 
 # ── Quotex symbol mapping ─────────────────────────────────────────────────────
 # Internal format : EUR_USD
-# Quotex format   : EURUSD-OTC
+# Quotex OTC sub  : EURUSD_otc   (lowercase _otc suffix)
+# Webhook format  : EURUSD_otc   (same as subscription)
 
 
 def _to_quotex_symbol(pair: str) -> str:
-    """``EUR_USD`` → ``EURUSD-OTC`` (Quotex OTC format)."""
-    return pair.replace("_", "") + "-OTC"
-
-
-def _to_quotex_symbol_lower(pair: str) -> str:
-    """``EUR_USD`` → ``eurusd-otc`` (Quotex lowercase format)."""
-    return pair.replace("_", "").lower() + "-otc"
+    """``EUR_USD`` → ``EURUSD_otc`` (Quotex OTC format)."""
+    return pair.replace("_", "") + "_otc"
 
 
 def _from_quotex_symbol(symbol: str) -> str:
-    """``EURUSD-OTC`` → ``EUR_USD``"""
-    base = symbol.replace("-OTC", "").replace("-otc", "")
-    # EURUSD → EUR_USD  (split at 3-char boundary — works for majors)
+    """``EURUSD_otc`` → ``EUR_USD``"""
+    base = symbol.replace("_otc", "").replace("_OTC", "")
     if len(base) == 6:
         return f"{base[:3]}_{base[3:]}"
     return base
@@ -89,12 +84,13 @@ class QuotexStream:
 
         self._buffers: dict[str, list[dict]] = {p: [] for p in pairs}
         self._buffer_lock = threading.Lock()
-        self._last_price: dict[str, float] = {}  # for spread estimation
+        self._last_price: dict[str, float] = {}
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._ticks_received = 0
         self._connected = False
+        self._working_symbols: dict[str, str] = {}
 
     # ── Properties (match TwelveDataStream interface) ──────────────────────────
 
@@ -155,10 +151,11 @@ class QuotexStream:
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
-                logger.warning(
+                logger.error(
                     {
                         "event": "quotex_disconnected",
                         "error": str(exc),
+                        "error_type": type(exc).__name__,
                         "reconnect_in_seconds": reconnect_delay,
                     }
                 )
@@ -176,6 +173,7 @@ class QuotexStream:
                 if check:
                     self._connected = True
                     logger.info({"event": "quotex_connected", "message": msg})
+                    await self._log_client_capabilities()
                     return
                 raise ConnectionError(msg)
             except Exception as exc:
@@ -195,25 +193,84 @@ class QuotexStream:
 
         raise ConnectionError("Quotex connection exhausted all retries")
 
-    # ── Polling loop ───────────────────────────────────────────────────────────
+    # ── Client capability discovery ────────────────────────────────────────────
 
-    async def _poll_loop(self) -> None:
-        # Try uppercase first, fallback to lowercase
-        symbols_upper = {p: _to_quotex_symbol(p) for p in self._pairs}
-        symbols_lower = {p: _to_quotex_symbol_lower(p) for p in self._pairs}
-        working_symbols: dict[str, str] = {}
+    async def _log_client_capabilities(self) -> None:
+        """Probe the client to see what methods and data are available."""
+        client_methods = [m for m in dir(self._client) if not m.startswith("_")]
+        price_methods = [m for m in client_methods if "price" in m.lower()]
+        candle_methods = [m for m in client_methods if "candle" in m.lower()]
+        asset_methods = [m for m in client_methods if "asset" in m.lower()]
 
-        # Probe: find which format works
+        logger.info(
+            {
+                "event": "quotex_client_capabilities",
+                "price_methods": price_methods,
+                "candle_methods": candle_methods,
+                "asset_methods": asset_methods,
+                "total_methods": len(client_methods),
+            }
+        )
+
+        # Try to get assets list
+        for method_name in [
+            "get_all_assets",
+            "get_available_asset",
+            "get_all_asset_name",
+        ]:
+            method = getattr(self._client, method_name, None)
+            if method is None:
+                continue
+            try:
+                result = await method()
+                if result:
+                    sample = str(result)[:300]
+                    logger.info(
+                        {
+                            "event": "quotex_assets_probe",
+                            "method": method_name,
+                            "count": (
+                                len(result) if hasattr(result, "__len__") else "unknown"
+                            ),
+                            "sample": sample,
+                        }
+                    )
+                    break
+            except Exception as exc:
+                logger.debug(
+                    {
+                        "event": "quotex_assets_probe_failed",
+                        "method": method_name,
+                        "error": str(exc),
+                    }
+                )
+
+    # ── Symbol format discovery ────────────────────────────────────────────────
+
+    async def _discover_symbol_format(self) -> None:
+        """
+        Try all symbol formats and log which one returns a price.
+
+        Formats tried per pair:
+            1. EURUSD_otc   (confirmed Quotex format)
+            2. EURUSD-OTC   (hyphen variant)
+            3. EURUSD       (plain, no suffix)
+        """
+        all_formats = [
+            ("lowercase_otc", {p: _to_quotex_symbol(p) for p in self._pairs}),
+            ("hyphen_OTC", {p: p.replace("_", "") + "-OTC" for p in self._pairs}),
+            ("plain", {p: p.replace("_", "") for p in self._pairs}),
+        ]
+
+        self._working_symbols = {}
+
         for pair in self._pairs:
-            for label, symbol in [
-                ("upper", symbols_upper[pair]),
-                ("lower", symbols_lower[pair]),
-                ("plain", pair.replace("_", "")),
-            ]:
+            for label, symbol_map in all_formats:
+                symbol = symbol_map[pair]
                 try:
                     price = await self._get_price(symbol)
-                    if price is not None:
-                        working_symbols[pair] = symbol
+                    if price is not None and price > 0:
+                        self._working_symbols[pair] = symbol
                         logger.info(
                             {
                                 "event": "quotex_symbol_format_found",
@@ -224,38 +281,83 @@ class QuotexStream:
                             }
                         )
                         break
+                    else:
+                        logger.warning(
+                            {
+                                "event": "quotex_symbol_probe_none",
+                                "pair": pair,
+                                "symbol": symbol,
+                                "format": label,
+                                "price": price,
+                            }
+                        )
                 except Exception as exc:
-                    logger.debug(
+                    logger.warning(
                         {
-                            "event": "quotex_symbol_probe_failed",
+                            "event": "quotex_symbol_probe_exception",
                             "pair": pair,
                             "symbol": symbol,
                             "format": label,
                             "error": str(exc),
+                            "error_type": type(exc).__name__,
                         }
                     )
 
-        if not working_symbols:
+        if not self._working_symbols:
             logger.error(
                 {
                     "event": "quotex_no_working_symbols",
-                    "tried_upper": list(symbols_upper.values()),
-                    "tried_lower": list(symbols_lower.values()),
-                    "tried_plain": [p.replace("_", "") for p in self._pairs],
+                    "pairs": self._pairs,
+                    "formats_tried": [label for label, _ in all_formats],
+                    "note": (
+                        "None of the symbol formats returned a price. "
+                        "Check quotex_all_price_methods_failed logs for details."
+                    ),
                 }
             )
-            return
+        else:
+            failed_pairs = [p for p in self._pairs if p not in self._working_symbols]
+            logger.info(
+                {
+                    "event": "quotex_symbol_discovery_complete",
+                    "working": self._working_symbols,
+                    "failed": failed_pairs if failed_pairs else "none",
+                }
+            )
+
+    # ── Polling loop ───────────────────────────────────────────────────────────
+
+    async def _poll_loop(self) -> None:
+        """Discover working symbols, then poll forever."""
+        await self._discover_symbol_format()
+
+        if not self._working_symbols:
+            logger.error(
+                {
+                    "event": "quotex_polling_aborted",
+                    "reason": "no working symbols found",
+                    "pairs": self._pairs,
+                    "note": (
+                        "Stream will sleep 30s and retry symbol discovery. "
+                        "This usually means the symbol format is wrong or "
+                        "the Quotex API is not returning price data for these assets."
+                    ),
+                }
+            )
+            await asyncio.sleep(30)
+            return  # exits _poll_loop, outer loop reconnects
 
         logger.info(
             {
                 "event": "quotex_polling_started",
-                "symbols": working_symbols,
+                "symbols": self._working_symbols,
+                "poll_interval": self._poll_interval,
             }
         )
 
-        # Main poll loop with working symbols
+        # Main poll loop
         while not self._stop_event.is_set():
-            for pair, symbol in working_symbols.items():
+            for pair, symbol in self._working_symbols.items():
                 if self._stop_event.is_set():
                     return
 
@@ -287,68 +389,122 @@ class QuotexStream:
 
                 await asyncio.sleep(self._poll_interval)
 
+    # ── Price fetching ─────────────────────────────────────────────────────────
+
     async def _get_price(self, symbol: str) -> float | None:
+        """
+        Try every known pyquotex method to get a price for *symbol*.
+
+        Returns the first successful price, or None if all methods fail.
+        Logs detailed errors for each failed method.
+        """
         errors = []
 
-        # Try realtime price first
+        # ── Method 1: get_realtime_price ────────────────────────────────────
         try:
             price = await self._client.get_realtime_price(symbol)
             if price is not None:
-                logger.debug(
-                    {
-                        "event": "quotex_price_hit",
-                        "method": "get_realtime_price",
-                        "symbol": symbol,
-                        "price": price,
-                    }
-                )
-                return float(price)
-            errors.append("get_realtime_price returned None")
+                val = float(price)
+                if val > 0:
+                    logger.info(
+                        {
+                            "event": "quotex_price_hit",
+                            "method": "get_realtime_price",
+                            "symbol": symbol,
+                            "price": val,
+                        }
+                    )
+                    return val
+                errors.append(f"get_realtime_price returned {val} (non-positive)")
+            else:
+                errors.append("get_realtime_price returned None")
         except AttributeError:
-            errors.append("get_realtime_price method not found")
+            errors.append("get_realtime_price: method not found on client")
         except Exception as exc:
-            errors.append(f"get_realtime_price: {exc}")
+            errors.append(f"get_realtime_price: {type(exc).__name__}: {exc}")
 
-        # Fallback: latest candle close
+        # ── Method 2: get_candles ───────────────────────────────────────────
         try:
             candles = await self._client.get_candles(symbol, 60, 1)
             if candles and len(candles) > 0:
-                close = float(candles[-1].get("close", 0))
-                logger.debug(
-                    {
-                        "event": "quotex_price_hit",
-                        "method": "get_candles",
-                        "symbol": symbol,
-                        "price": close,
-                    }
+                candle = candles[-1]
+                close = float(candle.get("close", 0))
+                if close > 0:
+                    logger.info(
+                        {
+                            "event": "quotex_price_hit",
+                            "method": "get_candles",
+                            "symbol": symbol,
+                            "price": close,
+                            "candle_keys": (
+                                list(candle.keys())
+                                if isinstance(candle, dict)
+                                else type(candle).__name__
+                            ),
+                        }
+                    )
+                    return close
+                errors.append(f"get_candles close={close} (non-positive)")
+            else:
+                errors.append(
+                    f"get_candles returned {type(candles).__name__}: {str(candles)[:100]}"
                 )
-                return close
-            errors.append("get_candles returned empty")
-        except (AttributeError, TypeError, KeyError, IndexError):
-            errors.append("get_candles parse error")
+        except AttributeError:
+            errors.append("get_candles: method not found on client")
         except Exception as exc:
-            errors.append(f"get_candles: {exc}")
+            errors.append(f"get_candles: {type(exc).__name__}: {exc}")
 
-        # Last resort: generic get_price
+        # ── Method 3: get_price ─────────────────────────────────────────────
         try:
             price = await self._client.get_price(symbol)
             if price is not None:
-                logger.debug(
-                    {
-                        "event": "quotex_price_hit",
-                        "method": "get_price",
-                        "symbol": symbol,
-                        "price": price,
-                    }
-                )
-                return float(price)
-            errors.append("get_price returned None")
+                val = float(price)
+                if val > 0:
+                    logger.info(
+                        {
+                            "event": "quotex_price_hit",
+                            "method": "get_price",
+                            "symbol": symbol,
+                            "price": val,
+                        }
+                    )
+                    return val
+                errors.append(f"get_price returned {val} (non-positive)")
+            else:
+                errors.append("get_price returned None")
         except AttributeError:
-            errors.append("get_price method not found")
+            errors.append("get_price: method not found on client")
         except Exception as exc:
-            errors.append(f"get_price: {exc}")
+            errors.append(f"get_price: {type(exc).__name__}: {exc}")
 
-        logger.warning(
+        # ── Method 4: get_realtime_candles ──────────────────────────────────
+        try:
+            candles = await self._client.get_realtime_candles(symbol, 60, 1)
+            if candles and len(candles) > 0:
+                candle = candles[-1]
+                close = float(candle.get("close", 0))
+                if close > 0:
+                    logger.info(
+                        {
+                            "event": "quotex_price_hit",
+                            "method": "get_realtime_candles",
+                            "symbol": symbol,
+                            "price": close,
+                        }
+                    )
+                    return close
+                errors.append(f"get_realtime_candles close={close} (non-positive)")
+            else:
+                errors.append(
+                    f"get_realtime_candles returned {type(candles).__name__}: {str(candles)[:100]}"
+                )
+        except AttributeError:
+            errors.append("get_realtime_candles: method not found on client")
+        except Exception as exc:
+            errors.append(f"get_realtime_candles: {type(exc).__name__}: {exc}")
+
+        # ── All methods failed ──────────────────────────────────────────────
+        logger.error(
             {
                 "event": "quotex_all_price_methods_failed",
                 "symbol": symbol,
@@ -360,14 +516,7 @@ class QuotexStream:
     # ── Tick construction ──────────────────────────────────────────────────────
 
     def _make_tick(self, pair: str, price: float) -> Tick:
-        """
-        Build a :class:`~stream.Tick` from a single price value.
-
-        Quotex doesn't expose bid/ask separately, so we estimate:
-        - ``bid = price - spread/2``
-        - ``ask = price + spread/2``
-        - ``spread`` is a fixed per-pair estimate (typical OTC spread).
-        """
+        """Build a :class:`~stream.Tick` from a single price value."""
         spread = self._estimate_spread(pair, price)
         bid = round(price - spread / 2, 5)
         ask = round(price + spread / 2, 5)
@@ -384,21 +533,15 @@ class QuotexStream:
 
     @staticmethod
     def _estimate_spread(pair: str, price: float) -> float:
-        """
-        Estimate a typical OTC spread for *pair*.
-
-        These are conservative estimates based on typical Quotex OTC spreads.
-        Override if you have measured real spreads.
-        """
-        # pips (4-decimal pairs) vs yen pairs vs metals
+        """Estimate a typical OTC spread for *pair*."""
         if "JPY" in pair:
-            return 0.015  # ~1.5 pips
+            return 0.015
         elif "XAU" in pair or "GOLD" in pair:
-            return 0.30  # ~$0.30
+            return 0.30
         elif "XAG" in pair or "SILVER" in pair:
             return 0.020
         else:
-            return 0.00015  # ~1.5 pips
+            return 0.00015
 
     # ── Ingestion / buffering (identical to TwelveDataStream) ──────────────────
 
