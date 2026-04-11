@@ -33,6 +33,14 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Import status_store for direct balance pushes from _balance_monitor.
+# This is the single source of truth for live balance on the dashboard —
+# health_task is only a 10-second backup; _balance_monitor runs every 1.5s.
+try:
+    from dashboard import status_store as _status_store
+except Exception:
+    _status_store = None  # type: ignore[assignment]
+
 # ── Asset name mapping ─────────────────────────────────────────────────────────
 # Quotex uses "EURUSD_otc" on OTC (weekends / off-hours) and "EURUSD" on live
 # The _otc suffix is tried first; both are checked on match.
@@ -88,13 +96,22 @@ class QuotexReader:
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
     MAX_RECONNECT_DELAY = 120  # seconds
 
-    def __init__(self, email: str, password: str, practice_mode: bool = True) -> None:
+    def __init__(
+        self,
+        email: str,
+        password: str,
+        practice_mode: bool = True,
+        client: Any = None,
+    ) -> None:
         self._email = email
         self._password = password
         self._practice_mode = practice_mode
         self._account_type = "PRACTICE" if practice_mode else "REAL"
 
-        self._client: Any = None
+        # Accept a pre-built shared client (e.g. from QuotexStream) so that
+        # only one WebSocket session is opened per Quotex account.  When None,
+        # connect() will create its own client as before.
+        self._client: Any = client
         self._connected = False
         self._balance: float = 0.0
         self._prev_balance: float = 0.0
@@ -112,7 +129,13 @@ class QuotexReader:
     # ── Connection ─────────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Establish WebSocket connection to Quotex."""
+        """Establish WebSocket connection to Quotex.
+
+        If a shared client was injected at construction time (e.g. the same
+        client used by QuotexStream), this method reuses it and only sets the
+        account mode / fetches the initial balance — it does NOT open a second
+        WebSocket connection.
+        """
         if not QUOTEX_LIB_AVAILABLE:
             return False
         if not self._email or not self._password:
@@ -120,37 +143,45 @@ class QuotexReader:
             return False
 
         try:
-            self._client = _QuotexClient(
-                email=self._email,
-                password=self._password,
-                lang="en",
-            )
-            ok, reason = await self._client.connect()
-            if ok:
-                self._connected = True
-                # Switch to correct account type
-                if hasattr(self._client, "change_account"):
-                    result = self._client.change_account(self._account_type)
-                    if asyncio.iscoroutine(result):
-                        await result
-
-                self._balance = await self._safe_get_balance()
-                self._prev_balance = self._balance
-
-                mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE]"
-                logger.info(
-                    {
-                        "event": "quotex_connected",
-                        "mode": mode_tag,
-                        "account_type": self._account_type,
-                        "balance": self._balance,
-                        "reason": str(reason),
-                    }
+            # Only create a new client when none was injected.
+            if self._client is None:
+                self._client = _QuotexClient(
+                    email=self._email,
+                    password=self._password,
+                    lang="en",
                 )
-                return True
+                ok, reason = await self._client.connect()
+                if not ok:
+                    logger.error(
+                        {"event": "quotex_connect_failed", "reason": str(reason)}
+                    )
+                    return False
             else:
-                logger.error({"event": "quotex_connect_failed", "reason": str(reason)})
-                return False
+                # Shared client — assume the caller already connected it.
+                reason = "shared_client"
+
+            self._connected = True
+            # Switch to correct account type
+            if hasattr(self._client, "change_account"):
+                result = self._client.change_account(self._account_type)
+                if asyncio.iscoroutine(result):
+                    await result
+
+            self._balance = await self._safe_get_balance()
+            self._prev_balance = self._balance
+
+            mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE]"
+            logger.info(
+                {
+                    "event": "quotex_connected",
+                    "mode": mode_tag,
+                    "account_type": self._account_type,
+                    "balance": self._balance,
+                    "reason": str(reason),
+                    "shared_client": self._client is not None and reason == "shared_client",
+                }
+            )
+            return True
 
         except Exception as exc:
             logger.error({"event": "quotex_connect_exception", "error": str(exc)})
@@ -270,7 +301,12 @@ class QuotexReader:
     # ── Balance monitor ────────────────────────────────────────────────────────
 
     async def _balance_monitor(self) -> None:
-        """Continuously polls balance to detect trade closes via delta."""
+        """Continuously polls balance to detect trade closes via delta.
+
+        Also pushes the fresh balance directly to ``status_store`` on every
+        poll so the dashboard updates every BALANCE_POLL_INTERVAL (1.5 s)
+        rather than waiting for health_task's 10-second tick.
+        """
         if self._balance == 0.0:
             self._balance = await self._safe_get_balance()
             self._prev_balance = self._balance
@@ -292,6 +328,19 @@ class QuotexReader:
                     )
                 # Always update so health() returns fresh balance
                 self._balance = new_balance
+                # Push directly to dashboard — single source of truth for balance.
+                # health_task only runs every 10 s; we run every 1.5 s.
+                if _status_store is not None:
+                    _status_store.update(
+                        {
+                            "quotex": {
+                                "connected": self._connected,
+                                "balance": self._balance,
+                                "pending_signals": len(self._pending),
+                                "result_queue_size": self._result_queue.qsize(),
+                            }
+                        }
+                    )
             except Exception as exc:
                 logger.debug({"event": "balance_poll_error", "error": str(exc)})
 
@@ -537,7 +586,14 @@ class QuotexReader:
 
 
 async def run_quotex_reader(reader: QuotexReader) -> None:
-    """Top-level entry point for asyncio.create_task."""
+    """Top-level entry point for asyncio.create_task.
+
+    NOTE: Does NOT call reader.connect() — main() already connected the reader
+    before launching this task.  Calling connect() a second time would open a
+    duplicate WebSocket session on the same Quotex account, which kills the
+    first session.  If the reader is not yet connected (e.g. initial connect
+    failed), poll_results()'s internal _reconnect() loop will handle it.
+    """
     if not QUOTEX_LIB_AVAILABLE:
         logger.info(
             {
@@ -549,5 +605,4 @@ async def run_quotex_reader(reader: QuotexReader) -> None:
         while True:
             await asyncio.sleep(3600)
     else:
-        await reader.connect()
         await reader.poll_results()

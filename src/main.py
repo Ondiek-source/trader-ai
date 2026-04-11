@@ -128,7 +128,9 @@ def _push_dashboard(orchestrator: SignalOrchestrator, **extra: Any) -> None:
     update: dict[str, Any] = {
         "stopped": status.get("stopped", False),
         "martingale_streak": status.get("martingale_streak", 0),
-        "confidence_threshold": status.get("confidence_threshold", 0.65),
+        # Fallback 0 (not a config constant) so a missing value is visible
+        # on the dashboard rather than silently showing a stale hardcoded default.
+        "confidence_threshold": status.get("confidence_threshold", 0),
         "pending_signals": status.get("pending_signals", 0),
         "session": status.get("session", {}),
     }
@@ -526,6 +528,9 @@ async def feedback_task(
     while True:
         result: dict[str, Any] | None = await quotex_reader.get_result(timeout=1.0)
         if result is None:
+            # get_result already waited up to 1.0 s — yield briefly and retry.
+            # Without this the loop burns CPU spinning at ~10 calls/s when idle.
+            await asyncio.sleep(0.1)
             continue
 
         orchestrator.on_result(result)
@@ -590,10 +595,13 @@ async def health_task(
             else {"connected": False, "balance": 0.0}
         )
 
-        # Memory and CPU metrics
+        # Memory and CPU metrics — run blocking cpu_percent in executor
+        # to avoid stalling the asyncio event loop for 1 second every tick.
         process = psutil.Process()
         memory_mb: float = process.memory_info().rss / 1024 / 1024
-        cpu_percent: float = process.cpu_percent(interval=1)
+        cpu_percent: float = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: process.cpu_percent(interval=1)
+        )
 
         logger.info(
             {
@@ -918,16 +926,21 @@ async def main() -> None:
     # ── Data source selection ───────────────────────────────────────────────
     stream: TwelveDataStream | QuotexStream
 
+    # Single shared Quotex client — Quotex only supports one active WebSocket
+    # session per account.  QuotexStream (tick data) and QuotexReader (result
+    # reading) must share this client, not each create their own connection.
+    shared_qx_client: Any = None
+
     if config.use_quotex_streaming and config.quotex_email:
         from pyquotex.stable_api import Quotex
 
-        qx_client = Quotex(
+        shared_qx_client = Quotex(
             config.quotex_email,
             config.quotex_password,
             lang="en",
         )
         stream = QuotexStream(
-            client=qx_client,
+            client=shared_qx_client,
             pairs=config.pairs,
             storage=storage,
             flush_size=config.tick_flush_size,
@@ -949,13 +962,16 @@ async def main() -> None:
         secret=config.webhook_secret,
     )
 
+    has_quotex_creds: bool = bool(config.quotex_email and config.quotex_password)
+
+    # QuotexReader reuses shared_qx_client when Quotex streaming is active so
+    # there is only ever one WebSocket session.  When using Twelve Data for
+    # ticks, QuotexReader opens its own separate connection for result reading.
     quotex_reader: QuotexReader = QuotexReader(
-        email=getattr(config, "quotex_email", ""),
-        password=getattr(config, "quotex_password", ""),
+        email=config.quotex_email,
+        password=config.quotex_password,
         practice_mode=config.practice_mode,
-    )
-    has_quotex_creds: bool = bool(
-        getattr(config, "quotex_email", "") and getattr(config, "quotex_password", "")
+        client=shared_qx_client,  # None when using Twelve Data — reader self-connects
     )
     if has_quotex_creds:
         await quotex_reader.connect()

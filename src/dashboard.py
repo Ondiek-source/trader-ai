@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
@@ -276,11 +277,17 @@ class StatusStore:
     Updated by the main trading loop via :meth:`update`.  Read by the
     HTTP handler on every ``/status`` request.
 
+    A :class:`threading.Lock` guards all reads and writes because the HTTP
+    server runs in a daemon thread while updates arrive from the asyncio
+    event loop thread — concurrent dict mutation without a lock can produce
+    torn reads in CPython when values are non-atomic (nested dicts, lists).
+
     The orchestrator **must** call ``status_store.update({"last_event": ...})``
     after every significant event for the activity log to populate.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._data: dict[str, Any] = {
             "stopped": False,
             "martingale_streak": 0,
@@ -301,7 +308,8 @@ class StatusStore:
         Args:
             data: Partial status dict.  Keys not present are left unchanged.
         """
-        self._data.update(data)
+        with self._lock:
+            self._data.update(data)
 
     def get(self) -> dict[str, Any]:
         """
@@ -310,7 +318,8 @@ class StatusStore:
         Returns:
             Copy of the status dict safe for JSON serialisation.
         """
-        return {**self._data, "server_time": datetime.now(timezone.utc).isoformat()}
+        with self._lock:
+            return {**self._data, "server_time": datetime.now(timezone.utc).isoformat()}
 
 
 # Singleton — imported by main.py
