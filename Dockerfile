@@ -56,7 +56,7 @@ RUN pip install --no-cache-dir \
     websockets>=12.0 \
     azure-storage-blob>=12.19.0 \
     psutil>=5.9.8 \
-    requests>=2.31.0,<3.0.0 \
+    requests>=2.31.0 \
     aiohttp>=3.13.2 \
     aiodns>=3.2.0 \
     brotli>=1.1.0 \
