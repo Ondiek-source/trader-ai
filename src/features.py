@@ -8,7 +8,7 @@ Workflow:
     1. ``resample_to_1min(tick_df)``              → 1-minute OHLCV bars
     2. ``compute_features(tick_df, expiry_seconds)`` → full feature + label DataFrame
     3. ``get_feature_columns()``                   → list of feature column names
-    4. ``extract_live_features(bars, ticks)``      → single-row feature Series for inference
+    4. ``extract_live_features(bars, ticks)``      → single-row feature Series for inference.
 """
 
 from __future__ import annotations
