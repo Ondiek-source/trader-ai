@@ -27,22 +27,48 @@ RUN groupadd --gid 1000 appuser && \
 WORKDIR /app
 
 # ---------------------------------------------------------------------------
-# Install Python dependencies (cached layer)
+# Install Python dependencies — separate layers for retry resilience
+# If one layer fails, Docker caches the others
 # ---------------------------------------------------------------------------
-COPY requirements.txt .
 
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install requirements — the --extra-index-url for torch CPU must be passed
-# on the command line because pip inside Docker doesn't always respect the
-# directive inside requirements.txt when the file also has inline comments.
+# Layer 1: CPU-only PyTorch (~200MB, most likely to timeout)
 RUN pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    -r requirements.txt
+    "torch>=2.1.0"
 
-# Install pyquotex separately — failure here is non-fatal
-RUN pip install --no-cache-dir "git+https://github.com/cleitonleonel/pyquotex.git" \
-    || echo "WARNING: pyquotex install failed — Quotex result reading disabled"
+# Layer 2: Scientific stack
+RUN pip install --no-cache-dir \
+    pyarrow>=15.0.0 \
+    pandas>=2.2.0 \
+    numpy>=1.26.0 \
+    scipy
+
+# Layer 3: ML frameworks
+RUN pip install --no-cache-dir \
+    lightgbm>=4.1.0 \
+    xgboost>=2.0.0 \
+    scikit-learn>=1.4.0
+
+# Layer 4: Everything else (small, fast)
+RUN pip install --no-cache-dir \
+    websockets>=12.0 \
+    azure-storage-blob>=12.19.0 \
+    psutil>=5.9.8 \
+    requests>=2.31.0,<3.0.0 \
+    aiohttp>=3.13.2 \
+    aiodns>=3.2.0 \
+    brotli>=1.1.0 \
+    python-telegram-bot>=20.7 \
+    httpx>=0.27.0 \
+    joblib>=1.3.0 \
+    python-dotenv>=1.0.0
+
+# Layer 5: Quotex (from git — failure is non-fatal)
+RUN pip install --no-cache-dir \
+    "git+https://github.com/cleitonleonel/pyquotex.git" \
+    || echo "WARNING: pyquotex install failed — Quotex streaming disabled"
 
 # ---------------------------------------------------------------------------
 # Copy application source
