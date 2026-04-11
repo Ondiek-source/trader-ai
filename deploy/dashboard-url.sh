@@ -7,17 +7,15 @@ set -euo pipefail
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AZURE_ENV="$SCRIPT_DIR/azure.env"
-APP_ENV="$PROJECT_ROOT/.env"
 
-# Load environment variables
+# Load azure.env (skip comments and blank lines)
 if [[ -f "$AZURE_ENV" ]]; then
-  export $(cat "$AZURE_ENV" | xargs)
-fi
-
-if [[ -f "$APP_ENV" ]]; then
-  export $(cat "$APP_ENV" | xargs)
+  while IFS='=' read -r key value; do
+    # Skip comments, blank lines, and malformed lines
+    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+    export "${key}=${value}"
+  done < "$AZURE_ENV"
 fi
 
 IP=$(az container show \

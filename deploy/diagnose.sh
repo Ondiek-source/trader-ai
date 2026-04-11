@@ -133,41 +133,32 @@ fi
 # ── Signals ────────────────────────────────────────────────────────────────────
 echo ""
 echo "── Signals ────────────────────────────────"
-ATTEMPTS=$(echo "$LOGS" | grep -c "signal_attempt" || true)
 FIRED=$(echo "$LOGS" | grep -c "signal_fired" || true)
-SUPPRESSED=$(echo "$LOGS" | grep -c "signal_suppressed" || true)
+REJECTED=$(echo "$LOGS" | grep -c "gate_rejected" || true)
+WEBHOOK_FAIL=$(echo "$LOGS" | grep -c "webhook_failed" || true)
 
 if [[ "$FIRED" -gt 0 ]]; then
-  echo "  OK: $FIRED signal(s) fired out of $ATTEMPTS attempts"
-elif [[ "$ATTEMPTS" -gt 0 ]]; then
-  echo "  INFO: $ATTEMPTS attempts, 0 fired — all suppressed"
+  echo "  OK: $FIRED signal(s) fired ($REJECTED rejected, $WEBHOOK_FAIL webhook failures)"
 
-  # Count suppression reasons
-  echo "$LOGS" | grep "signal_suppressed" | grep -o "'reason': '[^']*'" | cut -d"'" -f4 | sort | uniq -c | sort -rn | while IFS= read -r count reason; do
-    case "$reason" in
-      confidence_below_threshold)
-        echo "    $count blocked: confidence below threshold — model needs more training"
-        ;;
-      cooldown)
-        echo "    $count blocked: per-pair cooldown (60s) — normal, signals are rate-limited"
-        ;;
-      session_inactive)
-        echo "    $count blocked: session expired — send /start on Telegram to restart"
-        ;;
-      daily_target_reached)
-        echo "    $count blocked: daily target reached — session complete for today"
-        ;;
-      manual_stop)
-        echo "    $count blocked: manually stopped — send /resume on Telegram"
-        ;;
-      *)
-        echo "    $count blocked: $reason"
-        ;;
-    esac
+  echo "$LOGS" | grep "signal_fired" | tail -3 | while IFS= read -r line; do
+    SYM=$(echo "$line" | grep -o "'symbol': '[^']*'" | head -1 | cut -d"'" -f4)
+    SIDE=$(echo "$line" | grep -o "'side': '[^']*'" | head -1 | cut -d"'" -f4)
+    CONF=$(echo "$line" | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
+    echo "    Last: $SYM $SIDE (conf=$CONF)"
   done
+elif [[ "$REJECTED" -gt 0 ]]; then
+  echo "  INFO: 0 fired, $REJECTED rejected — gate is blocking everything"
+
+  echo "$LOGS" | grep "gate_rejected" | tail -5 | while IFS= read -r line; do
+    PAIR=$(echo "$line" | grep -o "'pair': '[^']*'" | head -1 | cut -d"'" -f4)
+    CONF=$(echo "$line" | grep -o "'confidence': [0-9.]*" | head -1 | grep -o "[0-9.]*")
+    echo "    $PAIR: confidence $CONF"
+  done
+  echo "  FIX: Lower CONFIDENCE_THRESHOLD or wait for model retrain"
 else
-  echo "  WAITING: No signal attempts yet — models still training"
+  echo "  WAITING: No signal activity — models still training or stream not connected"
 fi
+
 
 # ── Quotex Account ─────────────────────────────────────────────────────────────
 echo ""

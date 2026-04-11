@@ -12,12 +12,13 @@ Thread model mirrors TwelveDataStream:
     - Ticks are buffered per pair and flushed to storage every N ticks.
     - On disconnect: logs warning, waits with backoff, reconnects forever.
 
-pyquotex API (confirmed from docs):
+pyquotex API (from official docs):
     - Quotex(email, password, lang="en")
-    - await client.connect() → (bool, str)
-    - client.start_realtime_price(asset, period) → None  (sync, blocks until data)
-    - await client.get_realtime_price(asset) → dict | int | float | None
-    - client.close() → None
+    - await client.connect() -> (bool, str)
+    - await client.start_realtime_price(asset, period) -> None
+    - await client.get_realtime_price(asset) -> list[dict] | None
+      (each dict has "time" and "price" keys)
+    - await client.close() -> None
 """
 
 from __future__ import annotations
@@ -35,9 +36,8 @@ from twelveticks_stream import Tick
 
 logger = logging.getLogger(__name__)
 
+
 # ── Quotex symbol mapping ─────────────────────────────────────────────────────
-# Internal format : EUR_USD
-# Quotex OTC sub  : EURUSD_otc   (lowercase _otc suffix)
 
 
 def _to_quotex_symbol(pair: str) -> str:
@@ -49,8 +49,14 @@ def _to_quotex_symbol(pair: str) -> str:
 
     Returns:
         Quotex OTC symbol like ``"EURUSD_otc"``.
+
+    Examples:
+        >>> _to_quotex_symbol("EUR_USD")
+        'EURUSD_otc'
+        >>> _to_quotex_symbol("XAU_USD")
+        'XAUUSD_otc'
     """
-    return pair.replace("_", "") + "_otc"
+    return pair.replace("_", "").upper() + "_otc"
 
 
 # ── Main stream class ─────────────────────────────────────────────────────────
@@ -108,6 +114,7 @@ class QuotexStream:
                 "class": "QuotexStream",
                 "pairs": self._pairs,
                 "poll_interval": self._poll_interval,
+                "symbols": {p: _to_quotex_symbol(p) for p in self._pairs},
             }
         )
 
@@ -234,24 +241,22 @@ class QuotexStream:
 
     # ── Stream setup ───────────────────────────────────────────────────────────
 
-    def _start_realtime_streams(self, symbols: dict[str, str]) -> None:
+    async def _start_realtime_streams(self, symbols: dict[str, str]) -> None:
         """
         Start real-time price streams for all symbols.
 
-        Per pyquotex docs, ``start_realtime_price`` is synchronous and
-        internally blocks until ``api.realtime_price[asset]`` is populated.
-        Without this, ``get_realtime_price`` returns empty dicts.
+        Per pyquotex docs, ``start_realtime_price`` is async and must be
+        awaited.  Without this, ``get_realtime_price`` returns ``None``.
 
         Args:
-            symbols: Mapping of internal pair → Quotex symbol
+            symbols: Mapping of internal pair to Quotex symbol
                 (e.g. ``{"EUR_USD": "EURUSD_otc"}``).
         """
         for pair, symbol in symbols.items():
             if self._stop_event.is_set():
                 return
             try:
-                # start_realtime_price is sync — blocks until data is ready
-                self._client.start_realtime_price(symbol, 60)
+                await self._client.start_realtime_price(symbol, 60)
                 logger.info(
                     {
                         "event": "quotex_realtime_stream_started",
@@ -283,11 +288,8 @@ class QuotexStream:
         """
         symbols: dict[str, str] = {p: _to_quotex_symbol(p) for p in self._pairs}
 
-        # Start streams — get_realtime_price returns empty dict without this.
-        # This is sync and may block, so we run it in an executor.
-        await asyncio.get_running_loop().run_in_executor(
-            None, self._start_realtime_streams, symbols
-        )
+        # Start streams — get_realtime_price returns None without this.
+        await self._start_realtime_streams(symbols)
 
         logger.info(
             {
@@ -331,9 +333,12 @@ class QuotexStream:
 
         Requires :meth:`_start_realtime_streams` to have been called first.
 
-        ``get_realtime_price`` returns data from the WebSocket buffer
-        (``api.realtime_price`` dict).  Response format varies by
-        pyquotex version — handled by checking for common keys.
+        Per pyquotex docs, ``get_realtime_price`` returns a **list of dicts**,
+        each with ``"time"`` and ``"price"`` keys::
+
+            prices = await client.get_realtime_price(asset)
+            last_price = prices[-1]
+            print(f"Time: {last_price['time']} Price: {last_price['price']}")
 
         Args:
             symbol: Quotex symbol (e.g. ``"EURUSD_otc"``).
@@ -342,20 +347,40 @@ class QuotexStream:
             Price as a positive float, or ``None`` if unavailable.
         """
         try:
-            # get_realtime_price is async per docs
             result: Any = await self._client.get_realtime_price(symbol)
 
             if result is None:
                 return None
 
-            # Dict response — extract price from known keys
+            # List response — official format from pyquotex docs
+            if isinstance(result, list):
+                if not result:
+                    return None
+                last_entry: dict[str, Any] = result[-1]
+                price_raw: Any = last_entry.get("price")
+                if price_raw is not None:
+                    try:
+                        val: float = float(price_raw)
+                        if val > 0:
+                            return val
+                    except (ValueError, TypeError):
+                        logger.debug(
+                            {
+                                "event": "quotex_price_parse_error",
+                                "symbol": symbol,
+                                "price_raw": price_raw,
+                            }
+                        )
+                return None
+
+            # Dict response — some versions may return a single dict
             if isinstance(result, dict):
                 if not result:
-                    return None  # buffer not ready yet
-                for key in ("price", "value", "close", "last", "bid", "ask"):
+                    return None
+                for key in ("price", "value", "close", "last"):
                     if key in result:
                         try:
-                            val: float = float(result[key])
+                            val = float(result[key])
                             if val > 0:
                                 return val
                         except (ValueError, TypeError):
@@ -367,6 +392,15 @@ class QuotexStream:
                 val = float(result)
                 return val if val > 0 else None
 
+            # Unexpected type — log for debugging
+            logger.debug(
+                {
+                    "event": "quotex_price_unparsed",
+                    "symbol": symbol,
+                    "type": type(result).__name__,
+                    "repr": str(result)[:200],
+                }
+            )
             return None
 
         except Exception as exc:
