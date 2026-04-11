@@ -34,25 +34,25 @@ WORKDIR /app
 RUN pip install --no-cache-dir --upgrade pip
 
 # Layer 1: CPU-only PyTorch (~200MB, most likely to timeout)
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --retries 10\
     --extra-index-url https://download.pytorch.org/whl/cpu \
     "torch>=2.1.0"
 
 # Layer 2: Scientific stack
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --retries 10\
     pyarrow>=15.0.0 \
     pandas>=2.2.0 \
     numpy>=1.26.0 \
     scipy
 
 # Layer 3: ML frameworks
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --retries 10\
     lightgbm>=4.1.0 \
     xgboost>=2.0.0 \
     scikit-learn>=1.4.0
 
 # Layer 4: Everything else (small, fast)
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --retries 10\
     websockets>=12.0 \
     azure-storage-blob>=12.19.0 \
     psutil>=5.9.8 \
