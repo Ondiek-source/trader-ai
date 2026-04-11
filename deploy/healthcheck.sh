@@ -166,7 +166,7 @@ fi
 
 # ── 7. Quotex connection (FETCH FRESH LOGS) ───────────────────────────────────
 echo "[ 7/8 ] Quotex account connection..."
-QUOTEX_LOGS=$(az container logs --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" --tail 200 2>/dev/null || echo "")
+QUOTEX_LOGS=$(az container logs --name "$ACI_NAME" --resource-group "$RESOURCE_GROUP" | tail -n 200 2>/dev/null || echo "Logs? What Logs?")
 
 if echo "$QUOTEX_LOGS" | grep -q "quotex_connected"; then
     BALANCE=$(echo "$QUOTEX_LOGS" | grep "quotex_connected" | tail -1 | grep -o '"balance":[0-9.]*' | head -1 | cut -d':' -f2)

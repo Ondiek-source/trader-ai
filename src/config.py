@@ -2,7 +2,7 @@
 config.py — Environment variable parsing and validated configuration.
 
 All secrets (tokens, passwords, connection strings) are read exclusively from
-environment variables. Nothing is hard-coded. Raises ValueError on startup if
+environment variables.  Nothing is hard-coded.  Raises ValueError on startup if
 any required variable is missing or invalid.
 """
 
@@ -10,13 +10,30 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+VALID_PAIRS: set[str] = {"EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"}
+VALID_EXPIRIES: set[int] = {60, 120, 300}
+
+
+# ── Environment variable helpers ──────────────────────────────────────────────
+
 
 def _require(name: str) -> str:
-    """Return env var value or raise ValueError."""
+    """
+    Read a required environment variable.
+
+    Args:
+        name: Environment variable name.
+
+    Returns:
+        Stripped value.
+
+    Raises:
+        ValueError: If the variable is unset or empty.
+    """
     val = os.environ.get(name, "").strip()
     if not val:
         raise ValueError(f"Required environment variable '{name}' is not set or empty.")
@@ -24,15 +41,49 @@ def _require(name: str) -> str:
 
 
 def _optional(name: str, default: str = "") -> str:
+    """
+    Read an optional environment variable with a fallback.
+
+    Args:
+        name: Environment variable name.
+        default: Value to return if unset.
+
+    Returns:
+        Stripped value or *default*.
+    """
     return os.environ.get(name, default).strip()
 
 
 def _bool(name: str, default: bool = True) -> bool:
-    val = os.environ.get(name, str(default)).strip().lower()
-    return val in ("1", "true", "yes", "on")
+    """
+    Read a boolean environment variable.
+
+    Accepts ``"1"``, ``"true"``, ``"yes"``, ``"on"`` (case-insensitive) as
+    truthy.  Anything else — including an empty or missing variable — is
+    falsy, *unless* the variable is absent entirely, in which case *default*
+    is returned.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is not set at all.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int(name: str, default: int) -> int:
+    """
+    Read an integer environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is not set.
+
+    Raises:
+        ValueError: If the variable is set but not a valid integer.
+    """
     val = os.environ.get(name, str(default)).strip()
     try:
         return int(val)
@@ -43,6 +94,16 @@ def _int(name: str, default: int) -> int:
 
 
 def _float(name: str, default: float) -> float:
+    """
+    Read a float environment variable.
+
+    Args:
+        name: Environment variable name.
+        default: Value to use when the variable is not set.
+
+    Raises:
+        ValueError: If the variable is set but not a valid float.
+    """
     val = os.environ.get(name, str(default)).strip()
     try:
         return float(val)
@@ -50,24 +111,36 @@ def _float(name: str, default: float) -> float:
         raise ValueError(f"Environment variable '{name}' must be a float, got: '{val}'")
 
 
+# ── Configuration dataclass ───────────────────────────────────────────────────
+
+
 @dataclass
 class Config:
-    # ── Twelve Data ───────────────────────────────────────────────────────────
+    """
+    Validated application configuration.
+
+    Instantiated via :func:`load_config`.  Callers should never construct
+    this class directly — use ``load_config()`` so that every field is
+    sourced from environment variables and validated.
+    """
+
+    # ── Twelve Data ───────────────────────────────────────────────────────
     twelvedata_api_key: str
 
-    # ── Azure Storage ─────────────────────────────────────────────────────────
+    # ── Azure Storage ─────────────────────────────────────────────────────
     azure_storage_conn: str
     container_name: str
 
-    # ── Webhook ───────────────────────────────────────────────────────────────
-    webhook_url: str
-    webhook_secret: str  # may be empty string if not configured
-
-    # ── Quotex ────────────────────────────────────────────────────────────────
+    # ── Quotex ────────────────────────────────────────────────────────────
     quotex_email: str
     quotex_password: str
 
-    # ── Trading ───────────────────────────────────────────────────────────────
+    # ── Webhook ───────────────────────────────────────────────────────────
+    webhook_url: str
+    webhook_secret: str
+    webhook_key: str  # static auth key included in every payload
+
+    # ── Trading ───────────────────────────────────────────────────────────
     pairs: list[str]
     confidence_threshold: float
     expiry_seconds: int
@@ -75,56 +148,78 @@ class Config:
     trading_window_hours: int
     target_net_profit: float | None  # None = disabled; use daily_trade_target only
 
-    # ── Operational ───────────────────────────────────────────────────────────
+    # ── Operational ───────────────────────────────────────────────────────
     practice_mode: bool
     log_level: str
     tick_flush_size: int
 
-    # ── Martingale ────────────────────────────────────────────────────────────
-    martingale_max_streak: int  # reset after this many consecutive losses
+    # ── Martingale ────────────────────────────────────────────────────────
+    martingale_max_streak: int
 
-    # ── Webhook ───────────────────────────────────────────────────────────────
-    webhook_key: str  # static auth key sent in payload (e.g. "Ondiek")
+    # ── Reporting / notifications ─────────────────────────────────────────
+    telegram_token: str
+    telegram_chat_id: str
+    discord_webhook_url: str
 
-    # ── Reporting / notifications ─────────────────────────────────────────────
-    telegram_token: str  # Telegram Bot API token (empty = disabled)
-    telegram_chat_id: str  # Telegram chat ID to send messages to
-    discord_webhook_url: str  # Discord incoming webhook URL (empty = disabled)
+    # ── Dashboard ─────────────────────────────────────────────────────────
+    dashboard_port: int
 
-    # ── Result callback / Quotex reader ──────────────────────────────────────
-    result_callback_port: int  # port for the local HTTP result receiver
-    quotex_read_results: bool  # True = use Quotex API to read trade results
+    # ── Training ──────────────────────────────────────────────────────────
+    backfill_years: int
+    max_sequences: int
 
-    # ── Training ──────────────────────────────────────────────────────────────
-    backfill_years: int  # years of Dukascopy history to download
-    optimize_expiry: bool  # True = test 60/120/300s and pick best per pair
-    max_sequences: int  # Max sequences for LSTM & Transformer training (prevents OOM)
+    # ── Data source routing ──────────────────────────────────────────────
+    use_quotex_streaming: bool
+    otc_pairs: list[str]
+    poll_interval: float
 
     def __post_init__(self) -> None:
-        # Validate pairs
-        valid_pairs = {"EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD"}
+        """Run cross-field validation after construction."""
+        # Pairs
         for p in self.pairs:
-            if p not in valid_pairs:
+            if p not in VALID_PAIRS:
                 logger.warning(
                     "Pair '%s' is not in the default set %s — proceeding anyway.",
                     p,
-                    valid_pairs,
+                    VALID_PAIRS,
                 )
 
-        # Validate confidence threshold
+        # Confidence threshold
         if not 0.5 < self.confidence_threshold < 1.0:
             raise ValueError(
-                f"CONFIDENCE_THRESHOLD must be between 0.5 and 1.0, got: {self.confidence_threshold}"
+                f"CONFIDENCE_THRESHOLD must be between 0.5 and 1.0, "
+                f"got: {self.confidence_threshold}"
             )
 
-        # Validate expiry
-        if self.expiry_seconds not in (60, 120, 300):
+        # Expiry
+        if self.expiry_seconds not in VALID_EXPIRIES:
             logger.warning(
-                "EXPIRY_SECONDS=%d is not in the tested set [60, 120, 300]. Proceeding.",
+                "EXPIRY_SECONDS=%d is not in the tested set %s. Proceeding.",
                 self.expiry_seconds,
+                sorted(VALID_EXPIRIES),
             )
 
-        # Warn loudly on live mode
+        # Port range
+        if not 1 <= self.dashboard_port <= 65535:
+            raise ValueError(
+                f"DASHBOARD_PORT must be 1-65535, got: {self.dashboard_port}"
+            )
+
+        # Quotex credentials required when direct reading is enabled
+        if not self.quotex_email or not self.quotex_password:
+            logger.info(
+                "Quotex credentials not set — result reading via pyquotex disabled. "
+                "Set QUOTEX_EMAIL and QUOTEX_PASSWORD to enable."
+            )
+
+        # Log level validation (don't configure logging here — main.py owns that)
+        level = getattr(logging, self.log_level, None)
+        if level is None:
+            raise ValueError(
+                f"LOG_LEVEL must be a valid Python logging level, got: '{self.log_level}'"
+            )
+
+        # Live mode warning
         if not self.practice_mode:
             logger.warning(
                 "[LIVE MODE ACTIVE] — System is configured for LIVE trading. "
@@ -136,11 +231,33 @@ class Config:
             )
 
 
+def _parse_otc_pairs(raw: str) -> list[str]:
+    """
+    Parse ``OTC_PAIRS`` env var.
+
+    Accepts comma-separated Quotex symbol names, e.g.::
+
+        "EURUSD-OTC,GBPUSD-OTC,USDJPY-OTC,XAUUSD-OTC"
+
+    If empty, symbols are derived from ``PAIRS`` at stream start time
+    (``EUR_USD`` → ``EURUSD-OTC``).
+    """
+    if not raw.strip():
+        return []
+    pairs = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    if not pairs:
+        raise ValueError("OTC_PAIRS is set but contains no valid pairs.")
+    return pairs
+
+
 def load_config() -> Config:
-    """Parse all environment variables and return a validated Config instance."""
-    pairs_raw = _optional(
-        "PAIRS", "EUR_USD"
-    )  # start with EUR/USD only; add more when validated
+    """
+    Parse all environment variables and return a validated :class:`Config`.
+
+    Raises:
+        ValueError: If any required variable is missing or any value is invalid.
+    """
+    pairs_raw = _optional("PAIRS", "EUR_USD,GBP_USD,USD_JPY,XAU_USD")
     pairs = [p.strip().upper() for p in pairs_raw.split(",") if p.strip()]
     if not pairs:
         raise ValueError("PAIRS must contain at least one currency pair.")
@@ -161,12 +278,13 @@ def load_config() -> Config:
         # Azure
         azure_storage_conn=_require("AZURE_STORAGE_CONN"),
         container_name=_optional("CONTAINER_NAME", "traderai"),
+        # Quotex
+        quotex_email=_optional("QUOTEX_EMAIL", ""),
+        quotex_password=_optional("QUOTEX_PASSWORD", ""),
         # Webhook
         webhook_url=_require("WEBHOOK_URL"),
         webhook_secret=_optional("WEBHOOK_SECRET", ""),
-        # Quotex (required for result reading; can be blank if QUOTEX_READ_RESULTS=false)
-        quotex_email=_optional("QUOTEX_EMAIL", ""),
-        quotex_password=_optional("QUOTEX_PASSWORD", ""),
+        webhook_key=_optional("WEBHOOK_KEY", "Ondiek"),
         # Trading
         pairs=pairs,
         confidence_threshold=_float("CONFIDENCE_THRESHOLD", 0.65),
@@ -180,17 +298,17 @@ def load_config() -> Config:
         tick_flush_size=_int("TICK_FLUSH_SIZE", 500),
         # Martingale
         martingale_max_streak=_int("MARTINGALE_MAX_STREAK", 4),
-        # Webhook key (static auth sent in payload)
-        webhook_key=_optional("WEBHOOK_KEY", "Ondiek"),
-        # Reporting / notifications
+        # Reporting
         telegram_token=_optional("TELEGRAM_TOKEN", ""),
         telegram_chat_id=_optional("TELEGRAM_CHAT_ID", ""),
         discord_webhook_url=_optional("DISCORD_WEBHOOK_URL", ""),
-        # Result callback HTTP server + Quotex direct reading
-        result_callback_port=_int("RESULT_CALLBACK_PORT", 8080),
-        quotex_read_results=_bool("QUOTEX_READ_RESULTS", True),
-        # Training parameters
+        # Dashboard
+        dashboard_port=_int("DASHBOARD_PORT", 8080),
+        # Training
         backfill_years=_int("BACKFILL_YEARS", 2),
-        optimize_expiry=_bool("OPTIMIZE_EXPIRY", True),
         max_sequences=_int("MAX_SEQUENCES", 20000),
+        # Data source routing
+        use_quotex_streaming=_bool("USE_QUOTEX_STREAMING", True),
+        otc_pairs=_parse_otc_pairs(_optional("OTC_PAIRS", "")),
+        poll_interval=_float("POLL_INTERVAL", 1.0),
     )

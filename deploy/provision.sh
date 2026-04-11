@@ -18,7 +18,7 @@ set -euo pipefail
 
 # ── Configuration — ALL resources in one location ──────────────────────────────────
 RESOURCE_GROUP="rg-trader-ai"
-LOCATION="eastus"
+LOCATION="westindia"
 
 CONTAINER_NAME="traderai"
 ACI_NAME="trader-ai-engine"

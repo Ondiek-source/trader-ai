@@ -1,10 +1,11 @@
 """
 stream.py — Twelve Data WebSocket tick streaming.
 
-Connects to wss://ws.twelvedata.com/v1/quotes/price and subscribes to all
+Connects to ``wss://ws.twelvedata.com/v1/quotes/price`` and subscribes to all
 configured pairs. Each tick is:
-    - Appended to an in-memory buffer per pair (flushed to storage every N ticks)
-    - Put onto a shared queue for the signal generator to consume
+
+- Appended to an in-memory buffer per pair (flushed to storage every N ticks)
+- Put onto a shared queue for the signal generator to consume
 
 On disconnect: logs warning, waits with backoff, reconnects (infinite retry).
 Buffer is never lost on reconnect.
@@ -17,8 +18,7 @@ import json
 import logging
 import queue
 import threading
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,22 +27,27 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ── Pair format helpers ────────────────────────────────────────────────────────
-# Internal format:  EUR_USD
+# Internal format   : EUR_USD
 # Twelve Data format: EUR/USD
 
 
 def _to_td_symbol(pair: str) -> str:
-    """EUR_USD → EUR/USD"""
+    """Convert internal pair format to Twelve Data symbol (``EUR_USD`` → ``EUR/USD``)."""
     return pair.replace("_", "/")
 
 
 def _from_td_symbol(symbol: str) -> str:
-    """EUR/USD → EUR_USD"""
+    """Convert Twelve Data symbol to internal pair format (``EUR/USD`` → ``EUR_USD``)."""
     return symbol.replace("/", "_")
+
+
+# ── Tick dataclass ─────────────────────────────────────────────────────────────
 
 
 @dataclass
 class Tick:
+    """A single price update for one currency pair."""
+
     pair: str
     timestamp: datetime
     bid: float
@@ -50,6 +55,7 @@ class Tick:
     spread: float
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert to a dict suitable for DataFrame construction."""
         return {
             "pair": self.pair,
             "timestamp": self.timestamp,
@@ -59,14 +65,24 @@ class Tick:
         }
 
 
+# ── Main stream class ─────────────────────────────────────────────────────────
+
+
 class TwelveDataStream:
     """
     Streams live tick prices from Twelve Data WebSocket API.
 
     Thread model:
         - A background thread runs an asyncio event loop for the WebSocket.
-        - Ticks are buffered per pair and flushed to storage every flush_size ticks.
-        - Each tick is also placed on tick_queue for the signal generator to consume.
+        - Ticks are buffered per pair and flushed to storage every *flush_size*.
+        - Each tick is also placed on *tick_queue* for the signal generator.
+
+    Args:
+        api_key: Twelve Data API key.
+        pairs: List of internal-format pairs (``["EUR_USD", ...]``).
+        storage: :class:`~storage.StorageManager` instance for persistence.
+        flush_size: Number of ticks to buffer before auto-flush to blob.
+        tick_queue: Optional shared queue; created internally if ``None``.
     """
 
     WS_URL = "wss://ws.twelvedata.com/v1/quotes/price"
@@ -77,13 +93,13 @@ class TwelveDataStream:
         pairs: list[str],
         storage: Any,
         flush_size: int = 500,
-        tick_queue: queue.Queue | None = None,
+        tick_queue: queue.Queue[Tick] | None = None,
     ) -> None:
         self._api_key = api_key
         self._pairs = pairs
         self._storage = storage
         self._flush_size = flush_size
-        self._tick_queue: queue.Queue = tick_queue or queue.Queue(maxsize=100_000)
+        self._tick_queue: queue.Queue[Tick] = tick_queue or queue.Queue(maxsize=100_000)
 
         self._buffers: dict[str, list[dict]] = {p: [] for p in pairs}
         self._buffer_lock = threading.Lock()
@@ -92,17 +108,22 @@ class TwelveDataStream:
         self._thread: threading.Thread | None = None
         self._ticks_received = 0
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
-    def tick_queue(self) -> queue.Queue:
+    def tick_queue(self) -> queue.Queue[Tick]:
+        """Shared queue of :class:`Tick` objects for the signal generator."""
         return self._tick_queue
 
     @property
     def ticks_received(self) -> int:
+        """Total ticks received since start (across all pairs)."""
         return self._ticks_received
 
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
     def start(self) -> None:
+        """Start the background streaming thread."""
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="twelvedata-stream"
@@ -113,6 +134,7 @@ class TwelveDataStream:
         )
 
     def stop(self) -> None:
+        """Signal the stream to stop, wait for the thread, then flush remaining ticks."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
@@ -120,6 +142,7 @@ class TwelveDataStream:
         logger.info({"event": "stream_stopped"})
 
     def force_flush(self) -> None:
+        """Flush all buffered ticks to storage immediately."""
         self._flush_all()
 
     # ── Thread entry point ─────────────────────────────────────────────────────
@@ -129,12 +152,12 @@ class TwelveDataStream:
         asyncio.run(self._async_stream_loop())
 
     async def _async_stream_loop(self) -> None:
-        """Outer reconnect loop."""
+        """Outer reconnect loop — reconnects with exponential backoff."""
         reconnect_delay = 2.0
         while not self._stop_event.is_set():
             try:
                 await self._connect_and_stream()
-                reconnect_delay = 2.0
+                reconnect_delay = 2.0  # reset on clean disconnect
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
@@ -169,7 +192,6 @@ class TwelveDataStream:
         symbols = ",".join(_to_td_symbol(p) for p in self._pairs)
 
         async with _ws_connect(url) as ws:
-            # Subscribe to all pairs
             subscribe_msg = json.dumps(
                 {
                     "action": "subscribe",
@@ -184,11 +206,15 @@ class TwelveDataStream:
                     raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
                     self._handle_message(json.loads(raw))
                 except asyncio.TimeoutError:
-                    # Send ping to keep connection alive
                     await ws.ping()
 
-    def _handle_message(self, msg: dict) -> None:
-        """Process a single WebSocket message from Twelve Data."""
+    def _handle_message(self, msg: dict[str, Any]) -> None:
+        """
+        Process a single WebSocket message from Twelve Data.
+
+        Heartbeats and subscription confirmations are logged and ignored.
+        Price events are parsed into :class:`Tick` objects and ingested.
+        """
         event = msg.get("event", "")
 
         if event == "heartbeat":
@@ -198,7 +224,11 @@ class TwelveDataStream:
             return
         if event != "price":
             logger.debug(
-                {"event": "stream_unknown_msg", "type": event, "keys": list(msg.keys())}
+                {
+                    "event": "stream_unknown_msg",
+                    "type": event,
+                    "keys": list(msg.keys()),
+                }
             )
             return
 
@@ -206,12 +236,10 @@ class TwelveDataStream:
             symbol = msg.get("symbol", "")
             pair = _from_td_symbol(symbol)
 
-            # Twelve Data sends ask/bid as strings
             ask = float(msg.get("ask") or msg.get("price") or 0)
             bid = float(msg.get("bid") or ask)
             spread = round(ask - bid, 6)
 
-            # Timestamp: "2024-01-01 12:00:00" UTC or unix
             ts_raw = msg.get("timestamp")
             if ts_raw:
                 try:
@@ -226,18 +254,26 @@ class TwelveDataStream:
 
         except (KeyError, ValueError, TypeError) as exc:
             logger.warning(
-                {"event": "tick_parse_error", "error": str(exc), "raw": str(msg)[:200]}
+                {
+                    "event": "tick_parse_error",
+                    "error": str(exc),
+                    "raw": str(msg)[:200],
+                }
             )
 
     # ── Ingestion / buffering ──────────────────────────────────────────────────
 
     def _ingest_tick(self, tick: Tick) -> None:
+        """
+        Buffer a tick and optionally flush to storage.
+
+        The tick is also placed on the shared queue **outside** the lock to
+        avoid holding the buffer lock while the queue operation runs.
+        """
         with self._buffer_lock:
-            if tick.pair not in self._buffers:
-                self._buffers[tick.pair] = []
             self._buffers[tick.pair].append(tick.to_dict())
             self._ticks_received += 1
-            # Log every 100 ticks for healthcheck
+
             if self._ticks_received % 100 == 0:
                 logger.info(
                     {
@@ -250,6 +286,8 @@ class TwelveDataStream:
             if len(self._buffers[tick.pair]) >= self._flush_size:
                 self._flush_pair(tick.pair)
 
+        # Put on queue OUTSIDE the lock — avoids holding the lock if the
+        # queue is full and put_nowait raises.
         try:
             self._tick_queue.put_nowait(tick)
         except queue.Full:
@@ -258,7 +296,12 @@ class TwelveDataStream:
             )
 
     def _flush_pair(self, pair: str) -> None:
-        buf = self._buffers.get(pair, [])
+        """
+        Flush one pair's buffer to storage.
+
+        Must be called with ``_buffer_lock`` held.
+        """
+        buf = self._buffers[pair]
         if not buf:
             return
         df = pd.DataFrame(buf)
@@ -267,6 +310,7 @@ class TwelveDataStream:
         self._buffers[pair] = []
 
     def _flush_all(self) -> None:
+        """Flush every pair's buffer.  Acquires ``_buffer_lock``."""
         with self._buffer_lock:
             for pair in list(self._buffers.keys()):
                 self._flush_pair(pair)
@@ -274,7 +318,7 @@ class TwelveDataStream:
     # ── Stub fallback ──────────────────────────────────────────────────────────
 
     async def _stub_stream(self) -> None:
-        """Emit synthetic ticks when websockets library is unavailable."""
+        """Emit synthetic ticks when the websockets library is unavailable."""
         import random
 
         mid_prices = {
@@ -298,7 +342,3 @@ class TwelveDataStream:
                 )
                 self._ingest_tick(tick)
             await asyncio.sleep(0.1)
-
-
-# ── Backwards-compat alias (used in main.py) ───────────────────────────────────
-OANDAStream = TwelveDataStream

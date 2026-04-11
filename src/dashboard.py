@@ -46,6 +46,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .card-value.red { color: #f85149; }
     .card-value.yellow { color: #d29922; }
     .card-value.blue { color: #58a6ff; }
+    .card-value.gray { color: #8b949e; }
     .section-title { color: #8b949e; font-size: 0.8rem; text-transform: uppercase;
       letter-spacing: 0.08em; margin-bottom: 10px; margin-top: 8px; }
     .bar-wrap { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 4px; }
@@ -62,7 +63,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .log-entry { padding: 2px 0; border-bottom: 1px solid #21262d; }
     .log-entry.win { color: #3fb950; }
     .log-entry.loss { color: #f85149; }
+    .log-entry.draw { color: #d29922; }
     .log-entry.signal { color: #58a6ff; }
+    .log-entry.info { color: #8b949e; }
     .footer { text-align: center; color: #484f58; font-size: 0.75rem; margin-top: 24px; }
     #last-update { color: #484f58; font-size: 0.75rem; }
   </style>
@@ -84,6 +87,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <div class="card-label">Losses Today</div>
       <div class="card-value red" id="losses">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Draws Today</div>
+      <div class="card-value gray" id="draws">—</div>
     </div>
     <div class="card">
       <div class="card-label">Net Profit</div>
@@ -142,13 +149,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="section-title">Recent Activity</div>
   <div class="log" id="activity-log">
-    <div class="log-entry">Waiting for data...</div>
+    <div class="log-entry info">Waiting for data...</div>
   </div>
 
   <div class="footer">Trader AI &copy; 2024 &mdash; All signals use key: Ondiek</div>
 
 <script>
   const activity = [];
+  let lastSeenEvent = '';
+
+  function classifyEvent(text) {
+    const lower = (text || '').toLowerCase();
+    if (lower.includes('signal') || lower.includes('fired')) return 'signal';
+    if (lower.includes('win')) return 'win';
+    if (lower.includes('loss')) return 'loss';
+    if (lower.includes('draw')) return 'draw';
+    return 'info';
+  }
 
   async function refresh() {
     try {
@@ -166,6 +183,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       document.getElementById('wins').textContent = session.wins ?? '—';
       document.getElementById('losses').textContent = session.losses ?? '—';
+      document.getElementById('draws').textContent = session.draws ?? 0;
 
       const profit = session.net_profit ?? 0;
       const profitEl = document.getElementById('profit');
@@ -209,20 +227,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('quotex-balance').textContent =
         quotex.balance ? '$' + quotex.balance.toFixed(2) : '—';
 
-      // Activity log
-      const now = new Date().toLocaleTimeString();
-      if (d.last_event) {
-        const cls = d.last_event.includes('win') ? 'win' :
-                    d.last_event.includes('loss') ? 'loss' :
-                    d.last_event.includes('signal') ? 'signal' : '';
-        activity.unshift({ time: now, text: d.last_event, cls });
+      // Activity log — only append when event changes
+      const currentEvent = d.last_event || '';
+      if (currentEvent && currentEvent !== lastSeenEvent) {
+        lastSeenEvent = currentEvent;
+        const now = new Date().toLocaleTimeString();
+        const cls = classifyEvent(currentEvent);
+        activity.unshift({ time: now, text: currentEvent, cls });
         if (activity.length > 20) activity.pop();
+      }
+
+      // Always render (handles initial load + empty state)
+      if (activity.length > 0) {
         document.getElementById('activity-log').innerHTML =
           activity.map(e =>
-            `<div class="log-entry ${e.cls}">[${e.time}] ${e.text}</div>`
+            '<div class="log-entry ' + e.cls + '">[' + e.time + '] ' + e.text + '</div>'
           ).join('');
       }
 
+      const now = new Date().toLocaleTimeString();
       document.getElementById('last-update').textContent =
         'Last updated: ' + now;
 
@@ -239,6 +262,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
 # ── Status store (updated by main.py) ─────────────────────────────────────────
+
 
 class StatusStore:
     """Thread-safe store for live system status. Updated by main loop."""
@@ -257,10 +281,10 @@ class StatusStore:
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    def update(self, data: dict) -> None:
+    def update(self, data: dict[str, Any]) -> None:
         self._data.update(data)
 
-    def get(self) -> dict:
+    def get(self) -> dict[str, Any]:
         return {**self._data, "server_time": datetime.now(timezone.utc).isoformat()}
 
 
@@ -269,6 +293,7 @@ status_store = StatusStore()
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
+
 
 class _Handler(BaseHTTPRequestHandler):
 
@@ -297,12 +322,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 # ── Async runner ───────────────────────────────────────────────────────────────
 
+
 async def run_dashboard(port: int = 8080) -> None:
     """Run the HTTP dashboard in a background thread."""
     server = HTTPServer(("0.0.0.0", port), _Handler)
     thread = Thread(target=server.serve_forever, daemon=True, name="dashboard")
     thread.start()
-    logger.info({"event": "dashboard_started", "port": port, "url": f"http://0.0.0.0:{port}"})
+    logger.info(
+        {
+            "event": "dashboard_started",
+            "port": port,
+            "url": f"http://0.0.0.0:{port}",
+        }
+    )
     # Keep coroutine alive
     while True:
         await asyncio.sleep(60)

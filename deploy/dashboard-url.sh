@@ -4,8 +4,21 @@
 
 set -euo pipefail
 
-CONTAINER_NAME="trader-ai-engine"
-RESOURCE_GROUP="rg-trader-ai"
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+AZURE_ENV="$SCRIPT_DIR/azure.env"
+APP_ENV="$PROJECT_ROOT/.env"
+
+# Load environment variables
+if [[ -f "$AZURE_ENV" ]]; then
+  export $(cat "$AZURE_ENV" | xargs)
+fi
+
+if [[ -f "$APP_ENV" ]]; then
+  export $(cat "$APP_ENV" | xargs)
+fi
 
 IP=$(az container show \
   --name "$CONTAINER_NAME" \
@@ -19,3 +32,4 @@ if [[ -z "$IP" ]]; then
 fi
 
 echo "http://${IP}:8080"
+echo "http://${DNS_FQDN}:${CONTAINER_PORT}"

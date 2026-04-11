@@ -8,7 +8,7 @@ Model candidates:
     - LSTM          (PyTorch, sequence model on last 30 bars)
     - Transformer   (PyTorch, lightweight encoder on last 30 bars)
 
-Per-indicator confidence: each of the 10 indicators in features.py has its
+Per-indicator confidence: each indicator in features.py has its
 historical accuracy tracked; the highest-confidence indicator+model combo wins.
 
 Martingale awareness:
@@ -25,8 +25,6 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -70,7 +68,8 @@ logger = logging.getLogger(__name__)
 
 SEQ_LEN = 30  # lookback bars for LSTM / Transformer
 EXPIRY_OPTIONS = [60, 120, 300]
-MIN_TRAIN_BARS = 5_000  # minimum 1-min bars needed for meaningful training (~3.5 days)
+MIN_TRAIN_BARS = 5_000
+MAX_RF_ROWS = 100_000
 
 
 # ── Expiry Optimizer ──────────────────────────────────────────────────────────
@@ -86,15 +85,19 @@ class ExpiryOptimizer:
     """
 
     def __init__(self) -> None:
-        # {pair: {expiry_seconds: win_rate}}
         self._results: dict[str, dict[int, float]] = {}
-        # {pair: best_expiry_seconds}
         self._best: dict[str, int] = {}
 
     def optimize(self, pair: str, tick_df: pd.DataFrame) -> dict[str, Any]:
         """
         Test all expiry options against tick_df using a fast RandomForest.
-        Returns {expiry_seconds: win_rate, best_expiry: int}.
+
+        Args:
+            pair: Internal pair name.
+            tick_df: Raw tick DataFrame.
+
+        Returns:
+            Dict with ``best_expiry`` and ``results`` mapping.
         """
         results: dict[int, float] = {}
         for expiry in EXPIRY_OPTIONS:
@@ -111,12 +114,9 @@ class ExpiryOptimizer:
                 X = df[available].values
                 y = df["label"].values
 
-                # Simple time-series cross-validation (no leakage)
                 split = int(len(X) * 0.75)
                 X_tr, X_te = X[:split], X[split:]
                 y_tr, y_te = y[:split], y[split:]
-
-                from sklearn.preprocessing import StandardScaler
 
                 scaler = StandardScaler()
                 X_tr = scaler.fit_transform(X_tr)
@@ -127,13 +127,15 @@ class ExpiryOptimizer:
                 )
                 rf.fit(X_tr, y_tr)
                 proba = rf.predict_proba(X_te)[:, 1]
-                # Only count "confident" predictions (≥ 0.60) to simulate real signal filter
+
+                # Only count "confident" predictions to simulate real signal filter
                 confident_mask = (proba >= 0.60) | (proba <= 0.40)
                 if confident_mask.sum() < 20:
                     win_rate = accuracy_score(y_te, (proba >= 0.5).astype(int))
                 else:
                     win_rate = accuracy_score(
-                        y_te[confident_mask], (proba[confident_mask] >= 0.5).astype(int)
+                        y_te[confident_mask],
+                        (proba[confident_mask] >= 0.5).astype(int),
                     )
 
                 results[expiry] = round(float(win_rate), 4)
@@ -148,7 +150,11 @@ class ExpiryOptimizer:
 
             except Exception as exc:
                 logger.warning(
-                    {"event": "expiry_test_failed", "expiry": expiry, "error": str(exc)}
+                    {
+                        "event": "expiry_test_failed",
+                        "expiry": expiry,
+                        "error": str(exc),
+                    }
                 )
 
         self._results[pair] = results
@@ -169,9 +175,11 @@ class ExpiryOptimizer:
         return {"best_expiry": 60, "results": {}}
 
     def best_expiry(self, pair: str, default: int = 60) -> int:
+        """Return the best expiry for *pair*, or *default* if not optimized."""
         return self._best.get(pair, default)
 
-    def summary(self) -> dict:
+    def summary(self) -> dict[str, Any]:
+        """Return all optimization results."""
         return {
             "best_expiries": self._best,
             "all_results": self._results,
@@ -206,7 +214,16 @@ class RegimeDetector:
     }
 
     def detect(self, feature_row: pd.Series) -> str:
-        """Classify the current bar into a market regime."""
+        """
+        Classify the current bar into a market regime.
+
+        Args:
+            feature_row: Series with feature values for one bar.
+
+        Returns:
+            One of ``"trending_up"``, ``"trending_down"``, ``"ranging"``,
+            or ``"volatile"``.
+        """
         try:
             atr_pct = float(feature_row.get("atr_pct") or 0.001)
             momentum = float(feature_row.get("momentum") or 0.0)
@@ -214,24 +231,21 @@ class RegimeDetector:
             ema_cross = float(feature_row.get("ema_cross") or 0.0)
             rsi = float(feature_row.get("rsi") or 50.0)
 
-            # Volatile: wide ATR relative to price
             if atr_pct > 0.003:
                 return "volatile"
 
-            # Trending: strong EMA alignment + momentum
             if abs(ema_cross) > 0.5 and abs(momentum) > 0.0003:
                 return "trending_up" if momentum > 0 else "trending_down"
 
-            # Ranging: tight Bollinger Band, RSI near midline
             if bb_bw < 0.005 or (40 <= rsi <= 60):
                 return "ranging"
 
-            # Default: trending
             return "trending_up" if momentum >= 0 else "trending_down"
         except Exception:
             return "ranging"
 
     def preferred_indicators(self, regime: str) -> list[str]:
+        """Return indicators most predictive in the given regime."""
         return self.REGIME_INDICATOR_AFFINITY.get(
             regime, list(get_indicator_feature_groups().keys())
         )
@@ -245,7 +259,7 @@ class MartingaleTracker:
     Tracks consecutive losses and progressively raises the confidence threshold.
 
     Threshold formula:
-        current = base_threshold + (streak × step_size), capped at max_threshold.
+        ``current = base_threshold + (streak × step_size)``, capped at max_threshold.
 
     A win OR reaching max_streak resets the streak to 0.
     """
@@ -264,6 +278,12 @@ class MartingaleTracker:
         self._streak: int = 0
 
     def record_result(self, win: bool) -> None:
+        """
+        Update the streak based on a trade result.
+
+        Args:
+            win: ``True`` if the trade was profitable.
+        """
         if win:
             logger.info({"event": "martingale_win", "streak_reset_from": self._streak})
             self._streak = 0
@@ -289,67 +309,77 @@ class MartingaleTracker:
 
     @property
     def current_threshold(self) -> float:
+        """Current confidence threshold (increases with losses)."""
         return min(self._base + self._streak * self._step, self._max)
 
     @property
     def current_streak(self) -> int:
+        """Current consecutive loss count."""
         return self._streak
 
     def reset(self) -> None:
+        """Reset streak to zero."""
         self._streak = 0
 
 
 # ── PyTorch models ────────────────────────────────────────────────────────────
 
-_NNBase: type = nn.Module if TORCH_AVAILABLE else object  # type: ignore[assignment]
 
+if TORCH_AVAILABLE:
 
-class _LSTMModel(_NNBase):  # type: ignore[misc]
-    def __init__(
-        self, n_features: int, hidden: int = 64, layers: int = 2, dropout: float = 0.2
-    ):
-        if not TORCH_AVAILABLE:
-            raise ImportError("PyTorch not available")
-        super().__init__()
-        self.lstm = nn.LSTM(
-            n_features, hidden, num_layers=layers, batch_first=True, dropout=dropout
-        )
-        self.fc = nn.Linear(hidden, 1)
-        self.sigmoid = nn.Sigmoid()
+    class _LSTMModel(nn.Module):
+        """Bidirectional-free LSTM binary classifier."""
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.sigmoid(self.fc(out[:, -1, :])).squeeze(1)
+        def __init__(
+            self,
+            n_features: int,
+            hidden: int = 64,
+            layers: int = 2,
+            dropout: float = 0.2,
+        ) -> None:
+            super().__init__()
+            self.lstm = nn.LSTM(
+                n_features,
+                hidden,
+                num_layers=layers,
+                batch_first=True,
+                dropout=dropout,
+            )
+            self.fc = nn.Linear(hidden, 1)
+            self.sigmoid = nn.Sigmoid()
 
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            out, _ = self.lstm(x)
+            return self.sigmoid(self.fc(out[:, -1, :])).squeeze(1)
 
-class _TransformerModel(_NNBase):  # type: ignore[misc]
-    def __init__(
-        self,
-        n_features: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        layers: int = 2,
-        dropout: float = 0.1,
-    ):
-        if not TORCH_AVAILABLE:
-            raise ImportError("PyTorch not available")
-        super().__init__()
-        self.input_proj = nn.Linear(n_features, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
-        self.fc = nn.Linear(d_model, 1)
-        self.sigmoid = nn.Sigmoid()
+    class _TransformerModel(nn.Module):
+        """Lightweight Transformer encoder binary classifier."""
 
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.encoder(x)
-        return self.sigmoid(self.fc(x[:, -1, :])).squeeze(1)
+        def __init__(
+            self,
+            n_features: int,
+            d_model: int = 64,
+            nhead: int = 4,
+            layers: int = 2,
+            dropout: float = 0.1,
+        ) -> None:
+            super().__init__()
+            self.input_proj = nn.Linear(n_features, d_model)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=d_model * 4,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+            self.fc = nn.Linear(d_model, 1)
+            self.sigmoid = nn.Sigmoid()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+            x = self.input_proj(x)
+            x = self.encoder(x)
+            return self.sigmoid(self.fc(x[:, -1, :])).squeeze(1)
 
 
 def _train_pytorch_model(
@@ -360,7 +390,20 @@ def _train_pytorch_model(
     lr: float = 1e-3,
     patience: int = 5,
 ) -> Any:
-    """Train an LSTM or Transformer model with early stopping."""
+    """
+    Train a PyTorch sequence model with early stopping.
+
+    Args:
+        model: An ``nn.Module`` instance.
+        X_seq: Shape ``(n, seq_len, n_features)``.
+        y: Shape ``(n,)`` binary labels.
+        epochs: Max training epochs.
+        lr: Learning rate.
+        patience: Early stopping patience.
+
+    Returns:
+        The trained model (with best weights restored).
+    """
     device = torch.device("cpu")
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -374,7 +417,7 @@ def _train_pytorch_model(
     y_val = torch.tensor(y[split:], dtype=torch.float32).to(device)
 
     best_val_loss = float("inf")
-    best_state = None
+    best_state: dict[str, Any] | None = None
     no_improve = 0
 
     for epoch in range(epochs):
@@ -397,6 +440,13 @@ def _train_pytorch_model(
         else:
             no_improve += 1
             if no_improve >= patience:
+                logger.debug(
+                    {
+                        "event": "early_stopping",
+                        "epoch": epoch,
+                        "val_loss": round(val_loss, 6),
+                    }
+                )
                 break
 
     if best_state:
@@ -405,12 +455,64 @@ def _train_pytorch_model(
 
 
 def _make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
-    """Convert (n, n_features) → (n - seq_len + 1, seq_len, n_features)."""
+    """
+    Convert ``(n, n_features)`` to ``(n - seq_len + 1, seq_len, n_features)``.
+
+    Args:
+        X: Feature matrix.
+        seq_len: Lookback window length.
+
+    Returns:
+        3D array of sequences, or empty array if *n < seq_len*.
+    """
     n = len(X)
     if n < seq_len:
         return np.empty((0, seq_len, X.shape[1]))
-    seqs = np.stack([X[i : i + seq_len] for i in range(n - seq_len + 1)])
-    return seqs
+    return np.stack([X[i : i + seq_len] for i in range(n - seq_len + 1)])
+
+
+def _predict_sequence_model(
+    model: Any,
+    feature_row_scaled: np.ndarray,
+    n_features: int,
+    model_name: str,
+) -> float | None:
+    """
+    Run a single-row prediction through a sequence model.
+
+    Since sequence models need history, we replicate the current bar
+    across the full sequence length.  This is a known approximation —
+    for true sequence inference, the caller should pass the last
+    SEQ_LEN bars.
+
+    Args:
+        model: Trained LSTM or Transformer.
+        feature_row_scaled: Shape ``(1, n_features)`` — one scaled row.
+        n_features: Number of input features.
+        model_name: ``"lstm"`` or ``"transformer"`` (for logging).
+
+    Returns:
+        Probability of class 1, or ``None`` on error.
+    """
+    try:
+        # Repeat the single row across SEQ_LEN timesteps
+        seq = np.tile(feature_row_scaled, (SEQ_LEN, 1))  # (SEQ_LEN, n_features)
+        seq_tensor = torch.tensor(seq, dtype=torch.float32).unsqueeze(
+            0
+        )  # (1, SEQ_LEN, n_features)
+        model.eval()
+        with torch.no_grad():
+            prob = float(model(seq_tensor).item())
+        return prob
+    except Exception as exc:
+        logger.debug(
+            {
+                "event": "sequence_predict_error",
+                "model": model_name,
+                "error": str(exc),
+            }
+        )
+        return None
 
 
 # ── Walk-forward validation ───────────────────────────────────────────────────
@@ -419,14 +521,27 @@ def _make_sequences(X: np.ndarray, seq_len: int) -> np.ndarray:
 def walk_forward_evaluate(
     feature_df: pd.DataFrame,
     model_name: str,
-    build_model_fn,
+    build_model_fn: Any,
     feature_cols: list[str],
     step_days: int = 30,
     min_train_rows: int = 500,
 ) -> dict[str, float]:
     """
     Walk-forward validation with expanding training window.
-    Returns mean metrics across all folds.
+
+    Only works with sklearn-compatible models (those with ``fit`` and
+    ``predict_proba``).
+
+    Args:
+        feature_df: Full feature DataFrame sorted by time.
+        model_name: Name for logging.
+        build_model_fn: Callable returning an unfitted model.
+        feature_cols: Feature column names.
+        step_days: Days per test fold.
+        min_train_rows: Minimum training rows before first fold.
+
+    Returns:
+        Mean metrics across folds, or empty dict on failure.
     """
     df = feature_df.dropna(subset=["label"] + feature_cols).copy()
     df = df.sort_values("timestamp").reset_index(drop=True)
@@ -434,12 +549,12 @@ def walk_forward_evaluate(
     total = len(df)
     initial_train = int(total * 0.7)
 
-    fold_metrics: list[dict] = []
+    fold_metrics: list[dict[str, float]] = []
     train_end = initial_train
 
     while train_end + min_train_rows // 5 < total:
         train_df = df.iloc[:train_end]
-        test_end = min(train_end + step_days * 24 * 60, total)  # ~30 days of 1-min bars
+        test_end = min(train_end + step_days * 24 * 60, total)
         test_df = df.iloc[train_end:test_end]
 
         if len(train_df) < min_train_rows or len(test_df) < 20:
@@ -451,30 +566,39 @@ def walk_forward_evaluate(
         y_test = test_df["label"].to_numpy(dtype=np.float64)
 
         try:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+
             mdl = build_model_fn()
-            if hasattr(mdl, "fit"):
-                mdl.fit(X_train, y_train)
+            mdl.fit(X_train, y_train)
             proba = mdl.predict_proba(X_test)[:, 1]
             preds = (proba >= 0.5).astype(int)
 
             fold_metrics.append(
                 {
-                    "accuracy": accuracy_score(y_test, preds),
-                    "precision": precision_score(y_test, preds, zero_division=0),
-                    "recall": recall_score(y_test, preds, zero_division=0),
-                    "f1": f1_score(y_test, preds, zero_division=0),
-                    "brier": brier_score_loss(y_test, proba),
+                    "accuracy": float(accuracy_score(y_test, preds)),
+                    "precision": float(precision_score(y_test, preds, zero_division=0)),
+                    "recall": float(recall_score(y_test, preds, zero_division=0)),
+                    "f1": float(f1_score(y_test, preds, zero_division=0)),
+                    "brier": float(brier_score_loss(y_test, proba)),
                 }
             )
+
         except Exception as exc:
             logger.warning(
-                {"event": "wf_fold_failed", "model": model_name, "error": str(exc)}
+                {
+                    "event": "wf_fold_failed",
+                    "model": model_name,
+                    "error": str(exc),
+                }
             )
 
         train_end = test_end
 
     if not fold_metrics:
         return {}
+
     means = {k: float(np.mean([m[k] for m in fold_metrics])) for k in fold_metrics[0]}
     logger.info(
         {
@@ -493,23 +617,34 @@ def walk_forward_evaluate(
 class IndicatorAccuracyTracker:
     """
     Tracks historical prediction accuracy per indicator.
-    Uses a decaying moving average (alpha=0.05) to weight recent results more.
+
+    Uses a decaying moving average (alpha=0.05) to weight recent results
+    more heavily.
     """
 
     def __init__(self, indicator_names: list[str]) -> None:
         self._accuracy: dict[str, float] = {name: 0.55 for name in indicator_names}
-        self._alpha = 0.05  # EMA decay
+        self._alpha = 0.05
 
     def update(self, indicator: str, correct: bool) -> None:
+        """
+        Update the accuracy weight for *indicator*.
+
+        Args:
+            indicator: Indicator name.
+            correct: Whether the indicator's signal was correct.
+        """
         current = self._accuracy.get(indicator, 0.55)
         self._accuracy[indicator] = (
             current * (1 - self._alpha) + float(correct) * self._alpha
         )
 
     def get_confidence_weight(self, indicator: str) -> float:
+        """Return the current accuracy weight for *indicator*."""
         return self._accuracy.get(indicator, 0.55)
 
     def all_weights(self) -> dict[str, float]:
+        """Return all indicator accuracy weights."""
         return dict(self._accuracy)
 
 
@@ -520,13 +655,14 @@ class ModelManager:
     """
     Trains, evaluates, and serves predictions from multiple ML models.
 
-    Usage:
+    Usage::
+
         mgr = ModelManager(config, martingale_tracker)
         mgr.train(pair, expiry_seconds, feature_df)
         signal = mgr.predict(pair, expiry_seconds, feature_row)
     """
 
-    def __init__(self, config, martingale_tracker: MartingaleTracker) -> None:
+    def __init__(self, config: Any, martingale_tracker: MartingaleTracker) -> None:
         self._config = config
         self._mt = martingale_tracker
         self._feature_cols = get_feature_columns()
@@ -539,20 +675,19 @@ class ModelManager:
         self._metrics: dict[str, dict[int, dict[str, dict]]] = {}
         self._indicator_tracker: dict[str, IndicatorAccuracyTracker] = {}
 
-        # Regime detector (shared, stateless)
         self._regime_detector = RegimeDetector()
-
-        # Expiry optimizer (per pair)
         self._expiry_optimizer = ExpiryOptimizer()
 
-        # Track rows added since last retrain per pair
+        # Retrain tracking
         self._result_counts: dict[str, int] = {}
         self._last_train_counts: dict[str, int] = {}
         self._retrain_threshold = 500
 
-        # Prediction audit log (last N predictions per pair for analysis)
+        # Prediction audit log (rolling window per pair)
         self._prediction_log: dict[str, list[dict]] = {}
         self._max_log_size = 1000
+
+    # ── Training ──────────────────────────────────────────────────────────────
 
     def train(
         self,
@@ -560,21 +695,24 @@ class ModelManager:
         expiry_seconds: int,
         feature_df: pd.DataFrame,
         feature_df_recent: pd.DataFrame | None = None,
-    ) -> dict:
+    ) -> dict[str, dict]:
         """
-        Train all model candidates on feature_df. Run walk-forward validation.
-        Returns dict of metrics per model.
+        Train all model candidates on *feature_df*.  Run walk-forward
+        validation for sklearn models.
+
+        Args:
+            pair: Internal pair name.
+            expiry_seconds: Option expiry in seconds.
+            feature_df: Full feature DataFrame for tree models.
+            feature_df_recent: Optional recent data for sequence models
+                (LSTM/Transformer).
+
+        Returns:
+            Dict of walk-forward metrics per model name.
         """
         df = feature_df.dropna(subset=["label"] + self._feature_cols).copy()
         df = df.sort_values("timestamp").reset_index(drop=True)
-        logger.info(
-            {
-                "event": "debug_train_start",
-                "pair": pair,
-                "rows": len(df),
-                "features": len(self._feature_cols),
-            }
-        )
+
         if len(df) < 200:
             logger.warning(
                 {
@@ -588,7 +726,6 @@ class ModelManager:
         X = df[self._feature_cols].to_numpy(dtype=np.float64)
         y = df["label"].to_numpy(dtype=np.float64)
 
-        # Fit scaler on training data
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
         self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
@@ -596,7 +733,7 @@ class ModelManager:
         trained: dict[str, Any] = {}
         wf_metrics: dict[str, dict] = {}
 
-        # ── LightGBM ──────────────────────────────────────────────────────────
+        # ── LightGBM ──────────────────────────────────────────────────────
         if LGBM_AVAILABLE:
             try:
                 lgbm_model = lgb.LGBMClassifier(
@@ -622,11 +759,10 @@ class ModelManager:
                     ),
                     self._feature_cols,
                 )
-
             except Exception as exc:
                 logger.warning({"event": "lgbm_train_failed", "error": str(exc)})
 
-        # ── XGBoost ───────────────────────────────────────────────────────────
+        # ── XGBoost ───────────────────────────────────────────────────────
         if XGB_AVAILABLE:
             try:
                 xgb_model = xgb.XGBClassifier(
@@ -654,23 +790,12 @@ class ModelManager:
                     ),
                     self._feature_cols,
                 )
-
             except Exception as exc:
                 logger.warning({"event": "xgb_train_failed", "error": str(exc)})
 
-        # ── RandomForest (use subset of data to save memory) ───────────────────────────
-        logger.info(
-            {
-                "event": "debug_randomforest_start",
-                "pair": pair,
-                "X_shape": X_scaled.shape,
-            }
-        )
-
-        # Use only last 100k rows for RandomForest (saves memory)
-        MAX_RF_ROWS = 100000
+        # ── RandomForest (subset for memory) ──────────────────────────────
         if len(df) > MAX_RF_ROWS:
-            df_rf = df.tail(MAX_RF_ROWS).copy()  # Use most recent data
+            df_rf = df.tail(MAX_RF_ROWS).copy()
             logger.info(
                 {
                     "event": "randomforest_subset",
@@ -683,26 +808,18 @@ class ModelManager:
 
         try:
             rf_model = RandomForestClassifier(
-                n_estimators=100,  # Reduced from 200
-                max_depth=6,
-                random_state=42,
-                n_jobs=2,
+                n_estimators=100, max_depth=6, random_state=42, n_jobs=2
             )
-
-            # Prepare data for RandomForest
             X_rf = df_rf[self._feature_cols].to_numpy(dtype=np.float64)
             y_rf = df_rf["label"].to_numpy(dtype=np.float64)
 
-            # Scale using the same scaler
-            scaler_rf = StandardScaler()
-            X_rf_scaled = scaler_rf.fit_transform(X_rf)
+            # Use the SAME scaler fitted on full data — not a new one
+            X_rf_scaled = scaler.transform(X_rf)
 
             rf_model.fit(X_rf_scaled, y_rf)
             trained["randomforest"] = rf_model
-
-            # Run walk-forward validation on the subset (not full 500k rows)
             wf_metrics["randomforest"] = walk_forward_evaluate(
-                df_rf,  # Use subset for validation
+                df_rf,
                 "randomforest",
                 lambda: RandomForestClassifier(
                     n_estimators=100, max_depth=6, random_state=42
@@ -712,336 +829,140 @@ class ModelManager:
             logger.info(
                 {"event": "randomforest_trained", "pair": pair, "rows_used": len(df_rf)}
             )
-
         except Exception as exc:
             logger.warning({"event": "rf_train_failed", "error": str(exc)})
-        logger.info({"event": "debug_randomforest_complete", "pair": pair})
 
-        logger.info(
-            {
-                "event": "debug_lstm_check",
-                "pair": pair,
-                "torch_available": TORCH_AVAILABLE,
-                "has_recent_data": feature_df_recent is not None,
-            }
-        )
-
-        # ── LSTM (use recent data only) ──────────────────────────────────────
-        logger.info(
-            {
-                "event": "lstm_debug_start",
-                "pair": pair,
-                "torch_available": TORCH_AVAILABLE,
-                "has_recent_data": feature_df_recent is not None,
-            }
-        )
-
+        # ── Sequence models (LSTM + Transformer) ──────────────────────────
         if (
             TORCH_AVAILABLE
             and feature_df_recent is not None
             and not feature_df_recent.empty
         ):
-            logger.info({"event": "lstm_debug_processing_recent", "pair": pair})
-
-            # Use recent data for sequence models
-            df_recent = feature_df_recent.dropna(
-                subset=["label"] + self._feature_cols
-            ).copy()
-            logger.info(
-                {
-                    "event": "lstm_debug_recent_shape",
-                    "pair": pair,
-                    "rows": len(df_recent),
-                    "cols": len(self._feature_cols),
-                }
+            seq_result = self._train_sequence_models(
+                pair=pair,
+                feature_df_recent=feature_df_recent,
+                scaler=scaler,
             )
-            MAX_LSTM_SEQUENCES = self._max_sequences
-            logger.info(
-                {
-                    "event": "lstm_debug_max_sequences",
-                    "value": MAX_LSTM_SEQUENCES,
-                    "seq_len": SEQ_LEN,
-                }
-            )
-            original_rows = len(df_recent)
-            if len(df_recent) >= MAX_LSTM_SEQUENCES + SEQ_LEN:
-                df_recent = df_recent.tail(MAX_LSTM_SEQUENCES + SEQ_LEN)
-                logger.info(
-                    {
-                        "event": "lstm_sequences_capped",
-                        "original": original_rows,
-                        "capped": len(df_recent),
-                    }
-                )
-
-            if len(df_recent) >= SEQ_LEN + 50:
-                try:
-                    X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
-                    y_recent = df_recent["label"].to_numpy(dtype=np.float64)
-                    logger.info(
-                        {
-                            "event": "lstm_debug_X_shape",
-                            "pair": pair,
-                            "shape": X_recent.shape,
-                        }
-                    )
-
-                    # Scale using the same scaler as full data
-                    scaler = self._scalers.get(pair, {}).get(expiry_seconds)
-                    if scaler is None:
-                        logger.info(
-                            {"event": "lstm_debug_creating_scaler", "pair": pair}
-                        )
-                        scaler = StandardScaler()
-                        X_recent_scaled = scaler.fit_transform(X_recent)
-                        self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
-                    else:
-                        logger.info(
-                            {"event": "lstm_debug_using_existing_scaler", "pair": pair}
-                        )
-                        X_recent_scaled = scaler.transform(X_recent)
-
-                    logger.info({"event": "lstm_debug_making_sequences", "pair": pair})
-                    X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
-                    y_seq = y_recent[SEQ_LEN - 1 :]
-                    logger.info(
-                        {
-                            "event": "lstm_debug_sequences_shape",
-                            "pair": pair,
-                            "X_seq_shape": X_seq.shape,
-                        }
-                    )
-
-                    if len(X_seq) > 0:
-                        logger.info(
-                            {"event": "lstm_debug_creating_model", "pair": pair}
-                        )
-                        lstm = _LSTMModel(n_features=len(self._feature_cols))
-
-                        logger.info(
-                            {
-                                "event": "lstm_debug_training_start",
-                                "pair": pair,
-                                "sequences": len(X_seq),
-                            }
-                        )
-                        lstm = _train_pytorch_model(lstm, X_seq, y_seq, epochs=10)
-
-                        trained["lstm"] = lstm
-                        logger.info(
-                            {
-                                "event": "lstm_trained",
-                                "pair": pair,
-                                "sequences": len(X_seq),
-                            }
-                        )
-
-                    else:
-                        logger.warning(
-                            {"event": "lstm_debug_no_sequences", "pair": pair}
-                        )
-                except Exception as exc:
-                    logger.error(
-                        {
-                            "event": "lstm_train_failed",
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                        }
-                    )
-            else:
-                logger.warning(
-                    {
-                        "event": "lstm_debug_insufficient_data",
-                        "pair": pair,
-                        "rows": len(df_recent),
-                        "required": SEQ_LEN + 50,
-                    }
-                )
-        else:
-            logger.info(
-                {
-                    "event": "lstm_debug_skipped",
-                    "pair": pair,
-                    "reason": "condition not met",
-                }
-            )
-
-        # ── Transformer (use recent data only) ───────────────────────────────
-        logger.info(
-            {
-                "event": "transformer_debug_start",
-                "pair": pair,
-                "torch_available": TORCH_AVAILABLE,
-                "has_recent_data": feature_df_recent is not None,
-            }
-        )
-
-        if (
-            TORCH_AVAILABLE
-            and feature_df_recent is not None
-            and not feature_df_recent.empty
-        ):
-            logger.info({"event": "transformer_debug_processing_recent", "pair": pair})
-
-            # Use recent data for sequence models
-            df_recent = feature_df_recent.dropna(
-                subset=["label"] + self._feature_cols
-            ).copy()
-
-            # Cap the number of sequences
-            MAX_TRANSFORMER_SEQUENCES = self._max_sequences
-            logger.info(
-                {
-                    "event": "transformer_debug_max_sequences",
-                    "value": MAX_TRANSFORMER_SEQUENCES,
-                    "seq_len": SEQ_LEN,
-                }
-            )
-            original_rows = len(df_recent)
-            if len(df_recent) >= MAX_TRANSFORMER_SEQUENCES + SEQ_LEN:
-                df_recent = df_recent.tail(MAX_TRANSFORMER_SEQUENCES + SEQ_LEN)
-                logger.info(
-                    {
-                        "event": "transformer_sequences_capped",
-                        "original": original_rows,
-                        "capped": len(df_recent),
-                    }
-                )
-
-            if len(df_recent) >= SEQ_LEN + 50:
-                try:
-                    X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
-                    y_recent = df_recent["label"].to_numpy(dtype=np.float64)
-                    logger.info(
-                        {
-                            "event": "transformer_debug_X_shape",
-                            "pair": pair,
-                            "shape": X_recent.shape,
-                        }
-                    )
-
-                    # Scale using the same scaler as full data
-                    scaler = self._scalers.get(pair, {}).get(expiry_seconds)
-                    if scaler is None:
-                        logger.info(
-                            {"event": "transformer_debug_creating_scaler", "pair": pair}
-                        )
-                        scaler = StandardScaler()
-                        X_recent_scaled = scaler.fit_transform(X_recent)
-                        self._scalers.setdefault(pair, {})[expiry_seconds] = scaler
-                    else:
-                        logger.info(
-                            {
-                                "event": "transformer_debug_using_existing_scaler",
-                                "pair": pair,
-                            }
-                        )
-                        X_recent_scaled = scaler.transform(X_recent)
-
-                    logger.info(
-                        {"event": "transformer_debug_making_sequences", "pair": pair}
-                    )
-                    X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
-                    y_seq = y_recent[SEQ_LEN - 1 :]
-                    logger.info(
-                        {
-                            "event": "transformer_debug_sequences_shape",
-                            "pair": pair,
-                            "X_seq_shape": X_seq.shape,
-                        }
-                    )
-
-                    if len(X_seq) > 0:
-                        logger.info(
-                            {"event": "transformer_debug_creating_model", "pair": pair}
-                        )
-                        transformer = _TransformerModel(
-                            n_features=len(self._feature_cols)
-                        )
-
-                        logger.info(
-                            {
-                                "event": "transformer_debug_training_start",
-                                "pair": pair,
-                                "sequences": len(X_seq),
-                            }
-                        )
-                        transformer = _train_pytorch_model(
-                            transformer, X_seq, y_seq, epochs=10
-                        )
-
-                        trained["transformer"] = transformer
-                        logger.info(
-                            {
-                                "event": "transformer_trained",
-                                "pair": pair,
-                                "sequences": len(X_seq),
-                            }
-                        )
-
-                    else:
-                        logger.warning(
-                            {"event": "transformer_debug_no_sequences", "pair": pair}
-                        )
-                except Exception as exc:
-                    logger.error(
-                        {
-                            "event": "transformer_train_failed",
-                            "error": str(exc),
-                            "error_type": type(exc).__name__,
-                        }
-                    )
-            else:
-                logger.warning(
-                    {
-                        "event": "transformer_debug_insufficient_data",
-                        "pair": pair,
-                        "rows": len(df_recent),
-                        "required": SEQ_LEN + 50,
-                    }
-                )
-        else:
-            logger.info(
-                {
-                    "event": "transformer_debug_skipped",
-                    "pair": pair,
-                    "reason": "condition not met",
-                }
-            )
+            trained.update(seq_result)
 
         self._models.setdefault(pair, {})[expiry_seconds] = trained
         self._metrics.setdefault(pair, {})[expiry_seconds] = wf_metrics
 
-        # Initialize indicator tracker
         if pair not in self._indicator_tracker:
             self._indicator_tracker[pair] = IndicatorAccuracyTracker(
                 list(self._indicator_groups.keys())
             )
 
         self._last_train_counts[pair] = self._result_counts.get(pair, 0)
+
         logger.info(
             {
                 "event": "training_complete",
                 "pair": pair,
                 "expiry_seconds": expiry_seconds,
                 "models_trained": list(trained.keys()),
-                "metrics": {m: v.get("accuracy") for m, v in wf_metrics.items()},
+                "wf_metrics": {m: v.get("accuracy") for m, v in wf_metrics.items()},
             }
-        )
-        logger.info(
-            {"event": "models_trained_count", "pair": pair, "count": len(trained)}
         )
         return wf_metrics
 
+    def _train_sequence_models(
+        self,
+        pair: str,
+        feature_df_recent: pd.DataFrame,
+        scaler: StandardScaler,
+    ) -> dict[str, Any]:
+        """
+        Train LSTM and Transformer on recent feature data.
+
+        Args:
+            pair: Internal pair name.
+            feature_df_recent: Recent feature DataFrame.
+            scaler: Already-fitted StandardScaler.
+
+        Returns:
+            Dict mapping model name to trained model.
+        """
+        df_recent = feature_df_recent.dropna(
+            subset=["label"] + self._feature_cols
+        ).copy()
+
+        # Cap sequences to prevent OOM
+        max_rows = self._max_sequences + SEQ_LEN
+        if len(df_recent) > max_rows:
+            df_recent = df_recent.tail(max_rows)
+            logger.info(
+                {"event": "sequence_data_capped", "pair": pair, "rows": len(df_recent)}
+            )
+
+        if len(df_recent) < SEQ_LEN + 50:
+            logger.warning(
+                {
+                    "event": "insufficient_data_for_sequences",
+                    "pair": pair,
+                    "rows": len(df_recent),
+                    "required": SEQ_LEN + 50,
+                }
+            )
+            return {}
+
+        X_recent = df_recent[self._feature_cols].to_numpy(dtype=np.float64)
+        y_recent = df_recent["label"].to_numpy(dtype=np.float64)
+        X_recent_scaled = scaler.transform(X_recent)
+        X_seq = _make_sequences(X_recent_scaled, SEQ_LEN)
+        y_seq = y_recent[SEQ_LEN - 1 :]
+
+        if len(X_seq) == 0:
+            logger.warning({"event": "no_sequences_produced", "pair": pair})
+            return {}
+
+        n_features = len(self._feature_cols)
+        trained: dict[str, Any] = {}
+
+        for model_name, model_cls in [
+            ("lstm", _LSTMModel),
+            ("transformer", _TransformerModel),
+        ]:
+            try:
+                model = model_cls(n_features=n_features)
+                model = _train_pytorch_model(model, X_seq, y_seq, epochs=10)
+                trained[model_name] = model
+                logger.info(
+                    {
+                        "event": f"{model_name}_trained",
+                        "pair": pair,
+                        "sequences": len(X_seq),
+                    }
+                )
+            except Exception as exc:
+                logger.error(
+                    {
+                        "event": f"{model_name}_train_failed",
+                        "pair": pair,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+
+        return trained
+
+    # ── Prediction ────────────────────────────────────────────────────────────
+
     def predict(
         self, pair: str, expiry_seconds: int, feature_row: pd.Series
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """
-        Generate a signal for (pair, expiry_seconds) using the best available model.
+        Generate a signal for *(pair, expiry_seconds)* using the best
+        available model.
 
-        Returns None if:
-            - No models trained for this pair/expiry
-            - Best confidence < martingale_tracker.current_threshold
+        Args:
+            pair: Internal pair name.
+            expiry_seconds: Option expiry.
+            feature_row: Single-row Series of feature values.
+
+        Returns:
+            Signal dict, or ``None`` if no models are available.
+            The confidence threshold check is delegated to the orchestrator.
         """
         models = self._models.get(pair, {}).get(expiry_seconds)
         if not models:
@@ -1051,7 +972,6 @@ class ModelManager:
         if scaler is None:
             return None
 
-        # Align feature row to expected columns
         feat = (
             feature_row.reindex(self._feature_cols)
             .fillna(0.0)
@@ -1060,19 +980,18 @@ class ModelManager:
         )
         feat_scaled = scaler.transform(feat)
 
-        indicator_signals: dict[str, dict] = {}
-        best_direction: str | None = None
-        best_confidence: float = 0.0
-        best_model: str = ""
-
-        # ── Per-model prediction ───────────────────────────────────────────────
+        # ── Per-model predictions ──────────────────────────────────────────
         model_probs: dict[str, float] = {}
         for model_name, mdl in models.items():
             try:
                 if model_name in ("lstm", "transformer") and TORCH_AVAILABLE:
-                    # Need sequence — use last SEQ_LEN rows; for live we only have 1 row here
-                    # Skip sequence models in single-row live prediction (they need history)
+                    prob = _predict_sequence_model(
+                        mdl, feat_scaled, len(self._feature_cols), model_name
+                    )
+                    if prob is not None:
+                        model_probs[model_name] = prob
                     continue
+
                 prob = float(mdl.predict_proba(feat_scaled)[0, 1])
                 model_probs[model_name] = prob
             except Exception as exc:
@@ -1088,74 +1007,67 @@ class ModelManager:
             return None
 
         # Best model: highest deviation from 0.5 (most decisive)
-        def decisiveness(prob: float) -> float:
-            return abs(prob - 0.5)
-
-        best_model = max(model_probs, key=lambda m: decisiveness(model_probs[m]))
+        best_model = max(model_probs, key=lambda m: abs(model_probs[m] - 0.5))
         best_prob = model_probs[best_model]
         best_direction = "UP" if best_prob >= 0.5 else "DOWN"
-        # Confidence = distance from 0.5, scaled to [0.5, 1.0]
-        best_confidence = 0.5 + decisiveness(best_prob)
+        best_confidence = 0.5 + abs(best_prob - 0.5)
 
-        # ── Detect market regime → prefer regime-appropriate indicators ──────
+        # ── Market regime ──────────────────────────────────────────────────
         regime = self._regime_detector.detect(feature_row)
         preferred = self._regime_detector.preferred_indicators(regime)
 
-        # ── Per-indicator signals (weighted by historical accuracy + regime) ──
+        # ── Per-indicator consensus ────────────────────────────────────────
+        indicator_signals: dict[str, dict] = {}
         indicator_tracker = self._indicator_tracker.get(pair)
-        weighted_votes: dict[str, float] = {}  # "UP"->weight, "DOWN"->weight
+        weighted_votes: dict[str, float] = {}
 
-        for indicator, cols in self._indicator_groups.items():
-            available_cols = [c for c in cols if c in feature_row.index]
-            if not available_cols:
-                continue
-            # Use the mean of columns for the indicator
-            ind_feat = feature_row.reindex(available_cols).fillna(0.0).values
-            ind_feat_full = (
-                feature_row.reindex(self._feature_cols)
-                .fillna(0.0)
-                .to_numpy(dtype=np.float64)
-                .reshape(1, -1)
-            )
-            ind_feat_scaled = scaler.transform(ind_feat_full)
+        tabular_model = (
+            models.get("lightgbm")
+            or models.get("xgboost")
+            or models.get("randomforest")
+        )
 
-            try:
-                # Use the best tabular model for indicator-level signal
-                tabular_model = (
-                    models.get("lightgbm")
-                    or models.get("xgboost")
-                    or models.get("randomforest")
-                )
-                if tabular_model is None:
+        if tabular_model is not None:
+            for indicator, cols in self._indicator_groups.items():
+                available_cols = [c for c in cols if c in feature_row.index]
+                if not available_cols:
                     continue
-                ind_prob = float(tabular_model.predict_proba(ind_feat_scaled)[0, 1])
-                ind_direction = "UP" if ind_prob >= 0.5 else "DOWN"
-                ind_confidence = 0.5 + abs(ind_prob - 0.5)
 
-                # Weight by historical accuracy × regime affinity boost
-                base_weight = (
-                    indicator_tracker.get_confidence_weight(indicator)
-                    if indicator_tracker
-                    else 0.55
-                )
-                # Indicators aligned with current market regime get a 1.5× boost
-                regime_multiplier = 1.5 if indicator in preferred else 1.0
-                weight = base_weight * regime_multiplier
-                indicator_signals[indicator] = {
-                    "direction": ind_direction,
-                    "confidence": round(ind_confidence * base_weight, 4),
-                    "regime_boosted": indicator in preferred,
-                    "raw_prob": round(ind_prob, 4),
-                }
-                key = ind_direction
-                weighted_votes[key] = weighted_votes.get(key, 0.0) + (
-                    ind_confidence * weight
-                )
+                try:
+                    # Build indicator-only feature vector (zero out non-indicator cols)
+                    ind_feat = np.zeros_like(feat_scaled)
+                    for col in available_cols:
+                        if col in self._feature_cols:
+                            idx = self._feature_cols.index(col)
+                            ind_feat[0, idx] = feat_scaled[0, idx]
 
-            except Exception:
-                pass
+                    ind_prob = float(tabular_model.predict_proba(ind_feat)[0, 1])
+                    ind_direction = "UP" if ind_prob >= 0.5 else "DOWN"
+                    ind_confidence = 0.5 + abs(ind_prob - 0.5)
 
-        # Incorporate indicator consensus into final direction/confidence
+                    base_weight = (
+                        indicator_tracker.get_confidence_weight(indicator)
+                        if indicator_tracker
+                        else 0.55
+                    )
+                    regime_multiplier = 1.5 if indicator in preferred else 1.0
+                    weight = base_weight * regime_multiplier
+
+                    indicator_signals[indicator] = {
+                        "direction": ind_direction,
+                        "confidence": round(ind_confidence * base_weight, 4),
+                        "regime_boosted": indicator in preferred,
+                        "raw_prob": round(ind_prob, 4),
+                    }
+
+                    weighted_votes[ind_direction] = weighted_votes.get(
+                        ind_direction, 0.0
+                    ) + (ind_confidence * weight)
+
+                except Exception:
+                    pass
+
+        # Blend model confidence with indicator consensus (70/30)
         if weighted_votes:
             consensus_direction = max(weighted_votes, key=lambda k: weighted_votes[k])
             total_weight = sum(weighted_votes.values())
@@ -1164,7 +1076,6 @@ class ModelManager:
                 if total_weight > 0
                 else 0.5
             )
-            # Blend model confidence with indicator consensus (70/30)
             final_direction = (
                 best_direction
                 if best_confidence >= consensus_confidence
@@ -1177,20 +1088,6 @@ class ModelManager:
             final_direction = best_direction
             final_confidence = round(best_confidence, 4)
 
-        # ── Martingale threshold gate ──────────────────────────────────────────
-        threshold = self._mt.current_threshold
-        if final_confidence < threshold:
-            logger.debug(
-                {
-                    "event": "signal_below_threshold",
-                    "pair": pair,
-                    "confidence": final_confidence,
-                    "threshold": threshold,
-                    "streak": self._mt.current_streak,
-                }
-            )
-            return None
-
         result = {
             "pair": pair,
             "direction": final_direction,
@@ -1202,10 +1099,10 @@ class ModelManager:
             "regime": regime,
             "preferred_indicators": preferred,
             "martingale_streak": self._mt.current_streak,
-            "threshold_applied": threshold,
+            "threshold_applied": self._mt.current_threshold,
         }
 
-        # Append to rolling prediction audit log
+        # Audit log
         log = self._prediction_log.setdefault(pair, [])
         log.append(
             {
@@ -1227,63 +1124,113 @@ class ModelManager:
                 "regime": regime,
                 "model": best_model,
                 "streak": self._mt.current_streak,
-                "threshold": threshold,
+                "threshold": self._mt.current_threshold,
             }
         )
         return result
 
+    # ── Indicator accuracy ────────────────────────────────────────────────────
+
     def update_indicator_accuracy(
         self, pair: str, indicator: str, correct: bool
     ) -> None:
-        """Called after a trade result is known to update indicator accuracy."""
+        """Update indicator accuracy after a trade result is known."""
         tracker = self._indicator_tracker.get(pair)
         if tracker:
             tracker.update(indicator, correct)
 
+    # ── Retrain tracking ──────────────────────────────────────────────────────
+
     def record_result(self, pair: str) -> None:
-        """Increment result counter for pair (used to trigger retraining)."""
+        """Increment result counter for *pair* (used to trigger retraining)."""
         self._result_counts[pair] = self._result_counts.get(pair, 0) + 1
 
     def should_retrain(self, pair: str) -> bool:
+        """Return ``True`` if enough new results accumulated since last train."""
         last = self._last_train_counts.get(pair, 0)
         current = self._result_counts.get(pair, 0)
         return (current - last) >= self._retrain_threshold
 
-    def save(self, path: str, storage=None) -> None:
-        """Persist all models and trackers to disk and blob."""
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def save(self, path: str, storage: Any = None) -> None:
+        """
+        Persist all models and trackers to disk and optionally to blob storage.
+
+        PyTorch models are saved separately via ``torch.save`` to avoid
+        pickle version incompatibilities.
+
+        Args:
+            path: Local directory to save to.
+            storage: Optional :class:`~storage.StorageManager` for blob backup.
+        """
         os.makedirs(path, exist_ok=True)
+
+        # Separate PyTorch models — pickle is unreliable across versions
+        torch_state: dict[str, Any] = {}
+        serializable_models: dict[str, dict[int, dict[str, Any]]] = {}
+        for pair, expiries in self._models.items():
+            serializable_models[pair] = {}
+            for expiry, models in expiries.items():
+                serializable_models[pair][expiry] = {}
+                for name, mdl in models.items():
+                    if name in ("lstm", "transformer") and TORCH_AVAILABLE:
+                        torch_state[f"{pair}/{expiry}/{name}"] = mdl.state_dict()
+                    else:
+                        serializable_models[pair][expiry][name] = mdl
+
         payload = {
-            "models": self._models,
+            "models": serializable_models,
             "scalers": self._scalers,
             "metrics": self._metrics,
             "indicator_tracker": self._indicator_tracker,
             "result_counts": self._result_counts,
             "last_train_counts": self._last_train_counts,
         }
-        with open(os.path.join(path, "model_manager.pkl"), "wb") as f:
-            pickle.dump(payload, f)
-        # Also save to blob storage if provided
+
+        pkl_path = os.path.join(path, "model_manager.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if TORCH_AVAILABLE and torch_state:
+            torch_path = os.path.join(path, "pytorch_models.pt")
+            torch.save(torch_state, torch_path)
+
         if storage:
-            with open(os.path.join(path, "model_manager.pkl"), "rb") as f:
+            with open(pkl_path, "rb") as f:
                 storage.save_model(f.read())
+            if TORCH_AVAILABLE and torch_state:
+                import io as _io
+
+                buf = _io.BytesIO()
+                torch.save(torch_state, buf)
+                buf.seek(0)
+                storage.save_model(buf.read(), model_name="pytorch_models.pt")
 
         logger.info({"event": "models_saved", "path": path})
 
-    def load(self, path: str, storage=None) -> None:
-        """Load persisted models from disk."""
-        fpath = os.path.join(path, "model_manager.pkl")
-        # Try local first
-        if os.path.exists(fpath):
-            with open(fpath, "rb") as f:
+    def load(self, path: str, storage: Any = None) -> None:
+        """
+        Load persisted models from disk (or blob storage as fallback).
+
+        Args:
+            path: Local directory to load from.
+            storage: Optional :class:`~storage.StorageManager` for blob fallback.
+        """
+        pkl_path = os.path.join(path, "model_manager.pkl")
+        torch_path = os.path.join(path, "pytorch_models.pt")
+
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
                 payload = pickle.load(f)
             logger.info({"event": "models_loaded_from_local", "path": path})
         elif storage:
-            # Try blob storage
             data = storage.load_model()
             if data:
-                with open(fpath, "wb") as f:
+                os.makedirs(path, exist_ok=True)
+                with open(pkl_path, "wb") as f:
                     f.write(data)
-                with open(fpath, "rb") as f:
+                with open(pkl_path, "rb") as f:
                     payload = pickle.load(f)
                 logger.info({"event": "models_loaded_from_blob"})
             else:
@@ -1299,6 +1246,27 @@ class ModelManager:
         self._indicator_tracker = payload.get("indicator_tracker", {})
         self._result_counts = payload.get("result_counts", {})
         self._last_train_counts = payload.get("last_train_counts", {})
+
+        # Load PyTorch weights
+        if TORCH_AVAILABLE and os.path.exists(torch_path):
+            try:
+                torch_state = torch.load(
+                    torch_path, map_location="cpu", weights_only=True
+                )
+                for key, state in torch_state.items():
+                    pair, expiry_str, model_name = key.split("/")
+                    expiry = int(expiry_str)
+                    model = self._models.get(pair, {}).get(expiry, {}).get(model_name)
+                    if model is not None:
+                        model.load_state_dict(state)
+                        logger.info({"event": "pytorch_weights_loaded", "key": key})
+            except Exception as exc:
+                logger.warning({"event": "pytorch_load_failed", "error": str(exc)})
+
         logger.info(
-            {"event": "models_loaded", "path": path, "pairs": list(self._models.keys())}
+            {
+                "event": "models_loaded",
+                "path": path,
+                "pairs": list(self._models.keys()),
+            }
         )

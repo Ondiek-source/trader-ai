@@ -1,70 +1,150 @@
 """
-log_storage.py — Persistent log writer to Azure Blob Storage
+log_storage.py — Persistent log writer to Azure Blob Storage.
+
+Provides :class:`BlobLogHandler`, a :class:`logging.Handler` subclass that
+buffers log records and periodically uploads them as a single blob to Azure
+Blob Storage.  Each container instance gets its own daily log file to avoid
+write conflicts.
 """
 
+from __future__ import annotations
+
 import logging
+import sys
 import uuid
 from datetime import datetime, timezone
+from typing import Any
+
+from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
 
 
 class BlobLogHandler(logging.Handler):
-    """Custom logging handler that writes logs to Azure Blob Storage."""
+    """
+    Logging handler that appends records to a daily Azure Blob.
 
-    def __init__(self, conn_string: str, container_name: str):
+    Log files are stored under ``logs/YYYY-MM-DD/<prefix>-<instance>.log``.
+    The *instance* suffix (a short UUID) ensures concurrent container restarts
+    on the same day write to separate blobs.
+
+    Args:
+        conn_string: Azure Storage connection string.
+        container_name: Blob container name.
+        buffer_size: Number of records to accumulate before uploading.
+        blob_prefix: Filename prefix (default ``"trader-ai-engine"``).
+
+    Example::
+
+        handler = BlobLogHandler(conn_string, "traderai", buffer_size=100)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+    """
+
+    def __init__(
+        self,
+        conn_string: str,
+        container_name: str,
+        buffer_size: int = 10,
+        blob_prefix: str = "trader-ai-engine",
+    ) -> None:
         super().__init__()
-        self.conn_string = conn_string
-        self.container_name = container_name
-        self.container_instance_id = str(uuid.uuid4())[:8]  # Unique per container start
-        self._client = None
-        self._buffer = []
-        self._buffer_size = 50
-        self._init_client()
+        self._container_name = container_name
+        self._blob_prefix = blob_prefix
+        self._instance_id: str = uuid.uuid4().hex[:8]
+        self._buffer_size = buffer_size
+        self._buffer: list[str] = []
+        self._client: BlobServiceClient | None = None
 
-    def _init_client(self):
         try:
-            self._client = BlobServiceClient.from_connection_string(self.conn_string)
-        except Exception as e:
-            print(f"Failed to init blob client: {e}")
+            self._client = BlobServiceClient.from_connection_string(conn_string)
+        except Exception:
+            # Use sys.stderr directly — logging here would recurse.
+            sys.stderr.write("[BlobLogHandler] Failed to initialise blob client.\n")
+            self._client = None
 
-    def emit(self, record):
+    # ── properties ────────────────────────────────────────────────────────────
+
+    @property
+    def _blob_name(self) -> str:
+        """Return today's blob path."""
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return f"logs/{date_str}/{self._blob_prefix}-{self._instance_id}.log"
+
+    @property
+    def buffer_length(self) -> int:
+        """Number of records currently buffered."""
+        return len(self._buffer)
+
+    # ── logging.Handler interface ─────────────────────────────────────────────
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """
+        Buffer a formatted log record and flush when *buffer_size* is reached.
+        """
         try:
-            msg = self.format(record)
-            self._buffer.append(msg + "\n")
-
+            self._buffer.append(self.format(record) + "\n")
             if len(self._buffer) >= self._buffer_size:
                 self.flush()
         except Exception:
             self.handleError(record)
 
-    def flush(self):
-        if not self._buffer or not self._client:
+    def flush(self) -> None:
+        """
+        Upload buffered records to Azure Blob Storage.
+
+        If the blob already exists (earlier records from the same instance),
+        new records are appended.  If the client is unavailable the buffer is
+        silently dropped with a stderr warning.
+        """
+        if not self._buffer:
             return
 
-        try:
-            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            # Include unique container ID in filename
-            blob_name = (
-                f"logs/{date_str}/trader-ai-engine-{self.container_instance_id}.log"
+        if self._client is None:
+            sys.stderr.write(
+                f"[BlobLogHandler] Dropping {len(self._buffer)} records — no blob client.\n"
             )
+            self._buffer = []
+            return
 
+        blob_name = self._blob_name
+        payload = "".join(self._buffer)
+
+        try:
             blob_client = self._client.get_blob_client(
-                container=self.container_name, blob=blob_name
+                container=self._container_name, blob=blob_name
             )
 
             existing = ""
             try:
-                existing_data = blob_client.download_blob().readall()
-                existing = existing_data.decode("utf-8")
-            except:
-                pass
+                existing = blob_client.download_blob().readall().decode("utf-8")
+            except ResourceNotFoundError:
+                pass  # first write of the day — fine
 
-            new_content = existing + "".join(self._buffer)
-            blob_client.upload_blob(new_content, overwrite=True)
+            blob_client.upload_blob(existing + payload, overwrite=True)
             self._buffer = []
-        except Exception as e:
-            print(f"Failed to flush logs: {e}")
 
-    def close(self):
-        self.flush()
-        super().close()
+        except AzureError:
+            sys.stderr.write(
+                f"[BlobLogHandler] Azure error flushing {len(self._buffer)} records.\n"
+            )
+            self._buffer = []
+        except Exception:
+            sys.stderr.write(
+                f"[BlobLogHandler] Unexpected error flushing {len(self._buffer)} records.\n"
+            )
+            self._buffer = []
+
+    def close(self) -> None:
+        """Flush remaining records and release resources."""
+        try:
+            self.flush()
+        finally:
+            super().close()
+
+    # ── dunder ────────────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        return (
+            f"BlobLogHandler(container={self._container_name!r}, "
+            f"blob={self._blob_name!r}, buffered={self.buffer_length})"
+        )

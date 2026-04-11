@@ -355,8 +355,7 @@ if (( model_count == 0 )); then
   echo "  Last 30 lines of container logs:"
   az container logs \
     --name "$ACI_NAME" \
-    --resource-group "$RESOURCE_GROUP" \
-    --tail 30 2>/dev/null || echo "  (could not retrieve logs)"
+    --resource-group "$RESOURCE_GROUP" 2>/dev/null | tail -n 30 || echo "  (could not retrieve logs)"
 
   exit 1
 fi

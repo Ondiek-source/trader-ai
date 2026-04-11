@@ -1,7 +1,8 @@
 """
 webhook.py — Webhook signal delivery.
 
-Sends the EXACT payload the Quotex trading bot expects:
+Sends the EXACT payload the Quotex trading bot expects::
+
     {"side": "buy"|"sell", "symbol": "EURUSD", "key": "Ondiek"}
 
 Nothing extra is added. The payload is passed through as-is.
@@ -35,7 +36,20 @@ class WebhookSender:
     Delivers signal payloads to the configured webhook URL.
 
     The payload POSTed is exactly what is passed in — no fields are added
-    or modified. This guarantees the Quotex bot receives its expected schema.
+    or modified.  This guarantees the Quotex bot receives its expected schema.
+
+    Reuses a single :class:`requests.Session` for connection pooling.
+    Call :meth:`close` when done to release resources.
+
+    Args:
+        url: Webhook endpoint URL.
+        secret: Optional HMAC-SHA256 secret for ``X-Signature`` header.
+
+    Example::
+
+        sender = WebhookSender(url="https://example.com/hook", secret="s3cret")
+        result = sender.send({"side": "buy", "symbol": "EURUSD", "key": "Ondiek"})
+        sender.close()
     """
 
     MAX_ATTEMPTS = 3
@@ -44,18 +58,23 @@ class WebhookSender:
 
     def __init__(self, url: str, secret: str = "") -> None:
         self._url = url
-        self._secret = secret  # never logged
+        self._secret = secret
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
     def send(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
-        POST payload to webhook URL.
+        POST *payload* to the webhook URL with retry.
+
+        Args:
+            payload: Must match the schema the Quotex bot expects
+                (``{"side": ..., "symbol": ..., "key": ...}``).
 
         Returns:
-            {success: bool, status_code: int | None, latency_ms: float, attempts: int}
+            ``{success, status_code, latency_ms, attempts}``.
 
-        Raises WebhookError if all attempts fail.
+        Raises:
+            WebhookError: If all retry attempts fail.
         """
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         headers: dict[str, str] = {}
@@ -90,7 +109,9 @@ class WebhookSender:
 
             except requests.RequestException as exc:
                 latency_ms = (time.monotonic() - start) * 1000
-                self._log_attempt(payload, attempt, None, latency_ms, error=exc)
+                self._log_attempt(
+                    payload, attempt, None, latency_ms, error=exc
+                )
                 last_error = exc
 
             if attempt < self.MAX_ATTEMPTS:
@@ -115,21 +136,35 @@ class WebhookSender:
                 "error": str(last_error),
             }
         )
-        raise WebhookError(f"Webhook failed after {self.MAX_ATTEMPTS} attempts: {last_error}") from last_error
+        raise WebhookError(
+            f"Webhook failed after {self.MAX_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
+
+    def close(self) -> None:
+        """Close the underlying HTTP session."""
+        self._session.close()
 
     def _sign(self, body: bytes) -> str:
-        """HMAC-SHA256 signature over raw body bytes."""
-        sig = hmac.new(self._secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        """
+        Compute HMAC-SHA256 signature over raw body bytes.
+
+        Returns:
+            ``"sha256=<hex>"`` string for the ``X-Signature`` header.
+        """
+        sig = hmac.new(
+            self._secret.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
         return f"sha256={sig}"
 
     def _log_attempt(
         self,
-        payload: dict,
+        payload: dict[str, Any],
         attempt: int,
         status: int | None,
         latency_ms: float,
         error: Exception | None = None,
     ) -> None:
+        """Log a structured record for one send attempt."""
         record: dict[str, Any] = {
             "event": "webhook_attempt",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -145,14 +180,50 @@ class WebhookSender:
         logger.info(record)
 
 
-# ── Convenience function ───────────────────────────────────────────────────────
+# ── Module-level sender (singleton) ───────────────────────────────────────────
 
-def send_signal(payload: dict[str, Any], config) -> dict[str, Any]:
-    """
-    Convenience wrapper: create a WebhookSender from config and fire once.
+_sender: WebhookSender | None = None
 
-    payload must already be in the exact format expected by the bot:
-      {"side": "buy"|"sell", "symbol": "EURUSD", "key": "Ondiek"}
+
+def _get_sender(url: str, secret: str = "") -> WebhookSender:
+    """Return a module-level singleton :class:`WebhookSender`."""
+    global _sender
+    if _sender is None or _sender._url != url:
+        if _sender is not None:
+            _sender.close()
+        _sender = WebhookSender(url=url, secret=secret)
+    return _sender
+
+
+def send_signal(payload: dict[str, Any], config: Any) -> dict[str, Any]:
     """
-    sender = WebhookSender(url=config.webhook_url, secret=config.webhook_secret)
+    Convenience wrapper: create (or reuse) a :class:`WebhookSender` from
+    *config* and fire once.
+
+    Args:
+        payload: Must already be in the exact format the bot expects::
+
+            {"side": "buy"|"sell", "symbol": "EURUSD", "key": "Ondiek"}
+
+        config: Application :class:`~config.Config` (needs ``webhook_url``
+            and ``webhook_secret``).
+
+    Returns:
+        ``{success, status_code, latency_ms, attempts}``.
+
+    Raises:
+        WebhookError: If all retry attempts fail.
+    """
+    sender = _get_sender(
+        url=config.webhook_url,
+        secret=getattr(config, "webhook_secret", ""),
+    )
     return sender.send(payload)
+
+
+def close_sender() -> None:
+    """Close the module-level singleton sender (call on shutdown)."""
+    global _sender
+    if _sender is not None:
+        _sender.close()
+        _sender = None

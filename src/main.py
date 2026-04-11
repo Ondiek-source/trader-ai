@@ -2,7 +2,7 @@
 main.py — Asyncio orchestrator for the Trader AI signal engine.
 
 Task topology:
-    stream_task      — Tick stream (thread executor)
+    stream_task      — Twelve Data tick stream (thread executor)
     signal_task      — Feature engineering + model inference → webhook
     result_task      — HTTP server receiving trade results from bot
     feedback_task    — Consumes results → updates orchestrator + storage
@@ -27,6 +27,7 @@ import gc
 import uuid
 import psutil
 from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Coroutine
 
 import pandas as pd
 
@@ -60,7 +61,7 @@ def _configure_logging(level: str = "INFO") -> None:
     root.setLevel(getattr(logging, level, logging.INFO))
     root.handlers.clear()
     root.addHandler(handler)
-    # Suppress noisy Azure SDK HTTP transport logs (404s from blob existence checks)
+    # Suppress noisy Azure SDK HTTP transport logs
     logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
         logging.WARNING
     )
@@ -71,11 +72,13 @@ def _configure_logging(level: str = "INFO") -> None:
 
 from config import load_config
 from storage import StorageManager
-from stream import OANDAStream
+from twelveticks_stream import TwelveDataStream
+from quotex_stream import QuotexStream
+from pyquotex.stable_api import Quotex
 from backfill import backfill_all, check_data_coverage
 from features import compute_features, get_feature_columns, resample_to_1min
 from model import MartingaleTracker, ModelManager
-from signals import create_orchestrator
+from signals import create_orchestrator, SignalOrchestrator
 from webhook import WebhookSender, WebhookError
 from quotex_reader import QuotexReader, run_quotex_reader
 from reporter import DiscordReporter, TelegramBot, scheduled_report_loop
@@ -94,19 +97,34 @@ HEALTH_LOG_INTERVAL = 60  # seconds
 # ── Task supervisor ────────────────────────────────────────────────────────────
 
 
-async def _safe(coro, name: str) -> None:
-    """Run a one-shot coroutine, logging but never propagating exceptions."""
+async def _safe(
+    coro_factory: Callable[[], Coroutine[Any, Any, Any]], name: str
+) -> None:
+    """
+    Run a one-shot coroutine factory, logging but never propagating exceptions.
+
+    Unlike :func:`supervised`, this does NOT restart on failure.  Use for
+    fire-and-forget tasks like backfill and initial training.
+
+    Args:
+        coro_factory: A callable that returns a coroutine (NOT a coroutine
+            itself — this allows the supervisor to restart if needed).
+        name: Human-readable task name for logs.
+    """
     try:
-        await coro
+        await coro_factory()
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         logger.error(
-            {"event": "task_failed", "task": name, "error": str(exc)}, exc_info=True
+            {"event": "task_failed", "task": name, "error": str(exc)},
+            exc_info=True,
         )
 
 
-async def supervised(name: str, coro_factory) -> None:
+async def supervised(
+    name: str, coro_factory: Callable[[], Coroutine[Any, Any, Any]]
+) -> None:
     """Wrap a coroutine factory in infinite restart-on-error loop."""
     while True:
         try:
@@ -127,11 +145,12 @@ async def supervised(name: str, coro_factory) -> None:
 # ── Individual task implementations ───────────────────────────────────────────
 
 
-async def stream_task(stream: OANDAStream) -> None:
+async def stream_task(stream: TwelveDataStream | QuotexStream) -> None:
     """
-    Start the OANDA stream background thread, then hold this asyncio task alive
-    until the stop_event is set. The actual streaming runs in stream's daemon thread;
-    this coroutine just keeps the supervised() wrapper from restarting it instantly.
+    Start the Twelve Data stream background thread, then hold this asyncio task
+    alive until the stop_event is set.  The actual streaming runs in stream's
+    daemon thread; this coroutine just keeps the supervised() wrapper from
+    restarting it instantly.
     """
     stream.start()
     # Keep the task alive — the stream runs in its own daemon thread
@@ -140,12 +159,12 @@ async def stream_task(stream: OANDAStream) -> None:
 
 
 async def signal_task(
-    stream: OANDAStream,
+    stream: TwelveDataStream | QuotexStream,
     model_manager: ModelManager,
-    orchestrator,
+    orchestrator: SignalOrchestrator,
     webhook_sender: WebhookSender,
     storage: StorageManager,
-    config,
+    config: Any,
     quotex_reader: QuotexReader | None = None,
 ) -> None:
     """
@@ -158,9 +177,7 @@ async def signal_task(
     - Retrain in executor (non-blocking) when enough new results accumulate
     - Always analyzes, always predicts — suppression is handled by the gate
     """
-    import pandas as pd
-
-    recent_ticks: dict[str, list] = {p: [] for p in config.pairs}
+    recent_ticks: dict[str, list[dict]] = {p: [] for p in config.pairs}
     last_bar_minute: dict[str, int] = {p: -1 for p in config.pairs}
     MAX_RECENT_TICKS = 15_000  # ~25 min of ticks at ~10 ticks/sec
 
@@ -190,8 +207,9 @@ async def signal_task(
 
         # Non-blocking retrain if enough new results since last training
         if model_manager.should_retrain(pair):
+            _pair = pair  # capture value, not reference
 
-            async def _retrain(p: str = pair) -> None:
+            async def _retrain(p: str = _pair) -> None:
                 try:
                     tick_df_full = storage.read_ticks(p, months=6)
                     tick_df_recent = storage.read_ticks(p, months=3)
@@ -220,7 +238,11 @@ async def signal_task(
                             logger.info({"event": "retrain_complete", "pair": p})
                 except Exception as exc:
                     logger.warning(
-                        {"event": "retrain_failed", "pair": p, "error": str(exc)}
+                        {
+                            "event": "retrain_failed",
+                            "pair": p,
+                            "error": str(exc),
+                        }
                     )
 
             asyncio.create_task(_retrain())
@@ -239,18 +261,25 @@ async def signal_task(
                 continue
             feature_row = feature_df.iloc[-1]
             # Force garbage collection to free memory from temporary DataFrames
+            del feature_df
             gc.collect()
         except Exception as exc:
             logger.warning(
-                {"event": "feature_extraction_failed", "pair": pair, "error": str(exc)}
+                {
+                    "event": "feature_extraction_failed",
+                    "pair": pair,
+                    "error": str(exc),
+                }
             )
             continue
 
-        # Predict — always runs, logs below-threshold results, only fires when gate passes
+        # Predict — always runs, logs below-threshold results,
+        # only fires when gate passes
         prediction = model_manager.predict(pair, config.expiry_seconds, feature_row)
         if prediction is None:
             continue
-
+        
+        prediction["otc"] = config.use_quotex_streaming
         payload = orchestrator.try_signal(prediction)
         if payload is None:
             continue
@@ -270,21 +299,26 @@ async def signal_task(
             )
             # Register with quotex reader so result can be matched at expiry
             if quotex_reader is not None:
-                signal_id = f"{pair}_{tick.timestamp.isoformat()}"
+                signal_id = str(uuid.uuid4())
                 expiry_time = tick.timestamp + timedelta(seconds=config.expiry_seconds)
                 quotex_reader.register_pending(
                     signal_id,
                     {
                         "pair": pair,
                         "direction": prediction.get("direction", "UP"),
+                        "signal_id": signal_id,
                         **payload,
                     },
                     expiry_time,
                 )
-            # After webhook sends successfully
+            # Push to dashboard
             status_store.update(
                 {
-                    "last_event": f"signal_fired: {pair} {prediction.get('direction')} @ {prediction.get('confidence'):.2f}"
+                    "last_event": (
+                        f"signal_fired: {pair} "
+                        f"{prediction.get('direction')} @ "
+                        f"{prediction.get('confidence'):.2f}"
+                    )
                 }
             )
 
@@ -293,9 +327,29 @@ async def signal_task(
 
 
 async def feedback_task(
-    quotex_reader: QuotexReader, orchestrator, model_manager, storage
+    quotex_reader: QuotexReader,
+    orchestrator: SignalOrchestrator,
+    model_manager: ModelManager,
+    storage: StorageManager,
 ) -> None:
-    """Consume trade results and feed them back to orchestrator + storage."""
+    """
+    Consume trade results and feed them back to orchestrator + storage.
+
+    Only runs when pyquotex is available.  If the library is not installed,
+    sleeps forever to avoid polling an empty queue.
+    """
+    from quotex_reader import QUOTEX_LIB_AVAILABLE
+
+    if not QUOTEX_LIB_AVAILABLE:
+        logger.info(
+            {
+                "event": "feedback_task_disabled",
+                "reason": "pyquotex_not_installed",
+            }
+        )
+        while True:
+            await asyncio.sleep(3600)
+
     while True:
         result = await quotex_reader.get_result(timeout=1.0)
         if result is None:
@@ -312,7 +366,9 @@ async def feedback_task(
 
 
 async def health_task(
-    stream: OANDAStream, orchestrator, quotex_reader: QuotexReader | None = None
+    stream: TwelveDataStream | QuotexStream,
+    orchestrator: SignalOrchestrator,
+    quotex_reader: QuotexReader | None = None,
 ) -> None:
     """Log system health every HEALTH_LOG_INTERVAL seconds."""
     start_time = time.monotonic()
@@ -353,13 +409,16 @@ async def health_task(
                 "confidence_threshold": status.get("confidence_threshold", 0.65),
                 "pending_signals": status.get("pending_signals", 0),
                 "session": status.get("session", {}),
-                "stream": {"connected": True, "ticks_received": stream.ticks_received},
+                "stream": {
+                    "connected": True,
+                    "ticks_received": stream.ticks_received,
+                },
                 "quotex": qhealth,
             }
         )
 
 
-async def backfill_task(config, storage) -> None:
+async def backfill_task(config: Any, storage: StorageManager) -> None:
     """One-shot backfill at startup if less than 1 year of data exists."""
     needs_backfill = any(
         not check_data_coverage(pair, storage, min_days=365) for pair in config.pairs
@@ -371,16 +430,19 @@ async def backfill_task(config, storage) -> None:
 
             conn_string = storage._client.connection_string
             logger.info(
-                {"event": "blob_conn_string_present", "length": len(conn_string)}
+                {
+                    "event": "blob_conn_string_present",
+                    "length": len(conn_string),
+                }
             )
 
             client = BlobServiceClient.from_connection_string(conn_string)
             container_client = client.get_container_client(storage._container)
 
             # List blobs with timeout
-            import sys
+            import sys as _sys
 
-            sys.stderr.write("Listing blobs...\n")
+            _sys.stderr.write("Listing blobs...\n")
 
             blobs = list(container_client.list_blobs(name_starts_with="data/"))
             parquet_count = len([b for b in blobs if b.name.endswith(".parquet")])
@@ -411,7 +473,7 @@ async def backfill_task(config, storage) -> None:
         logger.info(
             {
                 "event": "backfill_skipped",
-                "reason": "sufficient_data_5yr",
+                "reason": "sufficient_data",
                 "parquet_files": parquet_count,
             }
         )
@@ -431,7 +493,9 @@ async def backfill_task(config, storage) -> None:
 # ── Startup: train models from historical data ────────────────────────────────
 
 
-async def initial_training(config, storage, model_manager) -> None:
+async def initial_training(
+    config: Any, storage: StorageManager, model_manager: ModelManager
+) -> None:
     """
     Load saved models or train fresh from historical data.
     Retries every 5 minutes until all pairs have a trained model
@@ -440,7 +504,7 @@ async def initial_training(config, storage, model_manager) -> None:
     model_manager.load(MODEL_SAVE_PATH, storage=storage)
 
     # Wait until backfill has written sufficient data before training.
-    # Check every 2 minutes. Train once coverage reaches ≥ 365 days per pair.
+    # Check every 2 minutes. Train once coverage reaches >= 365 days per pair.
     while True:
         all_trained = True
 
@@ -452,9 +516,8 @@ async def initial_training(config, storage, model_manager) -> None:
                 continue
 
             # Read all available data (up to 60 months)
-            # tick_df = storage.read_ticks(pair, months=60)
-            tick_df_full = storage.read_ticks(pair, months=60)  # For tree models
-            tick_df_recent = storage.read_ticks(pair, months=3)  # For LSTM/Transformer
+            tick_df_full = storage.read_ticks(pair, months=60)
+            tick_df_recent = storage.read_ticks(pair, months=3)
 
             if tick_df_full.empty:
                 logger.info(
@@ -488,7 +551,6 @@ async def initial_training(config, storage, model_manager) -> None:
                 all_trained = False
                 continue
 
-            # feature_df = compute_features(tick_df, expiry)
             feature_df_full = compute_features(tick_df_full, expiry)
             feature_df_recent = compute_features(tick_df_recent, expiry)
             if feature_df_full.empty or len(feature_df_full) < 200:
@@ -559,11 +621,12 @@ async def main() -> None:
         container_name=config.container_name,
         flush_size=config.tick_flush_size,
     )
-    
+
     # ── Add persistent blob logging ──────────────────────────────────────────
     try:
         blob_handler = BlobLogHandler(
-            conn_string=config.azure_storage_conn, container_name=config.container_name
+            conn_string=config.azure_storage_conn,
+            container_name=config.container_name,
         )
         blob_handler.setFormatter(_JSONFormatter())
         root_logger = logging.getLogger()
@@ -583,12 +646,24 @@ async def main() -> None:
     model_manager = ModelManager(config=config, martingale_tracker=martingale)
     orchestrator = create_orchestrator(config=config, martingale_tracker=martingale)
 
-    stream = OANDAStream(
-        api_key=config.twelvedata_api_key,
-        pairs=config.pairs,
-        storage=storage,
-        flush_size=config.tick_flush_size,
-    )
+    if config.use_quotex_streaming and config.quotex_email:
+        qx_client = Quotex(config.quotex_email, config.quotex_password)
+        stream = QuotexStream(
+            client=qx_client,
+            pairs=config.pairs,
+            storage=storage,
+            flush_size=config.tick_flush_size,
+            poll_interval=config.poll_interval,
+        )
+        logger.info({"event": "data_source_selected", "provider": "Quotex OTC"})
+    else:
+        stream = TwelveDataStream(
+            api_key=config.twelvedata_api_key,
+            pairs=config.pairs,
+            storage=storage,
+            flush_size=config.tick_flush_size,
+        )
+        logger.info({"event": "data_source_selected", "provider": "Twelve Data"})
 
     webhook_sender = WebhookSender(url=config.webhook_url, secret=config.webhook_secret)
     quotex_reader = QuotexReader(
@@ -596,7 +671,10 @@ async def main() -> None:
         password=getattr(config, "quotex_password", ""),
         practice_mode=config.practice_mode,
     )
-    if getattr(config, "quotex_email", "") and getattr(config, "quotex_password", ""):
+    has_quotex_creds = bool(
+        getattr(config, "quotex_email", "") and getattr(config, "quotex_password", "")
+    )
+    if has_quotex_creds:
         await quotex_reader.connect()
 
     discord = DiscordReporter(webhook_url=getattr(config, "discord_webhook_url", ""))
@@ -619,14 +697,10 @@ async def main() -> None:
         }
     )
 
-    # ── Launch all tasks immediately — dashboard is live on port 8080 ─────────
-    # Backfill and initial training run as background tasks so nothing blocks.
-    # signal_task waits for model_manager to have a trained model before firing.
-    tasks = [
-        asyncio.create_task(supervised("dashboard", lambda: run_dashboard(port=8080))),
-        asyncio.create_task(_safe(backfill_task(config, storage), "backfill")),
+    # ── Launch all tasks ──────────────────────────────────────────────────────
+    tasks: list[asyncio.Task[Any]] = [
         asyncio.create_task(
-            _safe(initial_training(config, storage, model_manager), "initial_training")
+            supervised("dashboard", lambda: run_dashboard(port=config.dashboard_port))
         ),
         asyncio.create_task(supervised("stream", lambda: stream_task(stream))),
         asyncio.create_task(
@@ -639,27 +713,57 @@ async def main() -> None:
                     webhook_sender,
                     storage,
                     config,
-                    quotex_reader,
+                    quotex_reader if has_quotex_creds else None,
                 ),
-            )
-        ),
-        asyncio.create_task(
-            supervised("quotex_reader", lambda: run_quotex_reader(quotex_reader))
-        ),
-        asyncio.create_task(
-            supervised(
-                "feedback",
-                lambda: feedback_task(
-                    quotex_reader, orchestrator, model_manager, storage
-                ),
-            )
-        ),
-        asyncio.create_task(
-            supervised(
-                "health", lambda: health_task(stream, orchestrator, quotex_reader)
             )
         ),
     ]
+
+    # One-shot tasks — fire and forget (no restart on failure)
+    tasks.append(
+        asyncio.create_task(_safe(lambda: backfill_task(config, storage), "backfill"))
+    )
+    tasks.append(
+        asyncio.create_task(
+            _safe(
+                lambda: initial_training(config, storage, model_manager),
+                "initial_training",
+            )
+        )
+    )
+
+    # Quotex-dependent tasks — only run when credentials are available
+    if has_quotex_creds:
+        tasks.append(
+            asyncio.create_task(
+                supervised(
+                    "quotex_reader",
+                    lambda: run_quotex_reader(quotex_reader),
+                )
+            )
+        )
+        tasks.append(
+            asyncio.create_task(
+                supervised(
+                    "feedback",
+                    lambda: feedback_task(
+                        quotex_reader,
+                        orchestrator,
+                        model_manager,
+                        storage,
+                    ),
+                )
+            )
+        )
+
+    tasks.append(
+        asyncio.create_task(
+            supervised(
+                "health",
+                lambda: health_task(stream, orchestrator, quotex_reader),
+            )
+        )
+    )
 
     if telegram:
         tasks.append(
@@ -686,7 +790,6 @@ async def main() -> None:
         stream.stop()
         await quotex_reader.disconnect()
         model_manager.save(MODEL_SAVE_PATH, storage=storage)
-        storage.force_flush if hasattr(storage, "force_flush") else None
         logger.info({"event": "shutdown_complete"})
 
 

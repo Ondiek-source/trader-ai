@@ -2,13 +2,13 @@
 signals.py — Signal orchestration with martingale-aware confidence gating.
 
 Responsibilities:
-  - Per-pair 60-second cooldown enforcement
-  - Trading window management (default 19h/day)
-  - Daily target: stop after N wins OR target profit reached
-  - Martingale integration: raise confidence threshold progressively after losses,
-    reset after a win or after max consecutive losses
-  - Pending signal tracking for result matching
-  - Result processing: update MartingaleTracker and DailySession
+    - Per-pair 60-second cooldown enforcement
+    - Trading window management (default 19h/day)
+    - Daily target: stop after N wins OR target profit reached
+    - Martingale integration: raise confidence threshold progressively after losses,
+        reset after a win or after max consecutive losses
+    - Pending signal tracking for result matching
+    - Result processing: update MartingaleTracker and DailySession
 
 Direction mapping: "UP" → "buy", "DOWN" → "sell" (Quotex convention)
 """
@@ -18,11 +18,11 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DIRECTION_MAP = {"UP": "buy", "DOWN": "sell"}
+DIRECTION_MAP: dict[str, str] = {"UP": "buy", "DOWN": "sell"}
 
 # Pair normalization: internal format → webhook symbol format
 PAIR_TO_SYMBOL: dict[str, str] = {
@@ -32,27 +32,37 @@ PAIR_TO_SYMBOL: dict[str, str] = {
     "XAU_USD": "XAUUSD",
 }
 
+# How long a signal stays in the pending queue before expiring.
+PENDING_SIGNAL_TTL_SECONDS = 300  # 5 minutes
 
-def normalize_symbol(pair: str) -> str:
-    """Convert internal pair format to webhook symbol (e.g. EUR_USD → EURUSD)."""
-    return PAIR_TO_SYMBOL.get(pair, pair.replace("_", "").replace("/", ""))
+
+def normalize_symbol(pair: str, otc: bool = False) -> str:
+    """Convert internal pair format to webhook symbol (``EUR_USD`` → ``EURUSD``)."""
+    base = PAIR_TO_SYMBOL.get(pair, pair.replace("_", "").replace("/", ""))
+    return f"{base}-OTC" if otc else base
 
 
 # ── Daily Session ─────────────────────────────────────────────────────────────
 
+
 class DailySession:
     """
-    Tracks a single 19-hour trading session.
+    Tracks a single trading session.
 
     Stops issuing signals once:
-      - wins >= target_wins, OR
-      - net_profit >= target_profit (if configured)
+        - wins >= target_wins, OR
+        - net_profit >= target_profit (if configured)
+
+    Args:
+        target_wins: Number of wins that ends the session.
+        target_profit: Dollar profit target (``None`` = disabled).
+        window_hours: Maximum session duration in hours.
     """
 
     def __init__(
         self,
-        target_wins: int = 10,
-        target_profit: float | None = 20.0,
+        target_wins: int = 30,
+        target_profit: float | None = 450.0,
         window_hours: int = 19,
     ) -> None:
         self.target_wins = target_wins
@@ -62,13 +72,16 @@ class DailySession:
         self.session_start: datetime | None = None
         self.wins: int = 0
         self.losses: int = 0
+        self.draws: int = 0
         self.net_profit: float = 0.0
         self.signals_fired: int = 0
 
     def start(self) -> None:
+        """Begin a new session, resetting all counters."""
         self.session_start = datetime.now(timezone.utc)
         self.wins = 0
         self.losses = 0
+        self.draws = 0
         self.net_profit = 0.0
         self.signals_fired = 0
         logger.info(
@@ -82,13 +95,14 @@ class DailySession:
         )
 
     def is_active(self) -> bool:
-        """True if within the trading window."""
+        """Return ``True`` if the session window has not expired."""
         if self.session_start is None:
             return False
         elapsed = datetime.now(timezone.utc) - self.session_start
         return elapsed < timedelta(hours=self.window_hours)
 
     def is_target_reached(self) -> bool:
+        """Return ``True`` if the win or profit target has been hit."""
         if self.wins >= self.target_wins:
             return True
         if self.target_profit is not None and self.net_profit >= self.target_profit:
@@ -96,6 +110,7 @@ class DailySession:
         return False
 
     def record_win(self, payout: float = 0.0) -> None:
+        """Record a winning trade."""
         self.wins += 1
         self.net_profit += payout
         logger.info(
@@ -109,6 +124,7 @@ class DailySession:
         )
 
     def record_loss(self, stake: float = 0.0) -> None:
+        """Record a losing trade."""
         self.losses += 1
         self.net_profit -= stake
         logger.info(
@@ -120,19 +136,28 @@ class DailySession:
         )
 
     def record_draw(self) -> None:
-        logger.info({"event": "session_draw"})
+        """Record a draw (stake returned)."""
+        self.draws += 1
+        logger.info({"event": "session_draw", "draws": self.draws})
 
     def reset(self) -> None:
+        """Alias for :meth:`start`."""
         self.start()
 
-    def summary(self) -> dict:
+    def summary(self) -> dict[str, Any]:
+        """Return a serialisable snapshot of session state."""
         now = datetime.now(timezone.utc)
-        elapsed = (now - self.session_start).total_seconds() if self.session_start else 0
+        elapsed = (
+            (now - self.session_start).total_seconds() if self.session_start else 0.0
+        )
         return {
-            "session_start": self.session_start.isoformat() if self.session_start else None,
+            "session_start": (
+                self.session_start.isoformat() if self.session_start else None
+            ),
             "elapsed_minutes": round(elapsed / 60, 1),
             "wins": self.wins,
             "losses": self.losses,
+            "draws": self.draws,
             "signals_fired": self.signals_fired,
             "net_profit": round(self.net_profit, 2),
             "target_wins": self.target_wins,
@@ -145,25 +170,32 @@ class DailySession:
 
 # ── Signal Orchestrator ───────────────────────────────────────────────────────
 
+
 class SignalOrchestrator:
     """
     Central gatekeeper between model predictions and webhook delivery.
 
     Signal flow (4 sequential gates):
-      1. Session is active (within trading window)
-      2. Daily target not yet reached
-      3. Per-pair cooldown (60 s)
-      4. Confidence >= martingale_tracker.current_threshold
+        1. Session is active (within trading window)
+        2. Daily target not yet reached
+        3. Per-pair cooldown (60 s)
+        4. Confidence >= martingale_tracker.current_threshold
 
     If all gates pass: build webhook payload, return it.
+
+    Args:
+        config: Application :class:`~config.Config`.
+        martingale_tracker: :class:`MartingaleTracker` instance.
+        daily_session: :class:`DailySession` instance.
+        webhook_key: Static auth key included in every webhook payload.
     """
 
     COOLDOWN_SECONDS = 60
 
     def __init__(
         self,
-        config,
-        martingale_tracker,
+        config: Any,
+        martingale_tracker: Any,
         daily_session: DailySession,
         webhook_key: str = "Ondiek",
     ) -> None:
@@ -174,43 +206,93 @@ class SignalOrchestrator:
 
         # {pair -> last_signal_time}
         self._last_signal: dict[str, datetime] = {}
-        # {signal_id -> signal_payload}
-        self.pending_signals: dict[str, dict] = {}
+        # {signal_id -> signal_metadata}
+        self.pending_signals: dict[str, dict[str, Any]] = {}
 
-        self._stopped: bool = False  # manual stop via Telegram
+        self._stopped: bool = False
 
     # ── Session management ────────────────────────────────────────────────────
 
     def ensure_session_active(self) -> None:
-        """Call at the start of each processing cycle to auto-start/reset session."""
+        """Auto-start session if it has never started or has expired."""
         if self._session.session_start is None:
             self._session.start()
         elif not self._session.is_active():
-            logger.info({"event": "session_window_expired", "summary": self._session.summary()})
-            # Session expired — auto-reset for next window (or wait for new day)
-            # Do not auto-start; let main loop decide based on scheduling
+            logger.info(
+                {
+                    "event": "session_window_expired",
+                    "summary": self._session.summary(),
+                }
+            )
+            # Do not auto-restart — let the scheduling loop or /start command
+            # decide when to begin a new session.
+
+    # ── Pending signal cleanup ────────────────────────────────────────────────
+
+    def _expire_old_signals(self) -> None:
+        """Remove pending signals older than ``PENDING_SIGNAL_TTL_SECONDS``."""
+        now = datetime.now(timezone.utc)
+        expired = [
+            sid
+            for sid, sig in self.pending_signals.items()
+            if (now - sig["fired_at"]).total_seconds() > PENDING_SIGNAL_TTL_SECONDS
+        ]
+        for sid in expired:
+            del self.pending_signals[sid]
+        if expired:
+            logger.info({"event": "pending_signals_expired", "count": len(expired)})
 
     # ── Core signal gate ──────────────────────────────────────────────────────
 
-    def try_signal(self, prediction: dict) -> dict | None:
+    def try_signal(self, prediction: dict[str, Any]) -> dict[str, Any] | None:
         """
         Evaluate a model prediction against all gates.
 
-        Returns webhook payload dict if signal fires, or None if suppressed.
+        Args:
+            prediction: Dict from :meth:`ModelManager.predict` with keys
+                ``pair``, ``direction``, ``confidence``, ``expiry_seconds``.
+
+        Returns:
+            Webhook payload dict if signal fires, or ``None`` if suppressed.
         """
         pair = prediction.get("pair", "")
         confidence = float(prediction.get("confidence", 0.0))
         direction = prediction.get("direction", "")
-        expiry_seconds = int(prediction.get("expiry_seconds", self._config.expiry_seconds))
+        expiry_seconds = int(
+            prediction.get("expiry_seconds", self._config.expiry_seconds)
+        )
+
+        # Diagnostic: log every attempt so we can see which gate blocks
+        logger.info(
+            {
+                "event": "signal_attempt",
+                "pair": pair,
+                "direction": direction,
+                "confidence": confidence,
+                "stopped": self._stopped,
+                "session_active": self._session.is_active(),
+                "target_reached": self._session.is_target_reached(),
+                "threshold": self._mt.current_threshold,
+                "streak": self._mt.current_streak,
+            }
+        )
 
         # Gate 0: manual stop
         if self._stopped:
-            logger.info({"event": "signal_suppressed", "reason": "manual_stop", "pair": pair})
+            logger.debug(
+                {"event": "signal_suppressed", "reason": "manual_stop", "pair": pair}
+            )
             return None
 
         # Gate 1: session active
         if not self._session.is_active():
-            logger.debug({"event": "signal_suppressed", "reason": "session_inactive", "pair": pair})
+            logger.debug(
+                {
+                    "event": "signal_suppressed",
+                    "reason": "session_inactive",
+                    "pair": pair,
+                }
+            )
             return None
 
         # Gate 2: daily target not reached
@@ -255,9 +337,10 @@ class SignalOrchestrator:
             )
             return None
 
-        # All gates passed — build payload
+        # ── All gates passed — build payload ──────────────────────────────
         signal_id = str(uuid.uuid4())
-        symbol = normalize_symbol(pair)
+        otc = bool(prediction.get("otc", False))
+        symbol = normalize_symbol(pair, otc=otc)
         side = DIRECTION_MAP.get(direction.upper(), "buy")
 
         # Exact payload the webhook receiver expects — nothing more
@@ -281,6 +364,9 @@ class SignalOrchestrator:
             "symbol": symbol,
         }
 
+        # Expire stale pending signals
+        self._expire_old_signals()
+
         logger.info(
             {
                 "event": "signal_fired",
@@ -299,16 +385,19 @@ class SignalOrchestrator:
 
     # ── Result feedback ───────────────────────────────────────────────────────
 
-    def on_result(self, result: dict) -> None:
+    def on_result(self, result: dict[str, Any]) -> None:
         """
         Process a trade result from Quotex / external feedback.
 
-        result dict:
-          {pair, direction, result: "win"|"loss"|"draw", payout: float,
-           signal_id: str (optional)}
+        Args:
+            result: Dict with keys ``pair``, ``direction``,
+                ``result`` (``"win"`` / ``"loss"`` / ``"draw"``),
+                ``payout`` (float), ``stake`` (float, optional),
+                ``signal_id`` (str, optional).
         """
         outcome = result.get("result", "").lower()
         payout = float(result.get("payout", 0.0))
+        stake = float(result.get("stake", 0.0))
         pair = result.get("pair", "")
 
         if outcome == "win":
@@ -316,7 +405,7 @@ class SignalOrchestrator:
             self._session.record_win(payout=payout)
         elif outcome == "loss":
             self._mt.record_result(win=False)
-            self._session.record_loss(stake=0.0)  # stake tracked by Quotex bot
+            self._session.record_loss(stake=stake)
         elif outcome == "draw":
             self._session.record_draw()
         else:
@@ -334,36 +423,57 @@ class SignalOrchestrator:
                 "pair": pair,
                 "outcome": outcome,
                 "payout": payout,
+                "stake": stake,
                 "streak": self._mt.current_streak,
                 "threshold": self._mt.current_threshold,
                 "session": self._session.summary(),
             }
         )
 
-        # Check if daily target now reached
         if self._session.is_target_reached():
-            logger.info({"event": "daily_target_reached", "session": self._session.summary()})
+            logger.info(
+                {"event": "daily_target_reached", "session": self._session.summary()}
+            )
 
-    # ── Manual controls (Telegram commands) ──────────────────────────────────
+    # ── Manual controls (Telegram commands) ────────────────────────────────────
 
     def stop(self) -> str:
+        """Halt signal generation immediately."""
         self._stopped = True
         logger.warning({"event": "manual_stop", "source": "telegram"})
         return "Signal generation stopped."
 
     def resume(self) -> str:
+        """Resume signal generation, restarting the session if needed."""
         self._stopped = False
+        if not self._session.is_active():
+            self._session.start()
+            logger.info(
+                {"event": "manual_resume_with_new_session", "source": "telegram"}
+            )
+            return (
+                f"Signal generation resumed. "
+                f"New session started: {self._session.target_wins} wins / "
+                f"${self._session.target_profit} target."
+            )
         logger.info({"event": "manual_resume", "source": "telegram"})
         return "Signal generation resumed."
 
     def start_session(self) -> str:
+        """Force-start a new session and resume signal generation."""
         self._stopped = False
         self._session.start()
-        return f"New session started. Target: {self._session.target_wins} wins / ${self._session.target_profit}."
+        self._last_signal.clear()
+        return (
+            f"New session started. "
+            f"Target: {self._session.target_wins} wins / "
+            f"${self._session.target_profit}."
+        )
 
     # ── Status ────────────────────────────────────────────────────────────────
 
-    def get_status(self) -> dict:
+    def get_status(self) -> dict[str, Any]:
+        """Return a serialisable snapshot of orchestrator state."""
         return {
             "stopped": self._stopped,
             "martingale_streak": self._mt.current_streak,
@@ -375,8 +485,18 @@ class SignalOrchestrator:
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def create_orchestrator(config, martingale_tracker) -> SignalOrchestrator:
-    """Wire up SignalOrchestrator from config."""
+
+def create_orchestrator(config: Any, martingale_tracker: Any) -> SignalOrchestrator:
+    """
+    Wire up :class:`SignalOrchestrator` from config.
+
+    Args:
+        config: Application :class:`~config.Config`.
+        martingale_tracker: :class:`MartingaleTracker` instance.
+
+    Returns:
+        A started :class:`SignalOrchestrator` ready for use.
+    """
     session = DailySession(
         target_wins=config.daily_trade_target,
         target_profit=config.target_net_profit,
