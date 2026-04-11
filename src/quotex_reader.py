@@ -300,6 +300,10 @@ class QuotexReader:
         if not self._client or not self._connected:
             return self._balance
         try:
+            if hasattr(self._client, "change_account"):
+                result = self._client.change_account(self._account_type)
+                if asyncio.iscoroutine(result):
+                    await result
             bal = await asyncio.wait_for(self._client.get_balance(), timeout=5.0)
             return float(bal) if bal is not None else self._balance
         except Exception:
@@ -327,6 +331,7 @@ class QuotexReader:
         # ── Strategy 1: Balance delta (fast, no API calls) ─────────────────
         current = await self._safe_get_balance()
         delta = current - balance_before
+        self._balance = current  # always update
         if abs(delta) > 0.001:
             outcome = "win" if delta > 0 else "loss"
             logger.info(
@@ -548,4 +553,5 @@ async def run_quotex_reader(reader: QuotexReader) -> None:
         while True:
             await asyncio.sleep(3600)
     else:
+        await reader.connect()
         await reader.poll_results()

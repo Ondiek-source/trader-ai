@@ -284,7 +284,7 @@ class StatusStore:
         self._data: dict[str, Any] = {
             "stopped": False,
             "martingale_streak": 0,
-            "confidence_threshold": 0.65,
+            "confidence_threshold": None,
             "pending_signals": 0,
             "practice_mode": True,
             "session": {},

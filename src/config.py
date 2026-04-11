@@ -362,7 +362,7 @@ def load_config() -> Config:
         webhook_key=_optional("WEBHOOK_KEY", "Ondiek"),
         # Trading
         pairs=pairs,
-        confidence_threshold=_float("CONFIDENCE_THRESHOLD", 0.60),
+        confidence_threshold=_float("CONFIDENCE_THRESHOLD", 0.53),
         expiry_seconds=_int("EXPIRY_SECONDS", 60),
         daily_trade_target=_int("DAILY_TRADE_TARGET", 10),
         trading_window_hours=_int("TRADING_WINDOW_HOURS", 19),
