@@ -367,11 +367,11 @@ def load_config() -> Config:
         daily_trade_target=_int("DAILY_TRADE_TARGET", 10),
         trading_window_hours=_int("TRADING_WINDOW_HOURS", 19),
         target_net_profit=target_net_profit,
-        # Operational
+        # Operational overwridden
         practice_mode=_bool("PRACTICE_MODE", True),
         log_level=_optional("LOG_LEVEL", "INFO").upper(),
         tick_flush_size=_int("TICK_FLUSH_SIZE", 500),
-        # Martingale
+        # Martingales
         martingale_max_streak=_int("MARTINGALE_MAX_STREAK", 4),
         # Reporting
         telegram_token=_optional("TELEGRAM_TOKEN", ""),
