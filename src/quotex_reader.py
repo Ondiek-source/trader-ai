@@ -300,10 +300,6 @@ class QuotexReader:
         if not self._client or not self._connected:
             return self._balance
         try:
-            if hasattr(self._client, "change_account"):
-                result = self._client.change_account(self._account_type)
-                if asyncio.iscoroutine(result):
-                    await result
             bal = await asyncio.wait_for(self._client.get_balance(), timeout=5.0)
             return float(bal) if bal is not None else self._balance
         except Exception:
