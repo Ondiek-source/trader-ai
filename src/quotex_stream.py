@@ -200,15 +200,45 @@ class QuotexStream:
 
         raise ConnectionError("Quotex connection exhausted all retries")
 
+    # ── Subscription ───────────────────────────────────────────────────────────
+
+    async def _subscribe_symbols(self, symbols: dict[str, str]) -> None:
+        """Subscribe to real-time price data for all symbols."""
+        for pair, symbol in symbols.items():
+            try:
+                result = self._client.subscribe_realtime_candle(symbol)
+                if asyncio.iscoroutine(result):
+                    await result
+                logger.info(
+                    {
+                        "event": "quotex_subscribed",
+                        "pair": pair,
+                        "symbol": symbol,
+                    }
+                )
+            except Exception as exc:
+                logger.error(
+                    {
+                        "event": "quotex_subscribe_failed",
+                        "pair": pair,
+                        "symbol": symbol,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                )
+
+        await asyncio.sleep(5)
+
     # ── Polling loop ───────────────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
         """
-        Poll each pair's OTC symbol forever.
-
-        Uses the confirmed format: EURUSD_otc.
+        Subscribe to each pair's OTC symbol, then poll forever.
         """
         symbols = {p: _to_quotex_symbol(p) for p in self._pairs}
+
+        # Subscribe before polling — Quotex returns empty dicts otherwise
+        await self._subscribe_symbols(symbols)
 
         logger.info(
             {
@@ -226,13 +256,7 @@ class QuotexStream:
                 try:
                     price = await self._get_price(symbol)
                     if price is None:
-                        logger.warning(
-                            {
-                                "event": "quotex_no_price",
-                                "pair": pair,
-                                "symbol": symbol,
-                            }
-                        )
+                        # Don't log warning for empty dict — subscription warming up
                         continue
 
                     tick = self._make_tick(pair, price)
@@ -265,14 +289,14 @@ class QuotexStream:
         try:
             result = await self._client.get_realtime_price(symbol)
 
-            # Log the raw result once so we can see the schema
+            # Log raw result once for schema discovery
             if not hasattr(self, "_logged_raw_price"):
                 logger.info(
                     {
                         "event": "quotex_raw_realtime_price",
                         "symbol": symbol,
                         "result_type": type(result).__name__,
-                        "result_preview": str(result)[:400],
+                        "result_repr": repr(result)[:400],
                     }
                 )
                 self._logged_raw_price = True
@@ -280,8 +304,10 @@ class QuotexStream:
             if result is None:
                 return None
 
-            # Result is a dict — extract the price value
+            # Empty dict — subscription not ready yet, silently skip
             if isinstance(result, dict):
+                if not result:
+                    return None
                 for key in ("price", "value", "close", "last", "bid", "ask"):
                     if key in result:
                         val = float(result[key])
@@ -296,18 +322,11 @@ class QuotexStream:
                 )
                 return None
 
-            # Result is a plain number
+            # Plain number
             if isinstance(result, (int, float)):
                 val = float(result)
                 return val if val > 0 else None
 
-            logger.warning(
-                {
-                    "event": "quotex_price_unknown_type",
-                    "symbol": symbol,
-                    "type": type(result).__name__,
-                }
-            )
             return None
 
         except AttributeError:
@@ -325,26 +344,14 @@ class QuotexStream:
         # ── Fallback: get_candles ───────────────────────────────────────────
         try:
             candles = await self._client.get_candles(symbol, 60, 1)
-
             if not candles or len(candles) == 0:
                 return None
-
             candle = candles[-1]
             if not isinstance(candle, dict):
                 return None
-
             close = float(candle.get("close", 0))
             return close if close > 0 else None
-
-        except Exception as exc:
-            logger.error(
-                {
-                    "event": "quotex_candles_error",
-                    "symbol": symbol,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                }
-            )
+        except Exception:
             return None
 
     # ── Tick construction ──────────────────────────────────────────────────────
