@@ -7,11 +7,11 @@ records compatible with the existing storage schema, then writes monthly
 parquet blobs.
 
 Strategy:
-  - One REST request = up to 5000 M1 bars (~3.5 days of market hours)
-  - Walks backwards from today, fetching 5000-bar chunks
-  - Stops when target coverage is reached or 2 years covered
-  - Free plan: 800 requests/day, 8/min → full 2yr backfill in ~150 requests
-  - Skips months already present in blob storage (idempotent)
+    - One REST request = up to 5000 M1 bars (~3.5 days of market hours)
+    - Walks backwards from today, fetching 5000-bar chunks
+    - Stops when target coverage is reached or 2 years covered
+    - Free plan: 800 requests/day, 8/min → full 2yr backfill in ~150 requests
+    - Skips months already present in blob storage (idempotent)
 
 Rate limiting: 1 request per 8s to stay within 8 req/min free tier limit.
 """
@@ -39,8 +39,8 @@ PAIR_TO_TD: dict[str, str] = {
 
 TD_BASE = "https://api.twelvedata.com/time_series"
 CHUNK_SIZE = 5000  # bars per request (Twelve Data max)
-REQUEST_INTERVAL = 8.0  # seconds between requests (8/min = free tier limit)
-BACKFILL_YEARS = 5  # how many years to try to fetch
+REQUEST_INTERVAL = 10.0  # seconds between requests (8/min = free tier limit)
+BACKFILL_YEARS = 2  # how many years to try to fetch
 
 
 def _bars_to_ticks(bars: list[dict], pair: str) -> pd.DataFrame:
@@ -95,17 +95,19 @@ async def backfill_pair(
     if not symbol:
         logger.error({"event": "backfill_unknown_pair", "pair": pair})
         return
-    
+
     # ========== NEW: Quick check using check_data_coverage ==========
     if check_data_coverage(pair, storage, min_days=365 * years_back):
-        logger.info({
-            "event": "backfill_skipped_quick",
-            "pair": pair,
-            "reason": f"Already have {years_back}+ years of data in blob storage",
-        })
+        logger.info(
+            {
+                "event": "backfill_skipped_quick",
+                "pair": pair,
+                "reason": f"Already have {years_back}+ years of data in blob storage",
+            }
+        )
         return
     # ========== End of quick check ==========
-    
+
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=365 * years_back)
 

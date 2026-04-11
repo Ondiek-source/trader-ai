@@ -2,18 +2,18 @@
 reporter.py — Telegram bot controller + Discord/Telegram daily HTML session reports.
 
 Telegram bot commands:
-  /status   — Current session state (wins, losses, streak, profit)
-  /stop     — Halt signal generation immediately
-  /start    — Resume signal generation / start new session
-  /report   — Send the current session HTML report now
-  /threshold — Show current confidence threshold
+    /status   — Current session state (wins, losses, streak, profit)
+    /stop     — Halt signal generation immediately
+    /start    — Resume signal generation / start new session
+    /report   — Send the current session HTML report now
+    /threshold — Show current confidence threshold
 
 Discord integration:
-  - Sends HTML-formatted session summary to a Discord webhook URL
+    - Sends HTML-formatted session summary to a Discord webhook URL
 
 Telegram integration:
-  - Sends Markdown/HTML session summary to a Telegram chat
-  - Responds to commands via long-polling
+    - Sends Markdown/HTML session summary to a Telegram chat
+    - Responds to commands via long-polling
 
 Both channels send at end of session window (or on demand via /report).
 """
@@ -188,11 +188,11 @@ class TelegramBot:
     Simple long-polling Telegram bot.
 
     Commands:
-      /status   — session status
-      /stop     — halt signal generation
-      /start    — resume / start new session
-      /report   — send report now
-      /threshold — show current confidence threshold
+        /status   — session status
+        /stop     — halt signal generation
+        /start    — resume / start new session
+        /report   — send report now
+        /threshold — show current confidence threshold
     """
 
     BASE_URL = "https://api.telegram.org/bot{token}/{method}"
@@ -213,10 +213,20 @@ class TelegramBot:
 
     async def _api_async(self, method: str, **kwargs) -> dict | None:
         url = self.BASE_URL.format(token=self._token, method=method)
-        timeout = aiohttp.ClientTimeout(total=35)
+
+        # Use a shorter timeout and better error handling
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=kwargs) as resp:
+                    if resp.status == 429:
+                        # Rate limited - wait and retry logic could go here
+                        logger.warning(
+                            {"event": "telegram_rate_limited", "method": method}
+                        )
+                        return None
+
                     data = await resp.json()
                     if not data.get("ok"):
                         logger.warning(
@@ -227,8 +237,18 @@ class TelegramBot:
                             }
                         )
                     return data
+
         except asyncio.TimeoutError:
             logger.warning({"event": "telegram_timeout", "method": method})
+            return None
+        except aiohttp.ClientError as exc:
+            logger.warning(
+                {
+                    "event": "telegram_client_error",
+                    "method": method,
+                    "error": str(exc),
+                }
+            )
             return None
         except Exception as exc:
             logger.warning(
@@ -236,6 +256,7 @@ class TelegramBot:
                     "event": "telegram_request_failed",
                     "method": method,
                     "error": str(exc),
+                    "error_type": type(exc).__name__,
                 }
             )
             return None

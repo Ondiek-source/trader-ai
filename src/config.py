@@ -190,7 +190,7 @@ def load_config() -> Config:
         result_callback_port=_int("RESULT_CALLBACK_PORT", 8080),
         quotex_read_results=_bool("QUOTEX_READ_RESULTS", True),
         # Training parameters
-        backfill_years=_int("BACKFILL_YEARS", 5),
+        backfill_years=_int("BACKFILL_YEARS", 2),
         optimize_expiry=_bool("OPTIMIZE_EXPIRY", True),
         max_sequences=_int("MAX_SEQUENCES", 20000),
     )
