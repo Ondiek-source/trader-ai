@@ -41,8 +41,13 @@ PAIR_TO_ASSETS: dict[str, list[str]] = {
     "EUR_USD": ["EURUSD", "EURUSD_otc"],
     "GBP_USD": ["GBPUSD", "GBPUSD_otc"],
     "USD_JPY": ["USDJPY", "USDJPY_otc"],
+    "AUD_USD": ["AUDUSD", "AUDUSD_otc"],
+    "USD_CAD": ["USDCAD", "USDCAD_otc"],
+    "USD_CHF": ["USDCHF", "USDCHF_otc"],
+    "NZD_USD": ["NZDUSD", "NZDUSD_otc"],
     "XAU_USD": ["XAUUSD", "XAUUSD_otc"],
 }
+
 
 # Direction: our internal → Quotex API
 DIRECTION_TO_QUOTEX: dict[str, str] = {"UP": "call", "DOWN": "put"}
