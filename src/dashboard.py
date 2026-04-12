@@ -213,7 +213,7 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
       const streak = d.martingale_streak ?? 0;
       const streakEl = document.getElementById('streak');
       streakEl.textContent = streak;
-      streakEl.className = 'card-value ' + (streak === 0 ? 'green' : streak >= 3 ? 'red' : 'yellow');
+      streakEl.className = 'card-value ' + (streak === 0 ? 'green' : streak >= 2 ? 'red' : 'yellow');
 
       document.getElementById('pending').textContent = d.pending_signals ?? 0;
       document.getElementById('practice').innerHTML =

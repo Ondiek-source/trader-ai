@@ -109,8 +109,8 @@ class QuotexReader:
         self._account_type = "PRACTICE" if practice_mode else "REAL"
 
         # Accept a pre-built shared client (e.g. from QuotexStream) so that
-        # only one WebSocket session is opened per Quotex account.  When None,
-        # connect() will create its own client as before.
+        # only one WebSocket session is opened per Quotex account. When None,
+        # connect() creates its own client.
         self._client: Any = client
         self._connected = False
         self._balance: float = 0.0
@@ -132,9 +132,8 @@ class QuotexReader:
         """Establish WebSocket connection to Quotex.
 
         If a shared client was injected at construction time (e.g. the same
-        client used by QuotexStream), this method reuses it and only sets the
-        account mode / fetches the initial balance — it does NOT open a second
-        WebSocket connection.
+        client used by QuotexStream), reuses it — only sets the account mode
+        and fetches the initial balance without opening a second WebSocket.
         """
         if not QUOTEX_LIB_AVAILABLE:
             return False
@@ -143,8 +142,8 @@ class QuotexReader:
             return False
 
         try:
-            # Only create a new client when none was injected.
             if self._client is None:
+                # No shared client — create and connect our own
                 self._client = _QuotexClient(
                     email=self._email,
                     password=self._password,
@@ -157,11 +156,10 @@ class QuotexReader:
                     )
                     return False
             else:
-                # Shared client — assume the caller already connected it.
+                # Shared client — caller already connected it
                 reason = "shared_client"
 
             self._connected = True
-            # Switch to correct account type
             if hasattr(self._client, "change_account"):
                 result = self._client.change_account(self._account_type)
                 if asyncio.iscoroutine(result):
@@ -178,7 +176,7 @@ class QuotexReader:
                     "account_type": self._account_type,
                     "balance": self._balance,
                     "reason": str(reason),
-                    "shared_client": self._client is not None and reason == "shared_client",
+                    "shared_client": reason == "shared_client",
                 }
             )
             return True
@@ -388,7 +386,11 @@ class QuotexReader:
                     "outcome": outcome,
                 }
             )
-            return self._make_result(signal_id, pair, direction, outcome, abs(delta))
+            return self._make_result(
+                signal_id, pair, direction, outcome,
+                payout=abs(delta) if outcome == "win" else 0.0,
+                stake=abs(delta) if outcome == "loss" else 0.0,
+            )
 
         # ── Strategy 2: get_history() scan ─────────────────────────────────
         history_result = await self._match_from_history(pair, direction, expiry_time)
@@ -398,6 +400,27 @@ class QuotexReader:
                 "signal_id": signal_id,
                 "detection": "api_history",
             }
+
+        # ── Strategy 3: near-zero delta fallback = draw ────────────────────
+        # If balance hasn't moved at all after expiry + buffer, and history
+        # also found nothing, the most likely outcome is a draw (stake returned).
+        # Only treat as draw when delta is genuinely zero — not just below our
+        # 0.001 noise threshold on a loss.
+        if abs(delta) < 0.001:
+            logger.info(
+                {
+                    "event": "result_from_zero_delta",
+                    "signal_id": signal_id,
+                    "pair": pair,
+                    "delta": round(delta, 6),
+                    "outcome": "draw",
+                }
+            )
+            return self._make_result(
+                signal_id, pair, direction, "draw",
+                payout=0.0,
+                stake=0.0,
+            )
 
         return None
 
@@ -480,7 +503,11 @@ class QuotexReader:
                             }
                         )
                         outcome = "win" if str(status).lower() == "win" else "loss"
-                        return self._make_result("", pair, direction, outcome, profit)
+                        return self._make_result(
+                            "", pair, direction, outcome,
+                            payout=abs(profit) if outcome == "win" else 0.0,
+                            stake=abs(profit) if outcome == "loss" else 0.0,
+                        )
                     except Exception:
                         pass
 
@@ -502,7 +529,11 @@ class QuotexReader:
                         "ticket": item.get("ticket"),
                     }
                 )
-                return self._make_result("", pair, direction, outcome, profit)
+                return self._make_result(
+                    "", pair, direction, outcome,
+                    payout=abs(profit) if outcome == "win" else 0.0,
+                    stake=abs(profit) if outcome == "loss" else 0.0,
+                )
 
         except asyncio.TimeoutError:
             logger.warning({"event": "quotex_history_timeout", "pair": pair})
@@ -527,6 +558,7 @@ class QuotexReader:
         direction: str,
         outcome: str,
         payout: float,
+        stake: float = 0.0,
     ) -> dict[str, Any]:
         """Build a standardised result dict for SignalOrchestrator.on_result."""
         logger.info(
@@ -537,6 +569,7 @@ class QuotexReader:
                 "direction": direction,
                 "outcome": outcome,
                 "payout": round(abs(payout), 4),
+                "stake": round(stake, 4),
             }
         )
         return {
@@ -544,8 +577,13 @@ class QuotexReader:
             "pair": pair,
             "direction": direction,
             "result": outcome,
-            "payout": round(abs(payout), 4),
-            "stake": 0.0,
+            # payout = amount won (wins) or 0 (losses/draws)
+            "payout": round(abs(payout), 4) if outcome == "win" else 0.0,
+            # stake = amount risked — used by DailySession.record_loss to
+            # deduct from net_profit. For balance-delta results, stake equals
+            # the absolute delta (the money lost). For history results, stake
+            # equals the absolute profit amount when outcome is loss.
+            "stake": round(abs(stake), 4),
             "received_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -588,11 +626,11 @@ class QuotexReader:
 async def run_quotex_reader(reader: QuotexReader) -> None:
     """Top-level entry point for asyncio.create_task.
 
-    NOTE: Does NOT call reader.connect() — main() already connected the reader
-    before launching this task.  Calling connect() a second time would open a
-    duplicate WebSocket session on the same Quotex account, which kills the
-    first session.  If the reader is not yet connected (e.g. initial connect
-    failed), poll_results()'s internal _reconnect() loop will handle it.
+    Does NOT call reader.connect() — main() already connected the reader
+    before launching this task. Calling connect() a second time opens a
+    duplicate WebSocket session on the same Quotex account, which kills
+    the first. If the initial connect failed, poll_results()'s internal
+    _reconnect() loop handles recovery.
     """
     if not QUOTEX_LIB_AVAILABLE:
         logger.info(

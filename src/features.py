@@ -152,7 +152,7 @@ def compute_features(tick_df: pd.DataFrame, expiry_seconds: int = 60) -> pd.Data
     #   This matches the broker's execution: entry at N+1 open, exit at
     #   N+expiry_bars close.
     expiry_bars: int = max(1, expiry_seconds // 60)
-    bars["label"] = (bars["close"].shift(-expiry_bars) > bars["open"].shift(-1)).astype(
+    bars["label"] = (bars["close"].shift(-expiry_bars) > bars["open"].shift(-expiry_bars)).astype(
         float
     )
     # Last expiry_bars rows cannot have a label

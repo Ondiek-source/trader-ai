@@ -577,6 +577,9 @@ async def feedback_task(
     while True:
         result: dict[str, Any] | None = await quotex_reader.get_result(timeout=1.0)
         if result is None:
+            # get_result already waited up to timeout — yield briefly before
+            # retrying to avoid spinning at ~10 calls/s when idle.
+            await asyncio.sleep(0.1)
             continue
 
         orchestrator.on_result(result)
@@ -645,10 +648,13 @@ async def health_task(
             else {"connected": False, "balance": 0.0}
         )
 
-        # Memory and CPU metrics
+        # Memory and CPU metrics — cpu_percent(interval=1) blocks for 1 s;
+        # run it in an executor so the event loop stays responsive.
         process = psutil.Process()
         memory_mb: float = process.memory_info().rss / 1024 / 1024
-        cpu_percent: float = process.cpu_percent(interval=1)
+        cpu_percent: float = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: process.cpu_percent(interval=1)
+        )
 
         logger.info(
             {
@@ -665,7 +671,10 @@ async def health_task(
             }
         )
 
-        # Backup push — feedback_task is the primary pusher
+        # Backup push — feedback_task is the primary pusher for session state.
+        # Do NOT include quotex= here: _balance_monitor pushes balance every
+        # 1.5 s directly to status_store.  Overwriting it here with a 10 s
+        # snapshot would show a stale balance on the dashboard.
         _push_dashboard(
             orchestrator,
             config,
@@ -673,8 +682,16 @@ async def health_task(
                 "connected": True,
                 "ticks_received": stream.ticks_received,
             },
-            quotex=qhealth,
         )
+        # Update connection status only — preserve balance already set by _balance_monitor
+        if quotex_reader:
+            connected = quotex_reader._connected
+            with status_store._lock:
+                existing_quotex = status_store._data.get("quotex", {})
+                status_store._data["quotex"] = {
+                    **existing_quotex,
+                    "connected": connected,
+                }
 
 
 async def backfill_task(config: Any, storage: StorageManager) -> None:
@@ -974,16 +991,21 @@ async def main() -> None:
     # ── Data source selection ───────────────────────────────────────────────
     stream: TwelveDataStream | QuotexStream
 
+    # Single shared Quotex client — Quotex only supports one active WebSocket
+    # session per account. QuotexStream (tick data) and QuotexReader (result
+    # reading) must share this client, not each create their own connection.
+    shared_qx_client: Any = None
+
     if config.use_quotex_streaming and config.quotex_email:
         from pyquotex.stable_api import Quotex
 
-        qx_client = Quotex(
+        shared_qx_client = Quotex(
             config.quotex_email,
             config.quotex_password,
             lang="en",
         )
         stream = QuotexStream(
-            client=qx_client,
+            client=shared_qx_client,
             pairs=config.pairs,
             storage=storage,
             flush_size=config.tick_flush_size,
@@ -1005,13 +1027,16 @@ async def main() -> None:
         secret=config.webhook_secret,
     )
 
+    has_quotex_creds: bool = bool(config.quotex_email and config.quotex_password)
+
+    # QuotexReader reuses shared_qx_client when Quotex streaming is active so
+    # there is only ever one WebSocket session. When using Twelve Data for
+    # ticks, shared_qx_client is None and QuotexReader self-connects.
     quotex_reader: QuotexReader = QuotexReader(
-        email=getattr(config, "quotex_email", ""),
-        password=getattr(config, "quotex_password", ""),
+        email=config.quotex_email,
+        password=config.quotex_password,
         practice_mode=config.practice_mode,
-    )
-    has_quotex_creds: bool = bool(
-        getattr(config, "quotex_email", "") and getattr(config, "quotex_password", "")
+        client=shared_qx_client,
     )
     if has_quotex_creds:
         await quotex_reader.connect()
