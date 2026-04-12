@@ -210,20 +210,25 @@ async def backfill_pair(
         logger.error({"event": "backfill_unknown_pair", "pair": pair})
         return
 
-    # Quick existence check — no data downloaded
-    if check_data_coverage(pair, storage, min_days=365 * years_back):
+    # 1. Define the timeframe first
+    end_date: datetime = datetime.now(timezone.utc)
+    start_date: datetime = end_date - timedelta(days=365 * years_back)
+    
+    # 2. Define the path for the oldest required month (e.g., April 2024)
+    oldest_month_path = storage._tick_blob_path(pair, start_date.year, start_date.month)
+    
+    # 3. Improved Coverage Check
+    # We skip ONLY if the oldest month exists AND the general coverage check passes.
+    if storage.blob_exists(oldest_month_path) and check_data_coverage(pair, storage, min_days=365 * years_back):
         logger.info(
             {
                 "event": "backfill_skipped",
                 "pair": pair,
-                "reason": f"{years_back}+ years of data already in blob storage",
+                "reason": f"Data for {start_date.strftime('%Y-%m')} already exists; coverage complete.",
             }
         )
         return
-
-    end_date: datetime = datetime.now(timezone.utc)
-    start_date: datetime = end_date - timedelta(days=365 * years_back)
-
+    
     logger.info(
         {
             "event": "backfill_start",

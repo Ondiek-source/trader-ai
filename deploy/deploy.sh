@@ -25,9 +25,6 @@ GITHUB_REPO="${GITHUB_REPO:-Ondiek-source/trader-ai}"
 CONTAINER_PORT="${CONTAINER_PORT:-8080}"
 DNS_LABEL="${DNS_LABEL:-trader-ai-bot}"
 
-MODEL_WAIT_TIMEOUT="${MODEL_WAIT_TIMEOUT:-1200}"
-MODEL_POLL_INTERVAL="${MODEL_POLL_INTERVAL:-30}"
-
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 
 for cmd in az gh; do
@@ -123,8 +120,7 @@ cleanup_acr() {
     --name "$ACR_NAME" \
     --repository trader-ai \
     --orderby time_desc \
-    --query "[?name != 'latest'].name" \
-    --output tsv 2>/dev/null || true)
+    --queryoutput tsv 2>/dev/null || true)
 
   if [[ -z "$all_tags" ]]; then
     echo "  No non-latest tags found — nothing to delete."
@@ -185,7 +181,8 @@ for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do
   state=$(az provider show --namespace "$provider" \
             --query registrationState --output tsv 2>/dev/null || echo "NotRegistered")
   if [[ "$state" != "Registered" ]]; then
-    echo "Registering $provider (one-time, ~1 minute)..."
+    "[?name != 'latest'].name" \
+    -- echo "Registering $provider (one-time, ~1 minute)..."
     az provider register --namespace "$provider" --wait
     echo "      Done."
   fi
@@ -314,52 +311,6 @@ fi
 
 "${_CREATE_CMD[@]}"
 
-# ── Step 6: Wait for models to train and save ─────────────────────────────────
-
-echo ""
-echo "Waiting up to ${MODEL_WAIT_TIMEOUT}s for models to appear in blob storage..."
-
-elapsed=0
-model_count=0
-
-while (( elapsed < MODEL_WAIT_TIMEOUT )); do
-  sleep "$MODEL_POLL_INTERVAL"
-  elapsed=$(( elapsed + MODEL_POLL_INTERVAL ))
-
-  model_count=$(az storage blob list \
-    --account-name "$STORAGE_ACCOUNT" \
-    --container-name "$CONTAINER_NAME" \
-    --prefix "models/" \
-    --query "length([])" \
-    --output tsv 2>/dev/null || echo "0")
-
-  if (( model_count > 0 )); then
-    echo "  ✅ $model_count model file(s) saved to blob storage (${elapsed}s elapsed)."
-    break
-  fi
-
-  echo "  ... ${elapsed}s elapsed, no models yet (checking every ${MODEL_POLL_INTERVAL}s)"
-done
-
-if (( model_count == 0 )); then
-  echo ""
-  echo "❌ FAILED: No models found after ${MODEL_WAIT_TIMEOUT}s."
-  echo ""
-  echo "  Check container logs:"
-  echo "    az container logs --name $ACI_NAME --resource-group $RESOURCE_GROUP --follow"
-  echo ""
-  echo "  Check container status:"
-  echo "    az container show --name $ACI_NAME --resource-group $RESOURCE_GROUP --query instanceView.state"
-  echo ""
-
-  echo "  Last 30 lines of container logs:"
-  az container logs \
-    --name "$ACI_NAME" \
-    --resource-group "$RESOURCE_GROUP" 2>/dev/null | tail -n 30 || echo "  (could not retrieve logs)"
-
-  exit 1
-fi
-
 # ── Summary ────────────────────────────────────────────────────────────────────
 
 DASHBOARD_IP=$(az container show \
@@ -386,4 +337,7 @@ echo "    az container logs --name $ACI_NAME --resource-group $RESOURCE_GROUP --
 echo ""
 echo "  Check status:"
 echo "    az container show --name $ACI_NAME --resource-group $RESOURCE_GROUP --query instanceView.state"
+echo ""
+echo "  Check for models:"
+echo "    az storage blob list --account-name $STORAGE_ACCOUNT --container-name $CONTAINER_NAME --prefix models/ --output table"
 echo "=========================================="
