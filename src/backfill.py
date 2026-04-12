@@ -200,6 +200,18 @@ def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["timestamp", "bid", "ask", "spread", "pair"])
 
     df: pd.DataFrame = pd.DataFrame(rows)
+    # Log the summary before returning
+    logger.info(
+        {
+            "event": "ticks_conversion_complete",
+            "pair": pair,
+            "ticks_generated": len(df),
+            "start": str(df["timestamp"].min()),
+            "end": str(df["timestamp"].max()),
+            "function": "_bars_to_ticks",
+            "file": "backfill.py",
+        }
+    )
     return (
         df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
     )

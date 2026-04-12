@@ -78,9 +78,12 @@ def _configure_logging(level: str = "INFO") -> None:
     logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
         logging.WARNING
     )
+    # 2. Silence the external firehoses
     logging.getLogger("azure").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
+    logging.getLogger("pyquotex.ws.client").setLevel(logging.WARNING) 
+
 
 
 # ── Import application modules ─────────────────────────────────────────────────
