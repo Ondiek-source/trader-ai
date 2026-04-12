@@ -17,6 +17,7 @@ from typing import Any
 
 from azure.core.exceptions import AzureError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
+from azure.core.pipeline.transport import RequestsTransport
 
 
 class BlobLogHandler(logging.Handler):
@@ -56,8 +57,22 @@ class BlobLogHandler(logging.Handler):
         self._instance_id: str = uuid.uuid4().hex[:8]
         self._buffer_size: int = buffer_size
         self._buffer: list[str] = []
-        self._client: BlobServiceClient | None = None
-
+        transport = RequestsTransport(
+            pool_connections=10,  # Number of pooled connections
+            pool_maxsize=20,  # Max total connections
+            retry_total=5,  # Total retry attempts
+            retry_backoff_factor=0.5,  # Backoff factor for retries
+        )
+        self._client: BlobServiceClient = (
+            BlobServiceClient.from_connection_string(
+                conn_string,
+                transport=transport,
+                logging_enable=False,
+                retry_on_timeout=True,
+                timeout=10,
+            )
+            | None
+        )
         try:
             self._client = BlobServiceClient.from_connection_string(conn_string)
         except Exception:
@@ -103,63 +118,44 @@ class BlobLogHandler(logging.Handler):
             self.handleError(record)
 
     def flush(self) -> None:
-        """
-        Upload buffered records to Azure Blob Storage.
-
-        If the blob already exists (earlier records from the same instance),
-        new records are appended by reading the existing content and
-        re-uploading the concatenation.
-
-        If the Azure client is unavailable, the buffer is silently dropped
-        with a stderr warning.  On upload failure, records are retained in
-        the buffer for the next flush attempt.
-        """
         if not self._buffer:
             return
 
-        if self._client is None:
-            sys.stderr.write(
-                f"[BlobLogHandler] Dropping {len(self._buffer)} records "
-                f"— no blob client.\n"
-            )
-            self._buffer = []
-            return
-
-        blob_name: str = self._blob_name
-        payload: str = "".join(self._buffer)
+        payload = "".join(self._buffer)
+        blob_client = self._client.get_blob_client(
+            container=self._container_name, blob=self._blob_name
+        )
 
         try:
-            blob_client = self._client.get_blob_client(
-                container=self._container_name, blob=blob_name
-            )
-
-            existing: str = ""
             try:
-                existing = blob_client.download_blob().readall().decode("utf-8")
+                blob_client.append_block(payload)
             except ResourceNotFoundError:
-                pass  # first write of the day — fine
+                # First time writing this specific UUID log file
+                blob_client.create_append_blob()
+                blob_client.append_block(payload)
 
-            blob_client.upload_blob(existing + payload, overwrite=True)
+            # Success - clear the buffer
             self._buffer = []
 
-        except AzureError:
-            # Don't clear buffer — retry on next flush
-            sys.stderr.write(
-                f"[BlobLogHandler] Azure error flushing "
-                f"{len(self._buffer)} records — retaining for retry.\n"
-            )
-        except Exception:
-            sys.stderr.write(
-                f"[BlobLogHandler] Unexpected error flushing "
-                f"{len(self._buffer)} records — retaining for retry.\n"
-            )
+        except AzureError as e:
+            # Catching the "Wrong Blob Type" error specifically
+            if "BlobTypeMismatch" in str(e):
+                sys.stderr.write(
+                    "[BlobLogHandler] Critical: Cannot append to a BlockBlob. Delete old logs.\n"
+                )
 
-    def close(self) -> None:
-        """Flush remaining records and release resources."""
-        try:
-            self.flush()
-        finally:
-            super().close()
+            sys.stderr.write(
+                f"[BlobLogHandler] Azure error flushing {len(self._buffer)} records.\n"
+            )
+        except Exception as e:
+            sys.stderr.write(f"[BlobLogHandler] Unexpected error: {e}\n")
+
+        def close(self) -> None:
+            """Flush remaining records and release resources."""
+            try:
+                self.flush()
+            finally:
+                super().close()
 
     # ── Dunder ────────────────────────────────────────────────────────────────
 

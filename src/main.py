@@ -34,6 +34,7 @@ import pandas as pd
 import psutil
 from urllib3 import Retry
 
+
 # ── JSON structured logging ────────────────────────────────────────────────────
 
 
@@ -78,6 +79,8 @@ def _configure_logging(level: str = "INFO") -> None:
         logging.WARNING
     )
     logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
 
 
 # ── Import application modules ─────────────────────────────────────────────────

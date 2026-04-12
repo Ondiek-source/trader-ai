@@ -79,11 +79,17 @@ class StorageManager:
         flush_size: int = 500,
     ) -> None:
         transport = RequestsTransport(
-            pool_connections=20,  # Number of pooled connections
-            pool_maxsize=50,  # Max total connections
+            pool_connections=10,  # Number of pooled connections
+            pool_maxsize=20,  # Max total connections
+            retry_total=5,  # Total retry attempts
+            retry_backoff_factor=0.5,  # Backoff factor for retries
         )
         self._client: BlobServiceClient = BlobServiceClient.from_connection_string(
-            conn_string, transport=transport
+            conn_string,
+            transport=transport,
+            logging_enable=False,
+            retry_on_timeout=True,
+            timeout=10,
         )
         self._container: str = container_name
         self._flush_size: int = flush_size
