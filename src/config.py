@@ -21,7 +21,6 @@ VALID_PAIRS: set[str] = {
     "AUD_USD",
     "USD_CAD",
     "USD_CHF",
-    "NZD_USD",
     "XAU_USD",
 }
 VALID_EXPIRIES: set[int] = {60, 120, 300}
