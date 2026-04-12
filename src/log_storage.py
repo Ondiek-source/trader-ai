@@ -48,7 +48,7 @@ class BlobLogHandler(logging.Handler):
         self,
         conn_string: str,
         container_name: str,
-        buffer_size: int = 10,
+        buffer_size: int = 100,
         blob_prefix: str = "trader-ai-engine",
     ) -> None:
         super().__init__()
@@ -58,23 +58,19 @@ class BlobLogHandler(logging.Handler):
         self._buffer_size: int = buffer_size
         self._buffer: list[str] = []
         transport = RequestsTransport(
-            pool_connections=10,  # Number of pooled connections
-            pool_maxsize=20,  # Max total connections
-            retry_total=5,  # Total retry attempts
+            pool_connections=2,  # Number of pooled connections
+            pool_maxsize=5,  # Max total connections
+            retry_total=3,  # Total retry attempts
             retry_backoff_factor=0.5,  # Backoff factor for retries
         )
-        self._client: BlobServiceClient = (
-            BlobServiceClient.from_connection_string(
+
+        try:
+            self._client: BlobServiceClient = BlobServiceClient.from_connection_string(
                 conn_string,
                 transport=transport,
-                logging_enable=False,
                 retry_on_timeout=True,
                 timeout=10,
             )
-            | None
-        )
-        try:
-            self._client = BlobServiceClient.from_connection_string(conn_string)
         except Exception:
             # Use sys.stderr directly — logging here would recurse.
             sys.stderr.write("[BlobLogHandler] Failed to initialise blob client.\n")
@@ -150,12 +146,12 @@ class BlobLogHandler(logging.Handler):
         except Exception as e:
             sys.stderr.write(f"[BlobLogHandler] Unexpected error: {e}\n")
 
-        def close(self) -> None:
-            """Flush remaining records and release resources."""
-            try:
-                self.flush()
-            finally:
-                super().close()
+    def close(self) -> None:
+        """Flush remaining records and release resources."""
+        try:
+            self.flush()
+        finally:
+            super().close()
 
     # ── Dunder ────────────────────────────────────────────────────────────────
 

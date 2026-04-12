@@ -87,7 +87,6 @@ class StorageManager:
         self._client: BlobServiceClient = BlobServiceClient.from_connection_string(
             conn_string,
             transport=transport,
-            logging_enable=False,
             retry_on_timeout=True,
             timeout=10,
         )
