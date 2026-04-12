@@ -169,6 +169,8 @@ def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
             h: float = float(bar["high"])
             l_: float = float(bar["low"])
             c: float = float(bar["close"])
+            # We strip tzinfo to avoid the Pandas localization crash.
+            dt_naive = dt.replace(tzinfo=None)
             for offset_s, price in [(0, o), (15, h), (30, l_), (45, c)]:
                 rows.append(
                     {
@@ -193,19 +195,6 @@ def _bars_to_ticks(bars: list[dict[str, Any]], pair: str) -> pd.DataFrame:
                 }
             )
             continue
-
-        for offset_s, price in [(0, o), (15, h), (30, l_), (45, c)]:
-            rows.append(
-                {
-                    "timestamp": pd.Timestamp(
-                        dt + timedelta(seconds=offset_s), tz="UTC"
-                    ),
-                    "bid": price,
-                    "ask": price,
-                    "spread": 0.0,
-                    "pair": pair,
-                }
-            )
 
     if not rows:
         return pd.DataFrame(columns=["timestamp", "bid", "ask", "spread", "pair"])
