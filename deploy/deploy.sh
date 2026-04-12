@@ -20,7 +20,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AZURE_ENV="$SCRIPT_DIR/azure.env"
 APP_ENV="$PROJECT_ROOT/.env"
-
 GITHUB_REPO="${GITHUB_REPO:-Ondiek-source/trader-ai}"
 CONTAINER_PORT="${CONTAINER_PORT:-8080}"
 DNS_LABEL="${DNS_LABEL:-trader-ai-bot}"
@@ -293,6 +292,7 @@ _CREATE_CMD=(
     --cpu "$ACI_CPU"
     --memory "$ACI_MEMORY"
     --location "$LOCATION"
+
     --os-type Linux
     --restart-policy Always
     --ports "$CONTAINER_PORT"

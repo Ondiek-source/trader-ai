@@ -140,51 +140,106 @@ class QuotexReader:
         if not self._email or not self._password:
             logger.warning({"event": "quotex_no_credentials"})
             return False
-
-        try:
-            if self._client is None:
-                # No shared client — create and connect our own
-                self._client = _QuotexClient(
-                    email=self._email,
-                    password=self._password,
-                    lang="en",
-                )
-                ok, reason = await self._client.connect()
-                if not ok:
-                    logger.error(
-                        {"event": "quotex_connect_failed", "reason": str(reason)}
+        max_retries = 3
+        retry_delay = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                if self._client is None:
+                    # No shared client — create and connect our own
+                    logger.info(
+                        {
+                            "event": "quotex_connect_attempt",
+                            "attempt": attempt,
+                            "function": "connect(self) method",
+                            "file": "quotex_reader.py",
+                        }
                     )
+
+                    self._client = _QuotexClient(
+                        email=self._email,
+                        password=self._password,
+                        lang="en",
+                    )
+
+                    # SAFETY CHECK: If the library fails to even create the object
+                    if self._client is None:
+                        logger.warning(
+                            {
+                                "event": "quotex_init_failed",
+                                "attempt": attempt,
+                                "function": "connect(self) method",
+                                "file": "quotex_reader.py",
+                            }
+                        )
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return False
+
+                    ok, reason = await self._client.connect()
+                    if not ok:
+                        logger.error(
+                            {
+                                "event": "quotex_connect_failed",
+                                "reason": str(reason)
+                                + " | Attempt "
+                                + str(attempt)
+                                + " of "
+                                + str(max_retries),
+                                "function": "connect(self) method",
+                                "file": "quotex_reader.py",
+                            }
+                        )
+                        self._client = None  # Reset for next retry
+                        if attempt < max_retries:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        return False
+                else:
+                    # Shared client — caller already connected it
+                    reason = "shared_client"
+
+                # If we reached here, self._client is guaranteed to be a valid object
+                self._connected = True
+                if hasattr(self._client, "change_account"):
+                    result = self._client.change_account(self._account_type)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+                self._balance = await self._safe_get_balance()
+                self._prev_balance = self._balance
+
+                mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE]"
+                logger.info(
+                    {
+                        "event": "quotex_connected",
+                        "mode": mode_tag,
+                        "account_type": self._account_type,
+                        "balance": self._balance,
+                        "reason": str(reason),
+                        "shared_client": reason == "shared_client",
+                        "function": "connect(self) method",
+                        "file": "quotex_reader.py",
+                    }
+                )
+                return True
+
+            except Exception as exc:
+                logger.error(
+                    {
+                        "event": "quotex_connect_exception",
+                        "error": str(exc),
+                        "file": "quotex_reader.py",
+                        "function": "connect(self) method",
+                    }
+                )
+                self._client = None  # Reset for next retry
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self._connected = False
                     return False
-            else:
-                # Shared client — caller already connected it
-                reason = "shared_client"
-
-            self._connected = True
-            if hasattr(self._client, "change_account"):
-                result = self._client.change_account(self._account_type)
-                if asyncio.iscoroutine(result):
-                    await result
-
-            self._balance = await self._safe_get_balance()
-            self._prev_balance = self._balance
-
-            mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE]"
-            logger.info(
-                {
-                    "event": "quotex_connected",
-                    "mode": mode_tag,
-                    "account_type": self._account_type,
-                    "balance": self._balance,
-                    "reason": str(reason),
-                    "shared_client": reason == "shared_client",
-                }
-            )
-            return True
-
-        except Exception as exc:
-            logger.error({"event": "quotex_connect_exception", "error": str(exc)})
-            self._connected = False
-            return False
+        return False
 
     async def disconnect(self) -> None:
         """Gracefully close the Quotex WebSocket connection."""
@@ -387,7 +442,10 @@ class QuotexReader:
                 }
             )
             return self._make_result(
-                signal_id, pair, direction, outcome,
+                signal_id,
+                pair,
+                direction,
+                outcome,
                 payout=abs(delta) if outcome == "win" else 0.0,
                 stake=abs(delta) if outcome == "loss" else 0.0,
             )
@@ -417,7 +475,10 @@ class QuotexReader:
                 }
             )
             return self._make_result(
-                signal_id, pair, direction, "draw",
+                signal_id,
+                pair,
+                direction,
+                "draw",
                 payout=0.0,
                 stake=0.0,
             )
@@ -504,7 +565,10 @@ class QuotexReader:
                         )
                         outcome = "win" if str(status).lower() == "win" else "loss"
                         return self._make_result(
-                            "", pair, direction, outcome,
+                            "",
+                            pair,
+                            direction,
+                            outcome,
                             payout=abs(profit) if outcome == "win" else 0.0,
                             stake=abs(profit) if outcome == "loss" else 0.0,
                         )
@@ -530,7 +594,10 @@ class QuotexReader:
                     }
                 )
                 return self._make_result(
-                    "", pair, direction, outcome,
+                    "",
+                    pair,
+                    direction,
+                    outcome,
                     payout=abs(profit) if outcome == "win" else 0.0,
                     stake=abs(profit) if outcome == "loss" else 0.0,
                 )

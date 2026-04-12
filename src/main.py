@@ -32,6 +32,7 @@ from typing import Any, Callable, Coroutine
 import numpy as np
 import pandas as pd
 import psutil
+from urllib3 import Retry
 
 # ── JSON structured logging ────────────────────────────────────────────────────
 
@@ -115,7 +116,7 @@ MIN_TICKS_FOR_FEATURES: int = 120  # ~2 min of ticks
 MIN_BARS_FOR_FEATURES: int = 80  # minimum 1-min bars for converged indicators
 
 TRAINING_RETRY_SECONDS: int = 120  # re-check coverage every 2 min
-SUPERVISOR_RESTART_DELAY: int = 5  # seconds before supervised restart
+SUPERVISOR_RESTART_DELAY: int = 20  # seconds before supervised restart
 
 
 # ── Dashboard helper ──────────────────────────────────────────────────────────
@@ -194,20 +195,52 @@ async def supervised(
         name: Human-readable task name for structured logs.
         coro_factory: A callable returning a coroutine to supervise.
     """
+    Retry_delay = SUPERVISOR_RESTART_DELAY
     while True:
         try:
-            logger.info({"event": "task_start", "task": name})
             await coro_factory()
         except asyncio.CancelledError:
-            logger.info({"event": "task_cancelled", "task": name})
+            logger.info(
+                {
+                    "event": "task_cancelled",
+                    "task": name,
+                    "message": "shutting down",
+                    "function": "supervised()",
+                    "file": "main.py",
+                }
+            )
             break
         except Exception as exc:
+            if "403" in str(exc):
+                retry_delay = min(retry_delay * 2, 300)  # Max 5 mins
+                logger.warning(
+                    {
+                        "event": "auth_throttled",
+                        "task": name,
+                        "next_retry": retry_delay,
+                        "function": "supervised()",
+                        "file": "main.py",
+                    }
+                )
             logger.error(
-                {"event": "task_crashed", "task": name, "error": str(exc)},
+                {
+                    "event": "task_crashed",
+                    "task": name,
+                    "error": str(exc),
+                    "function": "supervised()",
+                    "file": "main.py",
+                },
                 exc_info=True,
             )
-            await asyncio.sleep(SUPERVISOR_RESTART_DELAY)
-            logger.info({"event": "task_restarting", "task": name})
+            await asyncio.sleep(retry_delay)
+            logger.info(
+                {
+                    "event": "task_restarting",
+                    "task": name,
+                    "function": "supervised()",
+                    "file": "main.py",
+                }
+            )
 
 
 # ── Individual task implementations ───────────────────────────────────────────

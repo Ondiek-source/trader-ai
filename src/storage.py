@@ -23,6 +23,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from azure.core.exceptions import AzureError, ResourceNotFoundError
+from azure.core.pipeline.transport import RequestsTransport
 from azure.storage.blob import BlobServiceClient
 
 logger = logging.getLogger(__name__)
@@ -77,8 +78,12 @@ class StorageManager:
         container_name: str,
         flush_size: int = 500,
     ) -> None:
+        transport = RequestsTransport(
+            pool_connections=20,  # Number of pooled connections
+            pool_maxsize=50,  # Max total connections
+        )
         self._client: BlobServiceClient = BlobServiceClient.from_connection_string(
-            conn_string
+            conn_string, transport=transport
         )
         self._container: str = container_name
         self._flush_size: int = flush_size
@@ -105,7 +110,9 @@ class StorageManager:
         """
         if df.empty:
             return
-        records: list[dict[str, Any]] = cast(list[dict[str, Any]], df.to_dict("records"))
+        records: list[dict[str, Any]] = cast(
+            list[dict[str, Any]], df.to_dict("records")
+        )
         with self._locks[pair]:
             self._tick_buffers[pair].extend(records)
             if len(self._tick_buffers[pair]) >= self._flush_size:
@@ -277,6 +284,8 @@ class StorageManager:
                     "event": "raw_parquet_written",
                     "blob_path": blob_path,
                     "rows": len(df),
+                    "function": "write_raw_parquet",
+                    "file": "storage.py",
                 }
             )
         except Exception as exc:
@@ -285,6 +294,8 @@ class StorageManager:
                     "event": "raw_parquet_write_failed",
                     "blob_path": blob_path,
                     "error": str(exc),
+                    "function": "write_raw_parquet",
+                    "file": "storage.py",
                 }
             )
             self._spill_to_tmp(blob_path, table)
@@ -313,6 +324,8 @@ class StorageManager:
                             "event": "retry_failed",
                             "blob_path": blob_path,
                             "error": str(exc),
+                            "function": "flush_retry_queue",
+                            "file": "storage.py",
                         }
                     )
                     remaining.append((blob_path, table))
@@ -366,6 +379,8 @@ class StorageManager:
                     "event": "model_load_error",
                     "blob_path": blob_path,
                     "error": str(exc),
+                    "function": "load_model",
+                    "file": "storage.py",
                 }
             )
             return None
@@ -483,6 +498,8 @@ class StorageManager:
                     "event": "parquet_written",
                     "blob_path": blob_path,
                     "rows": len(combined),
+                    "function": "_append_parquet",
+                    "file": "storage.py",
                 }
             )
         except Exception as exc:
@@ -492,6 +509,8 @@ class StorageManager:
                     "blob_path": blob_path,
                     "error": str(exc),
                     "action": "spilling_to_tmp",
+                    "function": "_append_parquet",
+                    "file": "storage.py",
                 }
             )
             self._spill_to_tmp(blob_path, table)
@@ -546,6 +565,8 @@ class StorageManager:
                     "event": "blob_read_failed",
                     "blob_path": blob_path,
                     "error": str(exc),
+                    "function": "_read_parquet",
+                    "file": "storage.py",
                 }
             )
 
@@ -560,6 +581,8 @@ class StorageManager:
                         "event": "fallback_read_failed",
                         "path": str(fallback),
                         "error": str(exc),
+                        "function": "_read_parquet",
+                        "file": "storage.py",
                     }
                 )
         return None
@@ -611,6 +634,8 @@ class StorageManager:
                     {
                         "event": "container_created",
                         "container": self._container,
+                        "function": "_ensure_container",
+                        "file": "storage.py",
                     }
                 )
             except Exception as exc:
@@ -619,6 +644,8 @@ class StorageManager:
                         "event": "container_create_failed",
                         "container": self._container,
                         "error": str(exc),
+                        "function": "_ensure_container",
+                        "file": "storage.py",
                     }
                 )
                 raise
