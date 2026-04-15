@@ -792,7 +792,7 @@ class LiveEngine:
             return
 
         try:
-            self._journal_client.record(signal.to_dict())
+            self._journal_client.record_signal(signal.to_dict())
         except Exception as exc:
             warning_block = (
                 f"\n{'%' * 60}\n"

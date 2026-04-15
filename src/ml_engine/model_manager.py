@@ -783,7 +783,7 @@ class ModelManager:
 
         return best
 
-    def pull_from_blob(
+    async def pull_from_blob(
         self,
         symbol: str,
         expiry_key: str,

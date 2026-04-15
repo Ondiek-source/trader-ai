@@ -1,0 +1,172 @@
+
+main.py
+├── _JSONFormatter        — structured logging
+├── _configure_logging()  — sets up root logger, suppresses noisy SDKs
+├── _run()                — constructs Pipeline, calls await pipeline.run()
+└── main()                — CLI entry, wraps _run() with error handling
+``
+
+It does three things and three things only:
+1. Configures JSON logging
+2. Creates a `Pipeline` instance (from `core/pipeline.py`)
+3. Runs it, catches fatal errors, exits cleanly
+
+The old main.py was ~1100 lines reimplementing the entire boot sequence, signal loop, feature engineering, model inference, webhook dispatch, and health monitoring — all of which already live in `pipeline.py`, `live.py`, `signals.py`, `model_manager.py`, etc.
+
+---
+
+**`CODEBASE_ISSUES.txt` — 10 issues across the codebase:**
+
+| # | Severity | File | Issue |
+|---|----------|------|-------|
+| 1 | BUG | config.py | `VALID_EXPIRIES` includes 120 but nothing supports it; excludes 900 which everything else supports |
+| 2 | CLEANUP | storage.py | `from doctest import debug` — dead import |
+| 3 | WARNING | storage.py | `sys.exit(1)` instead of raising `StorageError` — breaks error propagation |
+| 4 | CLEANUP | journal.py | `self._settings = get_settings()` stored but never read |
+| 5 | WARNING | signals.py | `import torch` on every `_infer()` call |
+| 6 | FATAL | pipeline.py | `await manager.pull_from_blob()` on sync method — crashes Python 3.1+ |
+| 7 | WARNING | live.py + pipeline.py | Two `ModelManager` instances, `inject_model()` never called |
+| 8 | WARNING | model_manager.py | Blocking Azure I/O with no timeout during boot |
+| 9 | INFO | reporter.py | `poll_loop()` undocumented |
+
+Both files are at `/root/.openclaw/workspace/`. Want me to fix any of the issues in the other files directly?
+
+
+ISSUE 7: VALID_EXPIRIES and pipeline disagree on 120/900
+---------------------------------------------------------
+FILE:    config.py
+PROBLEM: VALID_EXPIRIES = {60, 120, 300}
+         But pipeline only maps 60, 300, 900.
+         120 passes config but fails at runtime.
+         900 works at runtime but fails config validation.
+
+FIX:
+    config.py:
+        VALID_EXPIRIES: set[int] = {60, 300, 900}
+
+    OR if you actually want to support 120 seconds:
+        labeler.py:
+            _EXPIRY_SECONDS = {
+                "1_MIN": 60,
+                "2_MIN": 120,
+                "5_MIN": 300,
+                "15_MIN": 900,
+            }
+        pipeline.py:
+            _EXPIRY_KEY_MAP = {
+                60: "1_MIN",
+                120: "2_MIN",
+                300: "5_MIN",
+                900: "15_MIN",
+            }
+        config.py:
+            VALID_EXPIRIES = {60, 120, 300, 900}
+
+    Pick one approach. All three files must agree on the
+    same set of supported expiry values.
+
+
+ISSUE 8: Unused import in storage.py
+-------------------------------------
+FILE:    storage.py, line 4
+
+PROBLEM:
+    from doctest import debug  # never used
+
+FIX:
+    Delete the line entirely.
+
+
+ISSUE 9: get_settings() result stored but never read
+-----------------------------------------------------
+FILE:    journal.py, __init__
+
+PROBLEM:
+    self._settings = get_settings()
+
+    The parsed settings object is never referenced by any
+    method in the Journal class. It adds startup cost
+    (env var parsing + validation) for nothing.
+
+FIX — Option A (remove it if nothing needs it):
+    # delete the line
+
+FIX — Option B (use it where needed):
+    # If Journal methods actually need config values,
+    # reference self._settings in those methods.
+    # Example:
+    def write_entry(self, data):
+        path = self._settings.storage_path  # actually use it
+
+
+ISSUE 10: hmac.new() — NOT an issue
+------------------------------------
+STATUS: NO ACTION NEEDED.
+
+    hmac.new() is the correct function name in Python's
+    hmac module. The confusion is with hashlib.new() vs
+    hashlib.sha256(). Leave it as-is.
+
+
+ISSUE 11: import torch on every _infer() call
+----------------------------------------------
+FILE:    signals.py, _infer()
+
+PROBLEM:
+    def _infer(self, fv: FeatureVector) -> float:
+        import torch  # re-imported every tick
+
+    Works but adds overhead on every inference call.
+
+FIX — Move import to module level with lazy fallback:
+
+    # At top of file:
+    try:
+        import torch
+        _HAS_TORCH = True
+    except ImportError:
+        _HAS_TORCH = False
+
+    # In _infer():
+    def _infer(self, fv: FeatureVector) -> float:
+        if not _HAS_TORCH:
+            raise RuntimeError("PyTorch required for inference")
+        # use torch directly, no re-import
+
+OR — Cache at class level:
+
+    class SignalModel:
+        _torch = None
+
+        def _get_torch(self):
+            if self._torch is None:
+                import torch
+                self._torch = torch
+            return self._torch
+
+        def _infer(self, fv: FeatureVector) -> float:
+            torch = self._get_torch()
+            ...
+
+    This imports once per instance instead of once per call.
+
+
+ISSUE 5 (revisited): get_settings imported but never used
+----------------------------------------------------------
+STATUS: CONFIRMED USED. get_settings() is called in
+        Journal.__init__. The import is fine. The only
+        problem is that the result (self._settings) is
+        never read after assignment — see Issue 9 above.
+
+
+=============================================================
+PRIORITY ORDER
+=============================================================
+
+1. Issue 6  — FATAL. Fix first or app crashes on boot.
+2. Issue 7  — WILL cause runtime errors with certain configs.
+3. Issue 9  — Wastes startup cycles. Quick cleanup.
+4. Issue 8  — Dead code. One-line delete.
+5. Issue 11 — Performance. Low urgency but easy fix.
+6. Issue 10 — Nothing to do. Already correct.
+=============================================================
