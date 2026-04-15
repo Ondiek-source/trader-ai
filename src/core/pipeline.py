@@ -230,6 +230,27 @@ class Pipeline:
             if not task.done():
                 task.cancel()
 
+        # Push stopped state to dashboard
+        try:
+            from core.dashboard import status_store
+
+            snapshot = status_store.get()
+            status_store.update(
+                {
+                    "stopped": True,
+                    "session": {**snapshot.get("session", {}), "is_active": False},
+                }
+            )
+        except Exception:
+            pass
+
+        # Close reporter — cancels Telegram poll_loop task and closes aiohttp sessions
+        if self._reporter is not None:
+            try:
+                await self._reporter.close()
+            except Exception:
+                pass
+
         logger.info("[^] Pipeline.stop(): all engines stopped, all tasks cancelled.")
 
     # ── Stage 1: Storage Link ─────────────────────────────────────────────────
@@ -913,16 +934,27 @@ class Pipeline:
                     except Exception:
                         pass
 
+                # Compute elapsed minutes from the started_at stamp in StatusStore
+                snapshot = status_store.get()
+                try:
+                    started_at = datetime.fromisoformat(snapshot["started_at"])
+                    elapsed_minutes = (
+                        datetime.now(timezone.utc) - started_at
+                    ).total_seconds() / 60
+                except Exception:
+                    elapsed_minutes = 0
+
                 status_store.update(
                     {
                         "quotex": {"connected": connected, "balance": balance},
                         "pending_signals": pending,
                         "session": {
-                            **status_store.get().get("session", {}),
+                            **snapshot.get("session", {}),
                             "wins": wins,
                             "losses": losses,
                             "draws": draws,
                             "net_profit": net_profit,
+                            "elapsed_minutes": round(elapsed_minutes, 1),
                         },
                     }
                 )

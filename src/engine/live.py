@@ -210,6 +210,10 @@ class LiveEngine:
         # Tracks consecutive per-bar errors for the self-termination guard.
         self._consecutive_errors: int = 0
 
+        # Running counters pushed to the dashboard on every tick.
+        self._ticks_processed: int = 0
+        self._signals_fired: int = 0
+
         # Reload lock: prevents reload_model() from mutating SignalGenerator
         # state while _process_tick() is mid-inference. Both the asyncio
         # event loop and any pipeline.py coroutine use this.
@@ -696,6 +700,12 @@ class LiveEngine:
 
         # Reset consecutive error counter on a successful inference.
         self._consecutive_errors = 0
+        self._ticks_processed += 1
+        if signal.direction != "SKIP":
+            self._signals_fired += 1
+
+        # ── Push stream + session counters to dashboard ───────────────────
+        self._push_stream_status(signal)  # type: ignore[attr-defined]
 
         # ── 5. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)
@@ -889,6 +899,90 @@ class LiveEngine:
             f"{'!'*60}"
         )
         logger.critical(warning_block)
+
+        # Push kill-switch state to dashboard — session is no longer active
+        try:
+            from core.dashboard import status_store
+
+            snapshot = status_store.get()
+            status_store.update(
+                {
+                    "kill_switch_active": True,
+                    "session": {**snapshot.get("session", {}), "is_active": False},
+                }
+            )
+        except Exception:
+            pass
+
+    def _push_stream_status(self, signal: TradeSignal) -> None:
+        """
+        Push stream connection status, tick count, signals fired, and the
+        most recent signal event to the dashboard StatusStore.
+
+        Called on every successful inference pass. Failure is silently
+        swallowed — dashboard pushes must never block the inference loop.
+        """
+        try:
+            from core.dashboard import status_store
+
+            # Detect stream type and read its live properties.
+            # QuotexReader exposes ._connected (bool).
+            # TwelveDataStream exposes ._thread (threading.Thread).
+            # Fallback: a tick was just received, so treat as connected.
+            if hasattr(self._stream, "_connected"):
+                connected: bool = bool(self._stream._connected)
+            elif hasattr(self._stream, "_thread") and self._stream._thread is not None:
+                connected = self._stream._thread.is_alive()
+            else:
+                connected = True  # tick received — stream must be up
+
+            ticks_received: int = self._ticks_processed
+
+            # For TwelveDataStream expose the stream-level counter if available.
+            if hasattr(self._stream, "ticks_received"):
+                ticks_received = int(self._stream.ticks_received)
+
+            direction = signal.direction
+            event_text = (
+                f"{self.symbol} {direction} @ {signal.confidence:.1%} "
+                f"[{signal.expiry_key}] gate={'✓' if signal.gate_passed else '✗'}"
+                if direction != "SKIP"
+                else f"{self.symbol} SKIP ({signal.confidence:.1%})"
+            )
+
+            snapshot = status_store.get()
+
+            # Compute elapsed minutes from the started_at stamp seeded at boot.
+            # This keeps the dashboard accurate for both Quotex and TwelveData users.
+            elapsed_minutes: float = 0.0
+            try:
+                from datetime import datetime, timezone as _tz
+
+                started_at_raw = snapshot.get("started_at")
+                if started_at_raw:
+                    started_at = datetime.fromisoformat(started_at_raw)
+                    elapsed_minutes = (
+                        datetime.now(_tz.utc) - started_at
+                    ).total_seconds() / 60.0
+            except Exception:
+                pass
+
+            status_store.update(
+                {
+                    "stream": {
+                        "connected": connected,
+                        "ticks_received": ticks_received,
+                    },
+                    "last_event": event_text,
+                    "session": {
+                        **snapshot.get("session", {}),
+                        "signals_fired": self._signals_fired,
+                        "elapsed_minutes": round(elapsed_minutes, 1),
+                    },
+                }
+            )
+        except Exception:
+            pass  # Dashboard is optional — never block on it
 
     def _push_threshold_to_dashboard(self) -> None:
         """
