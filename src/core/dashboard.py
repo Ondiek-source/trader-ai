@@ -1,10 +1,14 @@
 """
-dashboard.py — Lightweight HTTP status dashboard for Trader AI.
+core/dashboard.py — Lightweight HTTP status dashboard for Trader AI.
 
-Exposes two endpoints on port 8080:
-  GET /         → HTML dashboard (auto-refreshes every 10s)
-  GET /status   → JSON status payload (polled by the dashboard)
-  GET /health   → Simple health check (used by Docker HEALTHCHECK)
+Exposes three endpoints:
+    GET /         → HTML dashboard (auto-refreshes every 10s)
+    GET /status   → JSON status payload combining live state + journal data
+    GET /health   → Structured health check for Docker / load balancers
+
+Data sources:
+    StatusStore  — push-based live state from pipeline.py / live.py
+    Journal      — pull-based trade history and session stats on /status
 """
 
 from __future__ import annotations
@@ -16,14 +20,18 @@ import logging
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from threading import Thread
 from typing import Any
+
+from core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
 
-DASHBOARD_HTML: str = """<!DOCTYPE html>
+DASHBOARD_HTML: str = """\
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -37,95 +45,142 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
     }
     h1 { color: #58a6ff; font-size: 1.4rem; margin-bottom: 4px; }
     .subtitle { color: #8b949e; font-size: 0.85rem; margin-bottom: 24px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px; margin-bottom: 24px;
+    }
     .card {
       background: #161b22; border: 1px solid #30363d; border-radius: 8px;
       padding: 16px; display: flex; flex-direction: column; gap: 6px;
     }
-    .card-label { color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .card-label {
+      color: #8b949e; font-size: 0.75rem; text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
     .card-value { font-size: 1.6rem; font-weight: 700; color: #c9d1d9; }
     .card-value.green { color: #3fb950; }
     .card-value.red { color: #f85149; }
     .card-value.yellow { color: #d29922; }
     .card-value.blue { color: #58a6ff; }
     .card-value.gray { color: #8b949e; }
-    .section-title { color: #8b949e; font-size: 0.8rem; text-transform: uppercase;
-      letter-spacing: 0.08em; margin-bottom: 10px; margin-top: 8px; }
-    .bar-wrap { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 4px; }
+    .section-title {
+      color: #8b949e; font-size: 0.8rem; text-transform: uppercase;
+      letter-spacing: 0.08em; margin-bottom: 10px; margin-top: 8px;
+    }
+    .bar-wrap {
+      background: #21262d; border-radius: 4px; height: 8px;
+      overflow: hidden; margin-top: 4px;
+    }
     .bar { height: 100%; border-radius: 4px; background: #58a6ff; transition: width 0.5s; }
-    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
-      margin-right: 6px; vertical-align: middle; }
+    .bar.red { background: #f85149; }
+    .bar.yellow { background: #d29922; }
+    .status-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      margin-right: 6px; vertical-align: middle;
+    }
     .dot-green { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
-    .dot-red { background: #f85149; }
+    .dot-red { background: #f85149; box-shadow: 0 0 6px #f85149; }
     .dot-yellow { background: #d29922; animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-    .log { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-      padding: 16px; font-family: monospace; font-size: 0.78rem; color: #8b949e;
-      max-height: 180px; overflow-y: auto; }
-    .log-entry { padding: 2px 0; border-bottom: 1px solid #21262d; }
+    .log {
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: 16px; font-family: monospace; font-size: 0.78rem;
+      color: #8b949e; max-height: 240px; overflow-y: auto;
+    }
+    .log-entry { padding: 3px 0; border-bottom: 1px solid #21262d; }
     .log-entry.win { color: #3fb950; }
     .log-entry.loss { color: #f85149; }
     .log-entry.draw { color: #d29922; }
     .log-entry.signal { color: #58a6ff; }
+    .log-entry.kill { color: #f85149; font-weight: bold; }
     .log-entry.info { color: #8b949e; }
+    .table-wrap {
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: 16px; overflow-x: auto;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th { color: #8b949e; text-align: left; padding: 6px 10px;
+         border-bottom: 1px solid #30363d; font-weight: 600; }
+    td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
     .footer { text-align: center; color: #484f58; font-size: 0.75rem; margin-top: 24px; }
     #last-update { color: #484f58; font-size: 0.75rem; }
+    .kill-banner {
+      background: #f8514922; border: 1px solid #f85149; border-radius: 8px;
+      padding: 16px; margin-bottom: 16px; color: #f85149; font-weight: bold;
+      text-align: center; display: none;
+    }
   </style>
 </head>
 <body>
   <h1>Trader AI &mdash; Live Dashboard</h1>
-  <div class="subtitle">Auto-refreshes every 10 seconds &nbsp;|&nbsp; <span id="last-update">Loading...</span></div>
+  <div class="subtitle">
+    Auto-refreshes every 10s &nbsp;|&nbsp;
+    <span id="last-update">Loading...</span>
+  </div>
+
+  <div class="kill-banner" id="kill-banner">
+    KILL SWITCH ACTIVE &mdash; Max martingale streak reached. Trading halted.
+  </div>
 
   <div class="section-title">Session</div>
   <div class="grid">
     <div class="card">
       <div class="card-label">Status</div>
-      <div class="card-value" id="status-text">—</div>
+      <div class="card-value" id="status-text">&mdash;</div>
     </div>
     <div class="card">
-      <div class="card-label">Wins Today</div>
-      <div class="card-value green" id="wins">—</div>
+      <div class="card-label">Wins</div>
+      <div class="card-value green" id="wins">&mdash;</div>
     </div>
     <div class="card">
-      <div class="card-label">Losses Today</div>
-      <div class="card-value red" id="losses">—</div>
+      <div class="card-label">Losses</div>
+      <div class="card-value red" id="losses">&mdash;</div>
     </div>
     <div class="card">
-      <div class="card-label">Draws Today</div>
-      <div class="card-value gray" id="draws">—</div>
+      <div class="card-label">Win Rate</div>
+      <div class="card-value" id="winrate">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Net Profit</div>
-      <div class="card-value" id="profit">—</div>
+      <div class="card-value" id="profit">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Signals Fired</div>
-      <div class="card-value blue" id="signals">—</div>
+      <div class="card-value blue" id="signals">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Elapsed</div>
-      <div class="card-value" id="elapsed">—</div>
+      <div class="card-value" id="elapsed">&mdash;</div>
     </div>
   </div>
 
   <div class="section-title">Engine</div>
   <div class="grid">
     <div class="card">
-      <div class="card-label">Confidence Threshold</div>
-      <div class="card-value yellow" id="threshold">—</div>
+      <div class="card-label">Base Threshold</div>
+      <div class="card-value gray" id="base-threshold">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Effective Threshold</div>
+      <div class="card-value yellow" id="threshold">&mdash;</div>
       <div class="bar-wrap"><div class="bar" id="threshold-bar" style="width:0%"></div></div>
     </div>
     <div class="card">
       <div class="card-label">Martingale Streak</div>
-      <div class="card-value" id="streak">—</div>
+      <div class="card-value" id="streak">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Max Streak</div>
+      <div class="card-value gray" id="max-streak">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Pending Signals</div>
-      <div class="card-value" id="pending">—</div>
+      <div class="card-value" id="pending">&mdash;</div>
     </div>
     <div class="card">
-      <div class="card-label">Practice Mode</div>
-      <div class="card-value" id="practice">—</div>
+      <div class="card-label">Mode</div>
+      <div class="card-value" id="practice">&mdash;</div>
     </div>
   </div>
 
@@ -133,34 +188,47 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   <div class="grid">
     <div class="card">
       <div class="card-label">Price Stream</div>
-      <div class="card-value" id="stream-status">—</div>
+      <div class="card-value" id="stream-status">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Quotex Account</div>
-      <div class="card-value" id="quotex-status">—</div>
+      <div class="card-value" id="quotex-status">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Quotex Balance</div>
-      <div class="card-value green" id="quotex-balance">—</div>
+      <div class="card-value green" id="quotex-balance">&mdash;</div>
     </div>
     <div class="card">
       <div class="card-label">Ticks Received</div>
-      <div class="card-value" id="ticks">—</div>
+      <div class="card-value" id="ticks">&mdash;</div>
     </div>
   </div>
 
-  <div class="section-title">Recent Activity</div>
+  <div class="section-title">Recent Trades</div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Result</th><th>P&amp;L</th></tr>
+      </thead>
+      <tbody id="trades-body">
+        <tr><td colspan="5" style="color:#484f58">No trades yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="section-title" style="margin-top:16px">Activity Log</div>
   <div class="log" id="activity-log">
     <div class="log-entry info">Waiting for data...</div>
   </div>
 
-  <div class="footer">Trader AI &copy; 2024 &mdash; All signals use key: Ondiek</div>
+  <div class="footer">Trader AI Dashboard</div>
 
 <script>
   const activity = [];
 
   function classifyEvent(text) {
     const lower = (text || '').toLowerCase();
+    if (lower.includes('kill') || lower.includes('halted')) return 'kill';
     if (lower.includes('signal') || lower.includes('fired')) return 'signal';
     if (lower.includes('win')) return 'win';
     if (lower.includes('loss')) return 'loss';
@@ -174,31 +242,64 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
       el.innerHTML = '<div class="log-entry info">Waiting for data...</div>';
       return;
     }
-    el.innerHTML = activity.map(e =>
-      '<div class="log-entry ' + e.cls + '">[' + e.time + '] ' + e.text + '</div>'
-    ).join('');
+    el.innerHTML = activity.map(function(e) {
+      return '<div class="log-entry ' + e.cls + '">[' + e.time + '] ' +
+             e.text.replace(/</g, '&lt;') + '</div>';
+    }).join('');
+  }
+
+  function renderTrades(trades) {
+    var tbody = document.getElementById('trades-body');
+    if (!trades || trades.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#484f58">No trades yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = trades.slice(0, 10).map(function(t) {
+      var resultCls = t.result === 'win' ? 'green' : t.result === 'loss' ? 'red' : 'yellow';
+      var pnl = t.pnl != null ? '$' + Number(t.pnl).toFixed(2) : '&mdash;';
+      var time = t.time || '&mdash;';
+      return '<tr>' +
+        '<td>' + time + '</td>' +
+        '<td>' + (t.symbol || '&mdash;') + '</td>' +
+        '<td>' + (t.side || '&mdash;') + '</td>' +
+        '<td style="color:' + resultCls + '">' + (t.result || '?') + '</td>' +
+        '<td style="color:' + resultCls + '">' + pnl + '</td>' +
+        '</tr>';
+    }).join('');
   }
 
   async function refresh() {
     try {
-      const r = await fetch('/status');
-      const d = await r.json();
+      var r = await fetch('/status');
+      var d = await r.json();
+
+      // Kill switch
+      var killActive = d.kill_switch_active || false;
+      document.getElementById('kill-banner').style.display = killActive ? 'block' : 'none';
 
       // Session
-      const session = d.session || {};
-      const active = session.is_active;
-      const stopped = d.stopped;
+      var session = d.session || {};
+      var active = session.is_active;
+      var stopped = d.stopped;
       document.getElementById('status-text').innerHTML =
+        killActive ? '<span class="status-dot dot-red"></span>KILLED' :
         stopped ? '<span class="status-dot dot-red"></span>STOPPED' :
         active  ? '<span class="status-dot dot-green"></span>ACTIVE' :
                   '<span class="status-dot dot-yellow"></span>IDLE';
 
       document.getElementById('wins').textContent = session.wins ?? '—';
       document.getElementById('losses').textContent = session.losses ?? '—';
-      document.getElementById('draws').textContent = session.draws ?? 0;
 
-      const profit = session.net_profit ?? 0;
-      const profitEl = document.getElementById('profit');
+      var wins = session.wins || 0;
+      var losses = session.losses || 0;
+      var total = wins + losses;
+      var winrate = total > 0 ? (wins / total * 100).toFixed(1) + '%' : '—';
+      var wrEl = document.getElementById('winrate');
+      wrEl.textContent = winrate;
+      wrEl.className = 'card-value ' + (total > 0 ? (wins / total >= 0.5 ? 'green' : 'red') : '');
+
+      var profit = session.net_profit ?? 0;
+      var profitEl = document.getElementById('profit');
       profitEl.textContent = '$' + profit.toFixed(2);
       profitEl.className = 'card-value ' + (profit >= 0 ? 'green' : 'red');
 
@@ -207,15 +308,23 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
         session.elapsed_minutes ? Math.round(session.elapsed_minutes) + ' min' : '—';
 
       // Engine
-      const threshold = d.confidence_threshold ?? 0;
-      document.getElementById('threshold').textContent = (threshold * 100).toFixed(0) + '%';
-      document.getElementById('threshold-bar').style.width = (threshold * 100) + '%';
+      var baseT = d.base_confidence_threshold ?? 0;
+      document.getElementById('base-threshold').textContent = (baseT * 100).toFixed(0) + '%';
 
-      const streak = d.martingale_streak ?? 0;
-      const streakEl = document.getElementById('streak');
-      streakEl.textContent = streak;
-      streakEl.className = 'card-value ' + (streak === 0 ? 'green' : streak >= 2 ? 'red' : 'yellow');
+      var effT = d.confidence_threshold ?? 0;
+      document.getElementById('threshold').textContent = (effT * 100).toFixed(0) + '%';
+      var barEl = document.getElementById('threshold-bar');
+      barEl.style.width = (effT * 100) + '%';
+      barEl.className = 'bar' + (effT > 0.85 ? ' red' : effT > 0.75 ? ' yellow' : '');
 
+      var streak = d.martingale_streak ?? 0;
+      var maxStreak = d.martingale_max_streak ?? 3;
+      var streakEl = document.getElementById('streak');
+      streakEl.textContent = streak + ' / ' + maxStreak;
+      streakEl.className = 'card-value ' +
+        (streak === 0 ? 'green' : streak >= maxStreak ? 'red' : 'yellow');
+
+      document.getElementById('max-streak').textContent = maxStreak;
       document.getElementById('pending').textContent = d.pending_signals ?? 0;
       document.getElementById('practice').innerHTML =
         d.practice_mode
@@ -223,7 +332,7 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
           : '<span style="color:#f85149">LIVE</span>';
 
       // Connections
-      const stream = d.stream || {};
+      var stream = d.stream || {};
       document.getElementById('stream-status').innerHTML =
         stream.connected
           ? '<span class="status-dot dot-green"></span>Connected'
@@ -231,30 +340,32 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
       document.getElementById('ticks').textContent =
         stream.ticks_received ? stream.ticks_received.toLocaleString() : '—';
 
-      const quotex = d.quotex || {};
+      var quotex = d.quotex || {};
       document.getElementById('quotex-status').innerHTML =
         quotex.connected
           ? '<span class="status-dot dot-green"></span>Connected'
           : '<span class="status-dot dot-yellow"></span>Not connected';
       document.getElementById('quotex-balance').textContent =
-        quotex.balance ? '$' + quotex.balance.toFixed(2) : '—';
+        quotex.balance != null ? '$' + Number(quotex.balance).toFixed(2) : '—';
 
-      // Activity log — append every unique event
-      const currentEvent = d.last_event || '';
+      // Recent trades
+      renderTrades(d.recent_trades);
+
+      // Activity log
+      var currentEvent = d.last_event || '';
       if (currentEvent) {
-        const lastEntry = activity.length > 0 ? activity[0] : null;
-        const now = new Date().toLocaleTimeString();
-        const cls = classifyEvent(currentEvent);
+        var lastEntry = activity.length > 0 ? activity[0] : null;
+        var now = new Date().toLocaleTimeString();
+        var cls = classifyEvent(currentEvent);
         if (!lastEntry || lastEntry.text !== currentEvent) {
-          activity.unshift({ time: now, text: currentEvent, cls });
-          if (activity.length > 20) activity.pop();
+          activity.unshift({ time: now, text: currentEvent, cls: cls });
+          if (activity.length > 50) activity.pop();
         }
       }
       renderLog();
 
-      const now = new Date().toLocaleTimeString();
       document.getElementById('last-update').textContent =
-        'Last updated: ' + now;
+        'Last updated: ' + new Date().toLocaleTimeString();
 
     } catch(e) {
       document.getElementById('last-update').textContent = 'Connection error — retrying...';
@@ -265,108 +376,149 @@ DASHBOARD_HTML: str = """<!DOCTYPE html>
   setInterval(refresh, 10000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
-# ── Status store (updated by main.py) ─────────────────────────────────────────
+# ── Status Store ───────────────────────────────────────────────────────────────
 
 
 class StatusStore:
     """
     Thread-safe store for live system status.
 
-    Updated by the main trading loop via :meth:`update`.  Read by the
-    HTTP handler on every ``/status`` request.
+    Updated by pipeline.py / live.py via :meth:`update`.
+    Read by the HTTP handler on every ``/status`` request.
 
-    A :class:`threading.Lock` guards all reads and writes because the HTTP
-    server runs in a daemon thread while updates arrive from the asyncio
-    event loop thread — concurrent dict mutation without a lock can produce
-    torn reads in CPython when values are non-atomic (nested dicts, lists).
-
-    The orchestrator **must** call ``status_store.update({"last_event": ...})``
-    after every significant event for the activity log to populate.
+    A threading.Lock guards all reads and writes because the HTTP
+    server runs in a daemon thread while updates arrive from the
+    asyncio event loop thread.
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock: threading.Lock = threading.Lock()
         self._data: dict[str, Any] = {
+            # Session state
             "stopped": False,
-            "martingale_streak": 0,
+            "kill_switch_active": False,
+            "session": {},
+            # Engine state
+            "base_confidence_threshold": None,
             "confidence_threshold": None,
+            "martingale_streak": 0,
+            "martingale_max_streak": 3,
             "pending_signals": 0,
             "practice_mode": True,
-            "session": {},
+            # Connections
             "stream": {"connected": False, "ticks_received": 0},
             "quotex": {"connected": False, "balance": 0.0},
+            # Activity
             "last_event": "",
+            "recent_trades": [],
+            # Metadata
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
 
     def update(self, data: dict[str, Any]) -> None:
-        """
-        Merge *data* into the current status.
-
-        Args:
-            data: Partial status dict.  Keys not present are left unchanged.
-        """
+        """Merge *data* into the current status."""
         with self._lock:
             self._data.update(data)
 
     def get(self) -> dict[str, Any]:
-        """
-        Return a deep-copy snapshot of the current status with a ``server_time`` field.
-
-        A shallow copy ({**self._data}) leaves nested dicts (e.g. "session",
-        "stream", "quotex") as shared references — callers mutating those would
-        bypass the lock. deepcopy ensures the caller receives a fully independent
-        snapshot that cannot race with concurrent update() calls.
-
-        Returns:
-            Deep copy of the status dict safe for JSON serialisation.
-        """
+        """Return a deep-copy snapshot with server timestamp."""
         with self._lock:
-            return copy.deepcopy(
-                {**self._data, "server_time": datetime.now(timezone.utc).isoformat()}
-            )
+            snapshot = copy.deepcopy(self._data)
+            snapshot["server_time"] = datetime.now(timezone.utc).isoformat()
+            return snapshot
+
+    @property
+    def _lock_obj(self) -> threading.Lock:
+        """Expose the lock for direct status_store._lock access (health_task)."""
+        return self._lock
 
 
-# Singleton — imported by main.py
+# Singleton — imported by pipeline.py
 status_store: StatusStore = StatusStore()
 
 
-# ── HTTP handler ───────────────────────────────────────────────────────────────
+# ── Journal reader ─────────────────────────────────────────────────────────────
+
+
+def _load_recent_trades(journal_dir: str, limit: int = 10) -> list[dict[str, Any]]:
+    """
+    Read the most recent trade entries from the journal Parquet file.
+
+    Returns an empty list if the journal doesn't exist yet or is unreadable.
+    The dashboard calls this on every /status request so the trade table
+    stays current without push-based updates from live.py.
+
+    Args:
+        journal_dir: Path to the journal data directory.
+        limit: Maximum number of recent trades to return.
+
+    Returns:
+        List of dicts with keys: time, symbol, side, result, pnl.
+    """
+    try:
+        import pandas as pd
+
+        trades_path = Path(journal_dir) / "trades.parquet"
+        if not trades_path.exists():
+            return []
+
+        df = pd.read_parquet(trades_path)
+        if df.empty:
+            return []
+
+        df = df.tail(limit).iloc[::-1]  # most recent first
+
+        trades: list[dict[str, Any]] = []
+        for _, row in df.iterrows():
+            result_val = float(row.get("result", 0))
+            trades.append({
+                "time": str(row.get("timestamp", ""))[:19],
+                "symbol": str(row.get("symbol", "")),
+                "side": str(row.get("side", "")),
+                "result": "win" if result_val > 0 else "loss" if result_val < 0 else "draw",
+                "pnl": result_val,
+            })
+        return trades
+
+    except Exception:
+        return []
+
+
+# ── HTTP Handler ───────────────────────────────────────────────────────────────
 
 
 class _Handler(BaseHTTPRequestHandler):
     """Serves the dashboard HTML, JSON status, and health check."""
 
-    def do_GET(self) -> None:  # noqa: N802
-        """
-        Route GET requests to the appropriate handler.
+    # Class-level config — set once before first request.
+    _journal_dir: str = ""
 
-        ``/`` and ``/index.html`` return the dashboard HTML.
-        ``/status`` returns the live JSON status.
-        ``/health`` returns a plain-text ``"ok"``.
-        """
+    def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/", "/index.html"):
             self._respond(200, "text/html", DASHBOARD_HTML.encode())
         elif self.path == "/status":
-            payload: bytes = json.dumps(status_store.get()).encode()
+            snapshot = status_store.get()
+            # Enrich with journal trade history
+            snapshot["recent_trades"] = _load_recent_trades(
+                self._journal_dir, limit=10
+            )
+            payload: bytes = json.dumps(snapshot, default=str).encode()
             self._respond(200, "application/json", payload)
         elif self.path == "/health":
-            self._respond(200, "text/plain", b"ok")
+            health = {
+                "status": "ok",
+                "kill_switch": status_store.get().get("kill_switch_active", False),
+                "server_time": datetime.now(timezone.utc).isoformat(),
+            }
+            self._respond(200, "application/json", json.dumps(health).encode())
         else:
             self._respond(404, "text/plain", b"not found")
 
     def _respond(self, code: int, content_type: str, body: bytes) -> None:
-        """
-        Send an HTTP response with CORS headers.
-
-        Args:
-            code: HTTP status code.
-            content_type: ``Content-Type`` header value.
-            body: Response body bytes.
-        """
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -375,7 +527,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        """Suppress default HTTP server log output to stderr."""
+        """Suppress default HTTP server log output."""
         pass
 
 
@@ -386,22 +538,36 @@ async def run_dashboard(port: int = 8080) -> None:
     """
     Run the HTTP dashboard in a daemon background thread.
 
-    The thread is daemonised so it dies automatically when the process
-    exits.  The coroutine sleeps forever to keep the task alive.
+    Configures the journal directory from settings so the /status
+    endpoint can pull recent trades from the journal Parquet file.
 
     Args:
         port: TCP port to bind (default 8080).
     """
+    settings = get_settings()
+
+    # Resolve journal directory — journal.py writes trades.parquet
+    # alongside storage data. Use the same data_dir root.
+    journal_dir: str = str(
+        Path(settings.data_dir).resolve()
+    )
+    _Handler._journal_dir = journal_dir
+
     server: HTTPServer = HTTPServer(("0.0.0.0", port), _Handler)
-    thread: Thread = Thread(target=server.serve_forever, daemon=True, name="dashboard")
+    thread: Thread = Thread(
+        target=server.serve_forever, daemon=True, name="dashboard"
+    )
     thread.start()
+
     logger.info(
         {
             "event": "dashboard_started",
             "port": port,
             "url": f"http://0.0.0.0:{port}",
+            "journal_dir": journal_dir,
         }
     )
-    # Keep coroutine alive — daemon thread handles the actual serving
+
+    # Keep coroutine alive — daemon thread handles serving
     while True:
         await asyncio.sleep(60)

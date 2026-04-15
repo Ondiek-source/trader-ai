@@ -104,6 +104,7 @@ from ml_engine.features import (
 )
 from ml_engine.model_manager import ModelManager
 from trading.signals import SignalGenerator, SignalGeneratorError, TradeSignal
+from trading.threshold_manager import ThresholdManager
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,16 @@ class LiveEngine:
             symbol=self.symbol,
             expiry_key=self.expiry_key,
         )
+
+        # ── 5a. Threshold Manager ─────────────────────────────────────────
+        # Constructed from config; injected into SignalGenerator so that
+        # generate() uses the dynamic threshold rather than the static value.
+        self._threshold_mgr: ThresholdManager = ThresholdManager(
+            base_threshold=self._settings.confidence_threshold,
+            step=self._settings.martingale_step,
+            max_streak=self._settings.martingale_max_streak,
+        )
+        self._signal_gen.set_threshold_manager(self._threshold_mgr)
 
         # ── 6. Journal (warning-only) ─────────────────────────────────────
         self._journal_client: Any = self._init_journal()
@@ -689,7 +700,12 @@ class LiveEngine:
         # ── 5. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)
 
-        # ── 6. Execute only if signal is actionable ───────────────────────
+        # ── 6. Kill switch gate ───────────────────────────────────────────
+        if self._threshold_mgr.is_halted():
+            self._on_kill_switch_activated()
+            return
+
+        # ── 7. Execute only if signal is actionable ───────────────────────
         # is_executable() requires direction != SKIP AND gate_passed = True.
         # A CALL/PUT with gate_passed=False is journaled but not executed.
         if signal.is_executable():
@@ -702,6 +718,9 @@ class LiveEngine:
                 signal.direction,
                 signal.gate_passed,
             )
+
+        # ── 8. Push updated threshold state to dashboard ──────────────────
+        self._push_threshold_to_dashboard()
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
@@ -809,6 +828,101 @@ class LiveEngine:
                 f"{'%' * 60}"
             )
             logger.warning(warning_block)
+
+    # ── Threshold / Martingale helpers ────────────────────────────────────────
+
+    def record_result(self, win: bool) -> None:
+        """
+        Report the outcome of the most recent executed trade.
+
+        Called by an external result checker (e.g. pipeline.py polling the
+        Quotex API for settled contracts) once the binary option has expired
+        and the outcome is known.
+
+        Args:
+            win: True if the trade was profitable, False if it was a loss.
+        """
+        if win:
+            self._threshold_mgr.on_win()
+            logger.info(
+                "[^] ThresholdManager: WIN recorded — streak reset, "
+                "threshold=%.3f symbol=%s",
+                self._threshold_mgr.get_threshold(),
+                self.symbol,
+            )
+        else:
+            self._threshold_mgr.on_loss()
+            logger.info(
+                "[^] ThresholdManager: LOSS recorded — streak=%d "
+                "threshold=%.3f symbol=%s",
+                self._threshold_mgr.streak,
+                self._threshold_mgr.get_threshold(),
+                self.symbol,
+            )
+            if self._threshold_mgr.is_halted():
+                self._on_kill_switch_activated()
+
+        self._push_threshold_to_dashboard()
+
+    def _on_kill_switch_activated(self) -> None:
+        """
+        Handle kill switch activation — log prominently and stop the engine.
+
+        Called when ThresholdManager.is_halted() returns True, either
+        because record_result() just crossed the max_streak threshold or
+        because _process_tick() detected the halted state after a tick.
+        """
+        warning_block = (
+            f"\n{'!'*60}\n"
+            f"MARTINGALE KILL SWITCH ACTIVATED\n"
+            f"Symbol              : {self.symbol}\n"
+            f"Consecutive losses  : {self._threshold_mgr.streak}\n"
+            f"Max streak          : {self._threshold_mgr.max_streak}\n"
+            f"Effective threshold : {self._threshold_mgr.get_threshold():.3f}\n\n"
+            f"CONTEXT: The engine has reached the maximum consecutive loss\n"
+            f"streak. All trade execution is suspended for this session to\n"
+            f"prevent further losses. The inference loop continues to run\n"
+            f"and journal signals, but no trades will be placed until the\n"
+            f"threshold manager is reset (e.g. on next session start).\n"
+            f"\nFIX: Call engine.record_result(win=True) after a manual\n"
+            f"recovery trade, or restart the engine to reset the session.\n"
+            f"{'!'*60}"
+        )
+        logger.critical(warning_block)
+
+    def _push_threshold_to_dashboard(self) -> None:
+        """
+        Push the current ThresholdManager state to the StatusStore.
+
+        Failure is silently swallowed — dashboard unavailability must
+        never block the inference loop.
+        """
+        try:
+            from core.dashboard import status_store
+
+            state = self._threshold_mgr.get_state()
+            status_store.update(
+                {
+                    "martingale_streak": state["streak"],
+                    "confidence_threshold": state["effective_threshold"],
+                    "kill_switch_active": state["halted"],
+                }
+            )
+        except Exception:
+            pass  # Dashboard is optional — never block on it
+
+    def get_threshold_state(self) -> dict[str, object]:
+        """
+        Return the current ThresholdManager state snapshot.
+
+        Convenience accessor for pipeline.py and tests. Delegates directly
+        to ThresholdManager.get_state().
+
+        Returns:
+            dict with keys: streak, effective_threshold, base_threshold,
+            step, max_streak, halted, history_len.
+        """
+        return self._threshold_mgr.get_state()
 
     # ── Control ───────────────────────────────────────────────────────────────
 

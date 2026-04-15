@@ -67,6 +67,9 @@ from ml_engine.trainer import DataShaper, XGBoostTrainer
 from ml_engine.labeler import Labeler
 from engine.live import LiveEngine, LiveEngineError
 
+# How many seconds before midnight (UTC) to fire the daily report.
+_DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
+
 logger = logging.getLogger(__name__)
 
 # ── Module Constants ──────────────────────────────────────────────────────────
@@ -151,6 +154,8 @@ class Pipeline:
         self._tasks: list[asyncio.Task] = []
         self._shutdown_requested: bool = False
         self._last_retrain_time: datetime = datetime.now(timezone.utc)
+        # Reporter initialised in _run_task_group after engines are ready.
+        self._reporter: Any = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -400,6 +405,7 @@ class Pipeline:
                 # Smoke-test: transform the most recent 30 bars.
                 # If the bar data schema is broken this raises immediately
                 # rather than silently at the first live tick.
+                assert bars_df is not None  # guaranteed: bar_count >= 30 above
                 _ = engineer.transform(bars_df.tail(30))
                 results[symbol] = bar_count
 
@@ -660,6 +666,40 @@ class Pipeline:
         does not cancel other tasks. Individual engine crashes are handled
         by _safe_engine_run() which logs but does not re-raise.
         """
+        # ── Seed static config fields into the dashboard StatusStore ─────────
+        # These never change at runtime so one push at task-group start is
+        # sufficient. Dynamic fields (threshold, streak, session) are pushed
+        # by live.py on each tick.
+        from core.dashboard import status_store
+
+        status_store.update(
+            {
+                "practice_mode": self._settings.practice_mode,
+                "base_confidence_threshold": self._settings.confidence_threshold,
+                "confidence_threshold": self._settings.confidence_threshold,
+                "martingale_max_streak": self._settings.martingale_max_streak,
+                "session": {
+                    "is_active": True,
+                    "wins": 0,
+                    "losses": 0,
+                    "draws": 0,
+                    "net_profit": 0.0,
+                    "signals_fired": 0,
+                    "elapsed_minutes": 0,
+                },
+            }
+        )
+
+        # ── Dashboard HTTP server ──────────────────────────────────────────
+        from core.dashboard import run_dashboard
+
+        self._tasks.append(
+            asyncio.create_task(
+                run_dashboard(self._settings.dashboard_port),
+                name="dashboard",
+            )
+        )
+
         # Engine tasks
         for engine in self._engines:
             self._tasks.append(
@@ -670,6 +710,10 @@ class Pipeline:
             )
 
         # Retrain scheduler — receives the shared Storage instance
+        assert self._storage is not None, (
+            "Pipeline._storage must be initialised before _run_task_group(). "
+            "Ensure _stage_storage() completed successfully."
+        )
         self._tasks.append(
             asyncio.create_task(
                 self._retrain_scheduler(self._storage),
@@ -677,65 +721,293 @@ class Pipeline:
             )
         )
 
-        # Optional TelegramBot — lazy import, warning-only if unavailable
-        self._start_telegram_bot()
+        # ── Reporter + Telegram bot ────────────────────────────────────────
+        # Initialised here (not __init__) so engines exist before the bot
+        # starts responding to /status commands.
+        self._reporter = self._init_reporter()
+
+        if self._reporter is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._reporter.start_telegram_polling(),
+                    name="telegram_bot",
+                )
+            )
+
+        # ── Background notification tasks ──────────────────────────────────
+        self._tasks.append(
+            asyncio.create_task(
+                self._quotex_status_loop(),
+                name="quotex_status",
+            )
+        )
+        self._tasks.append(
+            asyncio.create_task(
+                self._daily_report_loop(),
+                name="daily_report",
+            )
+        )
 
         logger.info(
             "[^] Pipeline task group: %d tasks launched.",
             len(self._tasks),
         )
 
+        # Boot notification — fire-and-forget before entering gather.
+        # Not a task: we want it sent synchronously before the main loop
+        # blocks, but failure must never prevent the loop from starting.
+        await self._send_boot_notification()
+
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    def _start_telegram_bot(self) -> None:
-        """
-        Attempt to launch the TelegramBot polling loop as an asyncio task.
+    # ── Reporter initialisation ───────────────────────────────────────────────
 
-        Lazy-imported so pipeline.py imports cleanly when reporter.py is
-        not yet finalised. Requires TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
-        in .env. If either is absent or import fails, a warning is logged
-        and the bot is skipped — this is not a fatal condition.
+    def _init_reporter(self) -> Any:
         """
-        if not self._settings.telegram_token or not self._settings.telegram_chat_id:
-            warning_block = (
-                f"\n{'%' * 60}\n"
-                f"PIPELINE WARNING: TELEGRAM BOT NOT CONFIGURED\n"
-                f"TELEGRAM_TOKEN set   : {bool(self._settings.telegram_token)}\n"
-                f"TELEGRAM_CHAT_ID set : {bool(self._settings.telegram_chat_id)}\n\n"
-                f"CONTEXT: TelegramBot requires both TELEGRAM_TOKEN and\n"
-                f"TELEGRAM_CHAT_ID to be set in .env. Bot commands (/status,\n"
-                f"/stop, /report) will not be available this session.\n"
-                f"\nFIX: Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in .env and\n"
-                f"restart the pipeline.\n"
-                f"{'%' * 60}"
+        Construct the pipeline-level Reporter and start Telegram polling.
+
+        Pipeline acts as the orchestrator: get_status() reads status_store,
+        stop() schedules graceful shutdown, resume/start_session are no-ops
+        (a restart is required to start a new session).
+
+        Returns:
+            Reporter instance, or None if both channels are unconfigured.
+        """
+        try:
+            from trading.reporter import Reporter
+
+            # Thin adapter so Pipeline satisfies OrchestratorProtocol without
+            # conflicting with the existing async Pipeline.stop() method.
+            pipeline_ref = self
+
+            class _Orchestrator:
+                def get_status(self) -> dict[str, Any]:
+                    from core.dashboard import status_store
+                    return status_store.get()
+
+                def stop(self) -> str:
+                    asyncio.get_running_loop().create_task(pipeline_ref.stop())
+                    return "Shutdown signal sent."
+
+                def resume(self) -> str:
+                    return "Restart the container to start a new session."
+
+                def start_session(self) -> str:
+                    return "Session is already running."
+
+            return Reporter(
+                telegram_token=self._settings.telegram_token,
+                telegram_chat_id=self._settings.telegram_chat_id,
+                discord_webhook_url=self._settings.discord_webhook_url,
+                orchestrator=_Orchestrator(),
             )
-            logger.warning(warning_block)
+
+        except Exception as exc:
+            logger.warning(
+                "[%%] Pipeline: Reporter init failed — notifications disabled. %s", exc
+            )
+            return None
+
+    # ── Boot notification ─────────────────────────────────────────────────────
+
+    async def _send_boot_notification(self) -> None:
+        """
+        Send a 'system ready' alert to Discord and Telegram on every deploy.
+
+        Called once after all tasks are created but before asyncio.gather()
+        blocks. Failure is silently swallowed — a missed boot alert must
+        never prevent the trading loop from starting.
+        """
+        if self._reporter is None:
             return
 
+        symbols = ", ".join(f"`{e.symbol}`" for e in self._engines)
+        mode = "PRACTICE" if self._settings.practice_mode else "LIVE"
+        mode_icon = "🟡" if self._settings.practice_mode else "🔴"
+        message = (
+            f"🚀 <b>Trader AI — System Ready</b>\n"
+            f"{mode_icon} Mode: <code>{mode}</code>\n"
+            f"📊 Symbols: {symbols}\n"
+            f"⏱ Expiry: <code>{self._settings.expiry_seconds}s</code>\n"
+            f"🎯 Base threshold: <code>{self._settings.confidence_threshold:.0%}</code>\n"
+            f"🛡 Max streak: <code>{self._settings.martingale_max_streak}</code>\n"
+            f"📡 Stream: <code>{'Quotex' if self._settings.use_quotex_streaming else 'TwelveData'}</code>"
+        )
+
         try:
-            from trading.reporter import TelegramBot  # type: ignore[import]
+            # Telegram expects HTML; Discord gets a plain-text variant via
+            # send_alert_async which handles its own formatting.
+            if hasattr(self._reporter, "_telegram") and self._reporter._telegram:
+                await self._reporter._telegram.send_message(message, parse_mode="HTML")
+            if hasattr(self._reporter, "_discord") and self._reporter._discord:
+                plain = (
+                    message.replace("<b>", "**").replace("</b>", "**")
+                    .replace("<code>", "`").replace("</code>", "`")
+                    .replace("<br>", "\n")
+                )
+                await self._reporter._discord.send_alert_async(plain, level="info")
+        except Exception as exc:
+            logger.warning("[%%] Boot notification failed (non-fatal): %s", exc)
 
-            # TelegramBot requires an orchestrator — pipeline.py acts as one.
-            # Full orchestrator protocol wiring is deferred until pipeline.py
-            # implements get_status(), stop(), resume(), start_session().
-            # For now, bot construction is skipped with an explicit note.
+    # ── Quotex status polling loop ────────────────────────────────────────────
+
+    async def _quotex_status_loop(self) -> None:
+        """
+        Poll each engine's QuotexReader every 30 s and push live account
+        data to the dashboard StatusStore.
+
+        Pushes: connection status, account balance, session win/loss/draw
+        counts (derived from get_history()), and pending trade count.
+
+        Only runs when USE_QUOTEX_STREAMING=True and at least one engine
+        has a connected QuotexReader stream. Silently skips non-Quotex
+        streams and disconnected clients.
+        """
+        from core.dashboard import status_store
+
+        if not self._settings.use_quotex_streaming:
+            logger.info("[^] Quotex status loop: not using Quotex streaming — exiting.")
+            return
+
+        # Give QuotexReader time to connect before first poll.
+        await asyncio.sleep(15)
+
+        while not self._shutdown_requested:
+            try:
+                # Use the first engine's stream — all engines share the same
+                # Quotex account so one poll is sufficient.
+                stream = self._engines[0]._stream if self._engines else None
+                if stream is None or not hasattr(stream, "_connected"):
+                    await asyncio.sleep(30)
+                    continue
+
+                connected: bool = bool(getattr(stream, "_connected", False))
+                balance: float = 0.0
+                wins: int = 0
+                losses: int = 0
+                draws: int = 0
+                net_profit: float = 0.0
+                pending: int = len(getattr(stream, "_pending", {}))
+
+                if connected:
+                    try:
+                        balance = await asyncio.wait_for(
+                            stream.get_balance(), timeout=5.0
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        history = await asyncio.wait_for(
+                            stream.get_history(), timeout=8.0
+                        )
+                        for trade in history:
+                            profit = trade.get("profitAmount", 0)
+                            if profit > 0:
+                                wins += 1
+                            elif profit < 0:
+                                losses += 1
+                            else:
+                                draws += 1
+                            net_profit += profit
+                    except Exception:
+                        pass
+
+                status_store.update(
+                    {
+                        "quotex": {"connected": connected, "balance": balance},
+                        "pending_signals": pending,
+                        "session": {
+                            **status_store.get().get("session", {}),
+                            "wins": wins,
+                            "losses": losses,
+                            "draws": draws,
+                            "net_profit": net_profit,
+                        },
+                    }
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    {"event": "quotex_status_poll_error", "error": str(exc)}
+                )
+
+            await asyncio.sleep(30)
+
+    # ── Daily report loop ─────────────────────────────────────────────────────
+
+    async def _daily_report_loop(self) -> None:
+        """
+        Send a session summary to Discord and Telegram every day at 23:50 UTC.
+
+        Calculates seconds until the next 23:50 UTC, sleeps that long, fires
+        the report, then repeats. Fires regardless of whether the session is
+        active so you always get an end-of-day snapshot.
+
+        _DAILY_REPORT_OFFSET_S controls how many seconds before midnight the
+        report fires (default 600 = 23:50 UTC).
+        """
+        if self._reporter is None:
+            logger.info("[^] Daily report loop: no reporter configured — exiting.")
+            return
+
+        from core.dashboard import status_store
+
+        while not self._shutdown_requested:
+            # ── Calculate seconds until next fire time (23:50 UTC) ────────
+            now = datetime.now(timezone.utc)
+            seconds_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
+            fire_at = 86400 - _DAILY_REPORT_OFFSET_S  # 85800 = 23:50:00 UTC
+            sleep_for = fire_at - seconds_since_midnight
+            if sleep_for <= 0:
+                # Already past today's window — wait until tomorrow's
+                sleep_for += 86400
+
             logger.info(
-                "[^] TelegramBot: credentials present but orchestrator "
-                "protocol not yet wired in pipeline.py — bot deferred."
+                "[^] Daily report loop: next report in %.0f minutes.",
+                sleep_for / 60,
             )
 
-        except ImportError as exc:
-            warning_block = (
-                f"\n{'%' * 60}\n"
-                f"PIPELINE WARNING: TELEGRAM BOT IMPORT FAILED\n"
-                f"Error: {exc}\n\n"
-                f"CONTEXT: reporter.py could not be imported. TelegramBot\n"
-                f"commands will not be available this session.\n"
-                f"\nFIX: Verify reporter.py exists and its dependencies\n"
-                f"(aiohttp) are installed in the Docker image.\n"
-                f"{'%' * 60}"
-            )
-            logger.warning(warning_block)
+            # Sleep in 60-second chunks so shutdown is responsive.
+            while sleep_for > 0 and not self._shutdown_requested:
+                chunk = min(sleep_for, 60)
+                await asyncio.sleep(chunk)
+                sleep_for -= chunk
+
+            if self._shutdown_requested:
+                break
+
+            # ── Build and send report ──────────────────────────────────────
+            try:
+                snapshot = status_store.get()
+                session = snapshot.get("session", {})
+
+                # Enrich session with config targets for the report builder.
+                session_summary = {
+                    **session,
+                    "daily_trade_target": self._settings.daily_trade_target,
+                    "daily_net_profit_target": self._settings.daily_net_profit_target,
+                    "is_active": not self._shutdown_requested,
+                    "target_reached": (
+                        session.get("wins", 0) >= self._settings.daily_trade_target
+                        or (
+                            self._settings.daily_net_profit_target is not None
+                            and session.get("net_profit", 0.0)
+                            >= self._settings.daily_net_profit_target
+                        )
+                    ),
+                }
+
+                await self._reporter.send_session_report(
+                    session_summary=session_summary,
+                    status=snapshot,
+                )
+                logger.info({"event": "daily_report_sent"})
+
+            except Exception as exc:
+                logger.warning(
+                    {"event": "daily_report_failed", "error": str(exc)}
+                )
 
     async def _safe_engine_run(self, engine: LiveEngine) -> None:
         """

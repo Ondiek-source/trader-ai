@@ -119,7 +119,7 @@ cleanup_acr() {
     --name "$ACR_NAME" \
     --repository trader-ai \
     --orderby time_desc \
-    --queryoutput tsv 2>/dev/null || true)
+    --query output tsv 2>/dev/null || true)
 
   if [[ -z "$all_tags" ]]; then
     echo "  No non-latest tags found — nothing to delete."
@@ -180,8 +180,7 @@ for provider in Microsoft.ContainerInstance Microsoft.ContainerRegistry; do
   state=$(az provider show --namespace "$provider" \
             --query registrationState --output tsv 2>/dev/null || echo "NotRegistered")
   if [[ "$state" != "Registered" ]]; then
-    "[?name != 'latest'].name" \
-    -- echo "Registering $provider (one-time, ~1 minute)..."
+    echo "Registering $provider (one-time, ~1 minute)..."
     az provider register --namespace "$provider" --wait
     echo "      Done."
   fi

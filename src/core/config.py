@@ -41,7 +41,7 @@ VALID_PAIRS: set[str] = {
     "XAU_USD",
 }
 
-VALID_EXPIRIES: set[int] = {60, 120, 300}
+VALID_EXPIRIES: set[int] = {60, 300, 900}
 VALID_SOURCES: set[str] = {"TWELVE", "QUOTEX"}
 
 # ── Value truncation helper ───────────────────────────────────────────────────
@@ -355,6 +355,7 @@ class Config:
     log_level: str
     tick_flush_size: int
     martingale_max_streak: int
+    martingale_step: float  # per-loss confidence-threshold increment
 
     # ── Reporting / notifications ─────────────────────────────────────────
     telegram_token: str
@@ -489,6 +490,51 @@ class Config:
             logger.critical(error_block)
             raise ValueError(
                 "Martingale max streak cannot exceed 6 due to risk of catastrophic losses."
+            )
+
+        # Martingale step range
+        if not 0.005 <= self.martingale_step <= 0.10:
+            error_block = (
+                f"\n{'%'*60}\n"
+                f"CONFIGURATION ERROR: MARTINGALE_STEP\n"
+                f"Value Received: {_trunc(self.martingale_step)}\n\n"
+                f"ALLOWED RANGE: 0.005 – 0.10\n"
+                f"CONTEXT: MARTINGALE_STEP controls how much the confidence threshold\n"
+                f"rises after each consecutive loss. A value below 0.005 is too small\n"
+                f"to have any protective effect; a value above 0.10 would push the\n"
+                f"threshold unreachably high after just a few losses.\n"
+                f"\nFIX: Set MARTINGALE_STEP between 0.005 and 0.10 in .env.\n"
+                f"Recommended: 0.02 (raises threshold 2 pp per loss).\n"
+                f"{'%'*60}"
+            )
+            logger.critical(error_block)
+            raise ValueError(
+                f"MARTINGALE_STEP must be between 0.005 and 0.10, "
+                f"got {_trunc(self.martingale_step)}."
+            )
+
+        # Ceiling check: base_threshold + max_streak * step must be < 1.0
+        _threshold_ceiling = self.confidence_threshold + self.martingale_max_streak * self.martingale_step
+        if _threshold_ceiling >= 1.0:
+            error_block = (
+                f"\n{'%'*60}\n"
+                f"CONFIGURATION ERROR: MARTINGALE CEILING BREACH\n"
+                f"CONFIDENCE_THRESHOLD   : {_trunc(self.confidence_threshold)}\n"
+                f"MARTINGALE_STEP        : {_trunc(self.martingale_step)}\n"
+                f"MARTINGALE_MAX_STREAK  : {_trunc(self.martingale_max_streak)}\n"
+                f"Computed ceiling       : {_trunc(_threshold_ceiling)} (must be < 1.0)\n\n"
+                f"CONTEXT: After {_trunc(self.martingale_max_streak)} consecutive losses the\n"
+                f"threshold would reach {_trunc(_threshold_ceiling)}, which is unreachable\n"
+                f"and would permanently halt all trading.\n"
+                f"\nFIX: Reduce MARTINGALE_STEP or MARTINGALE_MAX_STREAK so that\n"
+                f"     CONFIDENCE_THRESHOLD + MAX_STREAK * STEP < 1.0.\n"
+                f"{'%'*60}"
+            )
+            logger.critical(error_block)
+            raise ValueError(
+                f"Martingale ceiling breach: {_trunc(self.confidence_threshold)} + "
+                f"{_trunc(self.martingale_max_streak)} × {_trunc(self.martingale_step)} "
+                f"= {_trunc(_threshold_ceiling)} >= 1.0."
             )
 
         # Confidence threshold
@@ -706,6 +752,7 @@ def load_config() -> Config:
         use_quotex_streaming=_bool("USE_QUOTEX_STREAMING", True),
         # Martingales
         martingale_max_streak=_int("MARTINGALE_MAX_STREAK", 4),
+        martingale_step=_parse_float("MARTINGALE_STEP", default=0.02),
         # Operational overrides
         log_level=_optional("LOG_LEVEL", "INFO").upper(),
         practice_mode=_bool("PRACTICE_MODE", True),

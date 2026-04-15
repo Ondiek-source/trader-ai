@@ -71,6 +71,7 @@ import numpy as np
 import pandas as pd
 
 from core.config import get_settings
+
 from ml_engine.features import (
     BINARY_EXPIRY_RULES,
     FeatureEngineer,
@@ -81,6 +82,12 @@ from ml_engine.features import (
 from ml_engine.labeler import _EXPIRY_SECONDS
 from ml_engine.model_manager import ModelManager, ModelRecord
 
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+    
 logger = logging.getLogger(__name__)
 
 
@@ -298,6 +305,10 @@ class SignalGenerator:
         self._model: Any = None
         self._record: ModelRecord | None = None
 
+        # Optional ThresholdManager injected by live.py after construction.
+        # When None, generate() falls back to the static config threshold.
+        self._threshold_mgr: Any = None
+
         # Attempt initial load — no error if no artifact found.
         self.reload()
 
@@ -322,7 +333,7 @@ class SignalGenerator:
 
         Returns:
             bool: True if a model was loaded successfully.
-                  False if no artifact exists or loading failed.
+                    False if no artifact exists or loading failed.
         """
         record = self._manager.get_best_model(
             symbol=self.symbol,
@@ -387,6 +398,26 @@ class SignalGenerator:
             self._record = None
             return False
 
+    def set_threshold_manager(self, mgr: Any) -> None:
+        """
+        Inject a ThresholdManager so generate() uses a dynamic threshold.
+
+        When set, the effective threshold is read from mgr.get_threshold()
+        on each generate() call instead of the static config value. live.py
+        calls this once after constructing SignalGenerator.
+
+        Args:
+            mgr: ThresholdManager instance (typed Any to avoid circular import).
+        """
+        self._threshold_mgr = mgr
+        logger.info(
+            "[^] SignalGenerator.set_threshold_manager(): dynamic threshold active "
+            "base=%.2f step=%.3f max_streak=%d",
+            mgr.base_threshold,
+            mgr.step,
+            mgr.max_streak,
+        )
+
     def inject_model(self, model: Any, record: ModelRecord) -> None:
         """
         Inject a pre-loaded model artifact directly into the generator.
@@ -421,11 +452,11 @@ class SignalGenerator:
         Translate a FeatureVector into a TradeSignal.
 
         Pipeline:
-          1. Evaluate trade eligibility gates via FeatureEngineer.
-          2. If no model is loaded, return SKIP immediately.
-          3. Run model inference via _infer() to get a raw probability.
-          4. Apply confidence threshold to determine direction.
-          5. Return an immutable TradeSignal.
+            1. Evaluate trade eligibility gates via FeatureEngineer.
+            2. If no model is loaded, return SKIP immediately.
+            3. Run model inference via _infer() to get a raw probability.
+            4. Apply confidence threshold to determine direction.
+            5. Return an immutable TradeSignal.
 
         The gate result does not block inference — the model runs
         regardless of gate state. This means CALL/PUT signals can be
@@ -436,10 +467,10 @@ class SignalGenerator:
 
         Args:
             fv:    FeatureVector from FeatureEngineer.get_latest().
-                   Carries the 50-feature float32 vector for inference.
+                    Carries the 50-feature float32 vector for inference.
             fe_df: Full feature DataFrame from FeatureEngineer.transform()
-                   for the current bar window. Required for evaluate_gates()
-                   which reads BB_WIDTH, ATR, RVOL, SPREAD columns.
+                    for the current bar window. Required for evaluate_gates()
+                    which reads BB_WIDTH, ATR, RVOL, SPREAD columns.
 
         Returns:
             TradeSignal: Always returns a signal — never raises for normal
@@ -511,10 +542,18 @@ class SignalGenerator:
             ) from exc
 
         # ── 4. Confidence threshold → direction ───────────────────────────
-        if prob >= self.threshold:
+        # Use dynamic threshold from ThresholdManager when injected;
+        # fall back to the static config value otherwise.
+        effective_threshold = (
+            self._threshold_mgr.get_threshold()
+            if self._threshold_mgr is not None
+            else self.threshold
+        )
+
+        if prob >= effective_threshold:
             direction = "CALL"
             confidence = prob
-        elif prob <= (1.0 - self.threshold):
+        elif prob <= (1.0 - effective_threshold):
             direction = "PUT"
             confidence = 1.0 - prob
         else:
@@ -531,13 +570,14 @@ class SignalGenerator:
 
         logger.info(
             "[^] Signal: symbol=%s direction=%s confidence=%.4f "
-            "gate=%s model=%s expiry=%s",
+            "gate=%s model=%s expiry=%s threshold=%.3f",
             self.symbol,
             signal.direction,
             signal.confidence,
             signal.gate_passed,
             signal.model_name,
             signal.expiry_key,
+            effective_threshold,
         )
 
         return signal
@@ -549,11 +589,11 @@ class SignalGenerator:
         Run model inference and return a scalar probability in [0.0, 1.0].
 
         Dispatches to the correct inference API based on the artifact type:
-          - SB3 agents return a discrete action (0=CALL, 1=PUT, 2=SKIP).
+            - SB3 agents return a discrete action (0=CALL, 1=PUT, 2=SKIP).
             These are converted to a pseudo-probability so the threshold
             logic in generate() remains uniform.
-          - PyTorch nn.Module: forward pass with a (1, n_features) tensor.
-          - Classical ML (sklearn/XGB/LGBM/CatBoost): predict_proba() with
+            - PyTorch nn.Module: forward pass with a (1, n_features) tensor.
+            - Classical ML (sklearn/XGB/LGBM/CatBoost): predict_proba() with
             a (1, n_features) 2D numpy array.
 
         Args:
@@ -567,10 +607,11 @@ class SignalGenerator:
                 or the artifact type cannot be identified.
         """
         # _infer() is only called from generate() after the self._record is None
-        # guard at line 478. Assert here so Pylance narrows the type for this method.
+        # guard. Assert here so Pylance narrows the type for this method.
         assert self._record is not None
 
-        import torch
+        if not _HAS_TORCH:
+            raise RuntimeError("PyTorch required for inference")
 
         # SB3 detection: same MRO check as model_manager._is_sb3_model()
         is_sb3 = any(

@@ -33,13 +33,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Import status_store for direct balance pushes from _balance_monitor.
-# This is the single source of truth for live balance on the dashboard —
-# health_task is only a 10-second backup; _balance_monitor runs every 1.5s.
-try:
-    from core.dashboard import status_store as _status_store
-except Exception:
-    _status_store = None  # type: ignore[assignment]
 
 # ── Asset name mapping ─────────────────────────────────────────────────────────
 # Quotex uses "EURUSD_otc" on OTC (weekends / off-hours) and "EURUSD" on live
@@ -381,19 +374,6 @@ class QuotexReader:
                     )
                 # Always update so health() returns fresh balance
                 self._balance = new_balance
-                # Push directly to dashboard — single source of truth for balance.
-                # health_task only runs every 10 s; we run every 1.5 s.
-                if _status_store is not None:
-                    _status_store.update(
-                        {
-                            "quotex": {
-                                "connected": self._connected,
-                                "balance": self._balance,
-                                "pending_signals": len(self._pending),
-                                "result_queue_size": self._result_queue.qsize(),
-                            }
-                        }
-                    )
             except Exception as exc:
                 logger.debug({"event": "balance_poll_error", "error": str(exc)})
 
