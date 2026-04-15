@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src\"/*.py \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src/core\"/*.py \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src/data\"/*.py \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src/engine\"/*.py \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src/ml_engine\"/*.py \"c:/Users/Martin.Owaga.IMPAXAFRICA.000/OneDrive - IMPAX BUSINESS SOLUTIONS LTD/code/Projects/Trader AI/src/trading\"/*.py)",
+      "Read(//c/Users/Martin.Owaga.IMPAXAFRICA.000/.claude/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Martin.Owaga.IMPAXAFRICA.000\\.claude"
+    ]
+  }
+}

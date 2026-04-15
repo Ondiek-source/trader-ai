@@ -11,6 +11,7 @@ dist/
 build/
 .venv/
 venv/
+*.pyc
 
 # Model artifacts
 models/
@@ -27,3 +28,30 @@ models/
 # OS
 .DS_Store
 Thumbs.db
+
+# Virtual environment
+.venv/
+venv/
+
+# Test coverage output
+.coverage
+htmlcov/
+
+# Pytest cache
+.pytest_cache/
+
+# Pyright / editor
+pyrightconfig.json
+
+# Models (large binary files, use Azure Blob instead)
+models/
+
+# Data directory (runtime generated)
+data/
+
+# Deploy logs (runtime generated)
+deploy/logs/
+
+# Dev scripts (not needed in production)
+scripts/dev/
+create_test_structure.py

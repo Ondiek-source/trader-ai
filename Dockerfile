@@ -1,15 +1,16 @@
 # ============================================================================
 # Trader AI — Binary Options Automated Trading System
-# Multi-stage Docker build for Python 3.12
+# Multi-stage Docker build optimized for Python 3.13 & Dictator Pattern
 # ============================================================================
 
-FROM python:3.12-slim AS base
+FROM python:3.13-slim AS base
 
-# Prevent Python from writing .pyc files and enable unbuffered stdout/stderr
+# 1. Environment Sanitization
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app/src"
 
-# Install minimal system dependencies required by native pip packages
+# 2. System Dependencies (Required for building native extensions & git installs)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
@@ -18,77 +19,62 @@ RUN apt-get update && \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------------------------------------------------------------------------
-# Create non-root application user
-# ---------------------------------------------------------------------------
+# 3. Security: Create non-root user
 RUN groupadd --gid 1000 appuser && \
     useradd  --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
 
 WORKDIR /app
 
-# ---------------------------------------------------------------------------
-# Install Python dependencies — separate layers for retry resilience
-# If one layer fails, Docker caches the others
-# ---------------------------------------------------------------------------
-
+# 4. Python Dependency Layers
 RUN pip install --no-cache-dir --upgrade pip
 
-# Layer 1: CPU-only PyTorch (~200MB, most likely to timeout)
-RUN pip install --no-cache-dir --retries 10\
+# Layer 1: Heavy ML & Data Processing
+# Note: pyarrow is required for your Snappy-compressed Parquet strategy
+# --extra-index-url https://download.pytorch.org/whl/cu121 GPU wheels if you enable GPU support in the future
+RUN pip install --no-cache-dir --retries 10 \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    "torch>=2.1.0"
+    "torch>=2.1.0" \
+    "pandas>=2.2.0" \
+    "pyarrow>=15.0.0" \
+    "numpy>=1.26.0" \
+    "scikit-learn>=1.4.0" \
+    "lightgbm>=4.3.0" \
+    "xgboost>=2.0.0" \
+    "catboost>=1.2.0" \
+    "stable-baselines3>=2.3.0" \ 
+    "sb3-contrib>=2.3.0" \
+    "gymnasium>=0.29.0"
 
-# Layer 2: Scientific stack
-RUN pip install --no-cache-dir --retries 10\
-    pyarrow>=15.0.0 \
-    pandas>=2.2.0 \
-    numpy>=1.26.0 \
-    scipy
+# Layer 2: API, Networking & Utilities
+RUN pip install --no-cache-dir --retries 10 \
+    "websockets>=12.0" \
+    "azure-storage-blob>=12.19.0" \
+    "psutil>=5.9.8" \
+    "requests>=2.31.0" \
+    "aiohttp>=3.13.2" \
+    "python-dotenv>=1.0.0" \
+    "python-telegram-bot>=20.7" \
+    "joblib>=1.3.0"
 
-# Layer 3: ML frameworks
-RUN pip install --no-cache-dir --retries 10\
-    lightgbm>=4.1.0 \
-    xgboost>=2.0.0 \
-    scikit-learn>=1.4.0
-
-# Layer 4: Everything else (small, fast)
-RUN pip install --no-cache-dir --retries 10\
-    websockets>=12.0 \
-    azure-storage-blob>=12.19.0 \
-    psutil>=5.9.8 \
-    requests>=2.31.0 \
-    aiohttp>=3.13.2 \
-    aiodns>=3.2.0 \
-    brotli>=1.1.0 \
-    python-telegram-bot>=20.7 \
-    httpx>=0.27.0 \
-    joblib>=1.3.0 \
-    python-dotenv>=1.0.0
-
-# Layer 5: Quotex (from git — failure is non-fatal)
+# Layer 3: Broker Integration (Git-based)
 RUN pip install --no-cache-dir \
-    "git+https://github.com/cleitonleonel/pyquotex.git" \
-    || echo "WARNING: pyquotex install failed — Quotex streaming disabled"
+    "git+https://github.com/cleitonleonel/pyquotex.git"
 
-# ---------------------------------------------------------------------------
-# Copy application source
-# ---------------------------------------------------------------------------
-COPY src/ ./src/
+# 5. Infrastructure Provisioning
+# We create the folders before copying source to ensure 'appuser' ownership 
+# and pass the Storage.py write-check.
+RUN mkdir -p /app/data/raw /app/data/processed /app/models /tmp/fallback && \
+    chown -R appuser:appuser /app /tmp/fallback
 
-# Model persistence and fallback storage directories
-RUN mkdir -p /app/models /tmp/fallback && chown -R appuser:appuser /app /tmp/fallback
+# 6. Source Code Deployment
+# Using --chown here is faster and more secure than a separate RUN chown
+COPY --chown=appuser:appuser . .
 
-# ---------------------------------------------------------------------------
-# Runtime configuration
-# ---------------------------------------------------------------------------
+# 7. Runtime Configuration
 USER appuser
 
-EXPOSE 8080
-
-ENV PYTHONPATH=/app/src
-
-# Health check: hits the local result-receiver /health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -sf http://localhost:8080/health || exit 1
+# Healthcheck uses pgrep to ensure the main process is actually running
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD pgrep -f "python src/main.py" || exit 1
 
 CMD ["python", "src/main.py"]

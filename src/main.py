@@ -19,7 +19,7 @@ exceptions, logs them, sleeps 5 s, and restarts.  One-shot tasks use
 from __future__ import annotations
 
 import asyncio
-import gc
+from collections import deque
 import json
 import logging
 import queue
@@ -82,25 +82,24 @@ def _configure_logging(level: str = "INFO") -> None:
     logging.getLogger("azure").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
-    logging.getLogger("pyquotex.ws.client").setLevel(logging.WARNING) 
-
+    logging.getLogger("pyquotex.ws.client").setLevel(logging.WARNING)
 
 
 # ── Import application modules ─────────────────────────────────────────────────
 # (after logging config so imports can log safely)
 
-from config import load_config  # noqa: E402
-from storage import StorageManager  # noqa: E402
-from twelveticks_stream import TwelveDataStream  # noqa: E402
+from core.config import load_config  # noqa: E402
+from data.storage import StorageManager  # noqa: E402
+from engine.twelveticks_stream import TwelveDataStream  # noqa: E402
 from quotex_stream import QuotexStream  # noqa: E402
 from backfill import backfill_all, check_data_coverage  # noqa: E402
 from features import compute_features, resample_to_1min  # noqa: E402
 from model import MartingaleTracker, ModelManager, SEQ_LEN  # noqa: E402
 from signals import create_orchestrator, SignalOrchestrator  # noqa: E402
-from webhook import WebhookSender, WebhookError  # noqa: E402
-from quotex_reader import QuotexReader, run_quotex_reader  # noqa: E402
+from trading.webhook import WebhookSender, WebhookError  # noqa: E402
+from engine.quotex_reader import QuotexReader, run_quotex_reader  # noqa: E402
 from reporter import DiscordReporter, TelegramBot, scheduled_report_loop  # noqa: E402
-from dashboard import run_dashboard, status_store  # noqa: E402
+from core.dashboard import run_dashboard, status_store  # noqa: E402
 from log_storage import BlobLogHandler  # noqa: E402
 
 logger = logging.getLogger("main")
@@ -298,7 +297,11 @@ async def signal_task(
         config: Application config with pairs, expiry, thresholds.
         quotex_reader: Optional :class:`QuotexReader` for result matching.
     """
-    recent_ticks: dict[str, list[dict[str, Any]]] = {p: [] for p in config.pairs}
+    # deque(maxlen) gives O(1) append + automatic eviction of oldest entries,
+    # eliminating the O(n) slice-trim and the TOCTOU race between len() and reassign.
+    recent_ticks: dict[str, deque[dict[str, Any]]] = {
+        p: deque(maxlen=MAX_RECENT_TICKS) for p in config.pairs
+    }
     last_bar_minute: dict[str, int] = {p: -1 for p in config.pairs}
 
     # FIX F: Rolling History Buffer (The "Bridge" Fix).
@@ -307,7 +310,9 @@ async def signal_task(
     # NEW: Maintain a rolling window of feature rows per pair so that every
     #   inference call has a full 30-minute "context" ready for LSTM /
     #   Transformer.
-    feature_history: dict[str, list[np.ndarray]] = {p: [] for p in config.pairs}
+    feature_history: dict[str, deque[np.ndarray]] = {
+        p: deque(maxlen=SEQ_LEN + 50) for p in config.pairs
+    }
 
     logger.info(
         {
@@ -329,10 +334,8 @@ async def signal_task(
         if pair not in config.pairs:
             continue
 
-        # Append to rolling window, trim to budget
+        # Append to rolling window — deque(maxlen) evicts oldest automatically.
         recent_ticks[pair].append(tick.to_dict())
-        if len(recent_ticks[pair]) > MAX_RECENT_TICKS:
-            recent_ticks[pair] = recent_ticks[pair][-MAX_RECENT_TICKS:]
 
         # ── Detect new 1-min bar ───────────────────────────────────────────
         tick_minute: int = tick.timestamp.minute
@@ -437,7 +440,6 @@ async def signal_task(
                 continue
             feature_row: pd.Series[Any] = feature_df.iloc[-1]
             del feature_df, tick_df
-            gc.collect()
         except Exception as exc:
             logger.warning(
                 {
@@ -453,12 +455,10 @@ async def signal_task(
 
         _feature_cols: list[str] = get_feature_columns()
         available_cols: list[str] = [c for c in _feature_cols if c in feature_row.index]
+        # deque(maxlen=SEQ_LEN+50) evicts oldest automatically — no manual trim needed.
         feature_history[pair].append(
             feature_row[available_cols].to_numpy(dtype=np.float64)
         )
-        # Keep at least SEQ_LEN rows for sequence models
-        if len(feature_history[pair]) > SEQ_LEN + 50:
-            feature_history[pair] = feature_history[pair][-(SEQ_LEN + 50) :]
 
         # ── Model inference ────────────────────────────────────────────────
         # FIX F + FIX G: Build 3D history array only when we have enough
@@ -601,7 +601,7 @@ async def feedback_task(
         storage: Persistent storage for result history.
         config: Application config (for confidence_threshold, etc.).
     """
-    from quotex_reader import QUOTEX_LIB_AVAILABLE
+    from engine.quotex_reader import QUOTEX_LIB_AVAILABLE
 
     if not QUOTEX_LIB_AVAILABLE:
         logger.info(
@@ -990,7 +990,7 @@ async def main() -> None:
             "confidence_threshold": config.confidence_threshold,
             "practice_mode": config.practice_mode,
             "daily_trade_target": config.daily_trade_target,
-            "target_net_profit": config.target_net_profit,
+            "daily_net_profit_target": config.daily_net_profit_target,
         }
     )
 
