@@ -280,6 +280,56 @@ if az container show \
     --output none
 fi
 
+# ── Step 5.5: Setup Log Analytics for container logs ──────────────────────────
+
+# ── Step 5.5: Setup Log Analytics for container logs ──────────────────────────
+
+echo "Setting up Log Analytics for container logging..."
+
+# Check if Log Analytics workspace exists, delete if found
+if az monitor log-analytics workspace show \
+    --resource-group "$RESOURCE_GROUP" \
+    --workspace-name "trader-ai-logs" &>/dev/null; then
+  echo "  Deleting existing Log Analytics workspace..."
+  az monitor log-analytics workspace delete \
+    --resource-group "$RESOURCE_GROUP" \
+    --workspace-name "trader-ai-logs" \
+    --force \
+    --yes \
+    --output none
+  echo "  ✓ Workspace deleted."
+fi
+
+# Create fresh workspace
+echo "  Creating new Log Analytics workspace..."
+az monitor log-analytics workspace create \
+  --resource-group "$RESOURCE_GROUP" \
+  --workspace-name "trader-ai-logs" \
+  --location "$LOCATION" \
+  --output none
+
+# Wait a few seconds for workspace to be ready
+sleep 5
+echo "  ✓ Fresh workspace created."
+
+# Get workspace ID and key
+WORKSPACE_ID=$(az monitor log-analytics workspace show \
+  --resource-group "$RESOURCE_GROUP" \
+  --workspace-name "trader-ai-logs" \
+  --query customerId -o tsv)
+
+WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
+  --resource-group "$RESOURCE_GROUP" \
+  --workspace-name "trader-ai-logs" \
+  --query primarySharedKey -o tsv)
+
+if [[ -n "$WORKSPACE_ID" && -n "$WORKSPACE_KEY" ]]; then
+  echo "  ✓ Log Analytics configured with fresh workspace."
+else
+  echo "  WARNING: Could not get Log Analytics keys - logs will not be persisted."
+fi
+
+# ── Step 6: Deploy to ACI ─────────────────────────────────────────────────────
 
 _CREATE_CMD=(
   az container create \
@@ -298,7 +348,7 @@ _CREATE_CMD=(
     --environment-variables "${_ENV_KV_PAIRS[@]}" \
     --secure-environment-variables "${_SECURE_KV_PAIRS[@]}" \
     --location "$LOCATION" \
-    --restart-policy Always \
+    --restart-policy Never \
     --output table
   )
 
@@ -307,20 +357,13 @@ _CREATE_CMD=(
     echo "File exists: $(test -f "$APP_ENV" && echo YES || echo NO)"
     echo ""
     echo "=== DIAGNOSTIC: _ENV_KV_PAIRS (${#_ENV_KV_PAIRS[@]} items) ==="
-    if [[ ${#_ENV_KV_PAIRS[@]} -gt 0 ]]; then
-      printf '  %s\n' "${_ENV_KV_PAIRS[@]}"
-    else
-      echo "  EMPTY — no plain vars were collected"
-    fi
-    echo ""
     echo "=== DIAGNOSTIC: _SECURE_KV_PAIRS (${#_SECURE_KV_PAIRS[@]} items) ==="
-    if [[ ${#_SECURE_KV_PAIRS[@]} -gt 0 ]]; then
-      printf '  %s\n' "${_SECURE_KV_PAIRS[@]}"
-    else
-      echo "  EMPTY — no secure vars were collected"
-    fi
     echo "=========================================="
-
+    # Add Log Analytics if configured
+    if [[ -n "$WORKSPACE_ID" && -n "$WORKSPACE_KEY" ]]; then
+      _CREATE_CMD+=(--log-analytics-workspace "$WORKSPACE_ID")
+      _CREATE_CMD+=(--log-analytics-workspace-key "$WORKSPACE_KEY")
+    fi
 
 
 "${_CREATE_CMD[@]}"

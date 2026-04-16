@@ -76,6 +76,6 @@ USER appuser
 # Healthcheck hits the dashboard /status endpoint (curl is installed above).
 # pgrep is not available in python:3.13-slim without procps.
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -sf http://localhost:8080/status > /dev/null || exit 1
+    CMD curl -sf http://localhost:${DASHBOARD_PORT:-8080}/status > /dev/null || exit 1
 
 CMD ["python", "src/main.py"]

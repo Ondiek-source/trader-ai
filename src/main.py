@@ -17,6 +17,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+import traceback
 
 # ── JSON structured logging ────────────────────────────────────────────────────
 
@@ -27,9 +28,7 @@ class _JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         msg: str = record.getMessage()
         try:
-            payload: dict = (
-                json.loads(msg) if msg.startswith("{") else {"message": msg}
-            )
+            payload: dict = json.loads(msg) if msg.startswith("{") else {"message": msg}
         except (json.JSONDecodeError, ValueError):
             payload = {"message": msg}
 
@@ -87,12 +86,18 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info({"event": "shutdown", "message": "KeyboardInterrupt"})
     except SystemExit:
+        # Force flush to stderr BEFORE exit
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         raise
     except Exception as exc:
         logger.critical(
             {"event": "fatal_crash", "error": str(exc), "type": type(exc).__name__},
             exc_info=True,
         )
+        # Force flush to stderr BEFORE exit
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         sys.exit(1)
 
 
