@@ -322,14 +322,22 @@ class Historian:
             try:
                 start: datetime = now_utc.replace(
                     year=now_utc.year - years,
-                    hour=0, minute=0, second=0, microsecond=0,
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
                 )
             except ValueError:
                 # now_utc is Feb 29 and (now_utc.year - years) is not a leap year.
                 # Shift to Feb 28 — one day earlier is preferable to an exception.
                 start = now_utc.replace(
-                    year=now_utc.year - years, month=2, day=28,
-                    hour=0, minute=0, second=0, microsecond=0,
+                    year=now_utc.year - years,
+                    month=2,
+                    day=28,
+                    hour=0,
+                    minute=0,
+                    second=0,
+                    microsecond=0,
                 )
             info_block = (
                 f"\n{'+' * 60}\n"
@@ -753,7 +761,7 @@ class Historian:
                 bar = Bar(
                     timestamp=ts,
                     symbol=symbol,
-                    open_price=float(v["open"]),
+                    open=float(v["open"]),
                     high=float(v["high"]),
                     low=float(v["low"]),
                     close=float(v["close"]),

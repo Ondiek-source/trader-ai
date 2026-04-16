@@ -19,7 +19,7 @@ from src.ml_engine.model import Bar, Timeframe
 
 def test_bar_valid_construction(valid_bar):
     assert valid_bar.symbol == "EUR_USD"
-    assert valid_bar.open_price == pytest.approx(1.0850)
+    assert valid_bar.open == pytest.approx(1.0850)
     assert valid_bar.high == pytest.approx(1.0865)
     assert valid_bar.low == pytest.approx(1.0848)
     assert valid_bar.close == pytest.approx(1.0860)
@@ -47,7 +47,7 @@ def test_bar_to_dict_keys(valid_bar):
     expected = {
         "timestamp",
         "symbol",
-        "open_price",
+        "open",
         "high",
         "low",
         "close",
@@ -104,12 +104,12 @@ def test_bar_low_above_high_rejected(valid_bar_factory):
 
 def test_bar_open_above_high_rejected(valid_bar_factory):
     with pytest.raises(ValueError, match="Bar integrity failure"):
-        valid_bar_factory(open_price=1.0870, high=1.0865)
+        valid_bar_factory(open=1.0870, high=1.0865)
 
 
 def test_bar_open_below_low_rejected(valid_bar_factory):
     with pytest.raises(ValueError, match="Bar integrity failure"):
-        valid_bar_factory(open_price=1.0840, low=1.0848)
+        valid_bar_factory(open=1.0840, low=1.0848)
 
 
 def test_bar_close_above_high_rejected(valid_bar_factory):
@@ -133,8 +133,8 @@ def test_bar_zero_volume_accepted(valid_bar_factory):
 
 
 def test_bar_open_equal_to_high_accepted(valid_bar_factory):
-    bar = valid_bar_factory(open_price=1.0865, high=1.0865)
-    assert bar.open_price == pytest.approx(1.0865)
+    bar = valid_bar_factory(open=1.0865, high=1.0865)
+    assert bar.open == pytest.approx(1.0865)
 
 
 def test_bar_close_equal_to_low_accepted(valid_bar_factory):

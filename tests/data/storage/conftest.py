@@ -10,7 +10,7 @@ from datetime import datetime
 from src.ml_engine.model import Tick, Bar, Timeframe
 
 
-VALID_TS   = datetime(2024, 1, 15, 10, 30, 0)
+VALID_TS = datetime(2024, 1, 15, 10, 30, 0)
 VALID_TS_2 = datetime(2024, 1, 15, 10, 31, 0)
 VALID_TS_3 = datetime(2024, 1, 15, 10, 32, 0)
 
@@ -53,7 +53,7 @@ def valid_bar():
     return Bar(
         timestamp=VALID_TS,
         symbol="EUR_USD",
-        open_price=1.0850,
+        open=1.0850,
         high=1.0865,
         low=1.0848,
         close=1.0860,
@@ -66,7 +66,7 @@ def valid_bar_2():
     return Bar(
         timestamp=VALID_TS_2,
         symbol="EUR_USD",
-        open_price=1.0860,
+        open=1.0860,
         high=1.0875,
         low=1.0858,
         close=1.0870,
@@ -79,7 +79,7 @@ def incomplete_bar():
     return Bar(
         timestamp=VALID_TS,
         symbol="EUR_USD",
-        open_price=1.0850,
+        open=1.0850,
         high=1.0865,
         low=1.0848,
         close=1.0860,
@@ -100,7 +100,7 @@ def storage(tmp_path, minimal_valid_env):
 
     with patch.dict(os.environ, minimal_valid_env, clear=True):
         store = Storage.__new__(Storage)
-        store._settings = None # type: ignore
+        store._settings = None  # type: ignore
         store._lock = threading.Lock()
         store.root_dir = tmp_path / "data"
         store.raw_dir = tmp_path / "data" / "raw"

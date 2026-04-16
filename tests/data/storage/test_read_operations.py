@@ -86,7 +86,7 @@ def test_get_bars_empty_file_returns_none_with_warning(storage, caplog):
     empty_df = pd.DataFrame(
         columns=[
             "timestamp",
-            "open_price",
+            "open",
             "high",
             "low",
             "close",
@@ -119,7 +119,7 @@ def test_get_bars_empty_file_different_timeframe(storage, caplog):
     empty_df = pd.DataFrame(
         columns=[
             "timestamp",
-            "open_price",
+            "open",
             "high",
             "low",
             "close",
@@ -150,7 +150,7 @@ def test_get_bars_returns_dataframe(storage, valid_bar):
     storage.save_bar(valid_bar)
     df = storage.get_bars("EUR_USD", timeframe="M1")
     assert isinstance(df, pd.DataFrame)
-    assert "open_price" in df.columns
+    assert "open" in df.columns
     assert "close" in df.columns
     assert "volume" in df.columns
 

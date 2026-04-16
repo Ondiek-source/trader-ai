@@ -33,7 +33,7 @@ def valid_bar():
     return Bar(
         timestamp=VALID_TS_NAIVE,
         symbol="EUR_USD",
-        open_price=1.0850,
+        open=1.0850,
         high=1.0865,
         low=1.0848,
         close=1.0860,
@@ -72,7 +72,7 @@ def valid_bar_factory():
         return Bar(
             timestamp=cast(datetime, overrides.get("timestamp", VALID_TS_NAIVE)),
             symbol=cast(str, overrides.get("symbol", "EUR_USD")),
-            open_price=cast(float, overrides.get("open_price", 1.0850)),
+            open=cast(float, overrides.get("open", 1.0850)),
             high=cast(float, overrides.get("high", 1.0865)),
             low=cast(float, overrides.get("low", 1.0848)),
             close=cast(float, overrides.get("close", 1.0860)),

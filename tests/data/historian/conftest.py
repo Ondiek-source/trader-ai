@@ -12,10 +12,11 @@ from src.ml_engine.model import Bar, Timeframe
 VALID_SYMBOL = "EUR_USD"
 VALID_API_SYMBOL = "EUR/USD"
 NOW_UTC = datetime(2026, 4, 13, 12, 0, 0, tzinfo=timezone.utc)
-LAST_BAR_TS = datetime(2026, 4, 12, 23, 59, 0)   # naive UTC
+LAST_BAR_TS = datetime(2026, 4, 12, 23, 59, 0)  # naive UTC
 
 
 # â”€â”€ Settings mock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 
 @pytest.fixture
 def mock_settings():
@@ -29,16 +30,18 @@ def mock_settings():
 
 # â”€â”€ Storage mock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+
 @pytest.fixture
 def mock_storage():
     """Mock Storage with get_bars and save_bar_batch pre-configured."""
     storage = MagicMock()
-    storage.get_bars.return_value = None     # default: no existing data
+    storage.get_bars.return_value = None  # default: no existing data
     storage.save_bar_batch.return_value = True
     return storage
 
 
 # â”€â”€ Historian under test â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 
 @pytest.fixture
 def historian(mock_settings, mock_storage):
@@ -48,13 +51,15 @@ def historian(mock_settings, mock_storage):
     Bypasses get_settings() and Storage() construction so tests
     do not require a real .env file or filesystem.
     """
-    with patch("src.data.historian.get_settings", return_value=mock_settings), \
-         patch("src.data.historian.Storage", return_value=mock_storage):
+    with patch("src.data.historian.get_settings", return_value=mock_settings), patch(
+        "src.data.historian.Storage", return_value=mock_storage
+    ):
         h = Historian()
     return h
 
 
 # â”€â”€ API response factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 
 def make_api_values(n: int = 3, symbol: str = VALID_SYMBOL) -> list[dict]:
     """
@@ -64,13 +69,11 @@ def make_api_values(n: int = 3, symbol: str = VALID_SYMBOL) -> list[dict]:
     base = datetime(2026, 4, 12, 10, 2, 0)
     return [
         {
-            "datetime": (base - pd.Timedelta(minutes=i)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-            "open":   "1.08500",
-            "high":   "1.08550",
-            "low":    "1.08480",
-            "close":  "1.08520",
+            "datetime": (base - pd.Timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M:%S"),
+            "open": "1.08500",
+            "high": "1.08550",
+            "low": "1.08480",
+            "close": "1.08520",
             "volume": "342",
         }
         for i in range(n)
@@ -89,7 +92,7 @@ def valid_bar():
     return Bar(
         timestamp=datetime(2026, 4, 12, 10, 0, 0),
         symbol=VALID_SYMBOL,
-        open_price=1.08500,
+        open=1.08500,
         high=1.08550,
         low=1.08480,
         close=1.08520,

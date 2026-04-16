@@ -368,6 +368,116 @@ _CREATE_CMD=(
 
 "${_CREATE_CMD[@]}"
 
+# ── Step 7: Wait for container to be ready ─────────────────────────────────────
+echo ""
+echo "Waiting for container to be ready..."
+sleep 10
+
+# ── Step 8: Sync data from Azure Blob to container ────────────────────────────
+echo ""
+echo "=========================================="
+echo "  Syncing data from Azure Blob to container"
+echo "=========================================="
+
+# Function to copy blob to container
+copy_blob_to_container() {
+  local blob_name="$1"
+  local container_path="$2"
+  
+  echo "  Copying: $blob_name -> $container_path"
+  
+  # Create directory in container
+  az container exec \
+    --name "$ACI_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --exec-command "mkdir -p $(dirname "$container_path")" \
+    --output none 2>/dev/null || true
+  
+  # Download blob to container using Azure CLI inside container
+  az container exec \
+    --name "$ACI_NAME" \
+    --resource-group "$RESOURCE_GROUP" \
+    --exec-command "az storage blob download \
+      --account-name $STORAGE_ACCOUNT \
+      --container-name $CONTAINER_NAME \
+      --name \"$blob_name\" \
+      --file \"$container_path\" \
+      --overwrite 2>/dev/null || echo '  ⚠ File not found: $blob_name'" \
+    --output none
+}
+
+# Sync processed bar files
+echo ""
+echo "[1/3] Syncing processed bar files..."
+BLOB_LIST=$(az storage blob list \
+  --account-name "$STORAGE_ACCOUNT" \
+  --container-name "$CONTAINER_NAME" \
+  --prefix "processed/" \
+  --query "[].name" -o tsv 2>/dev/null || echo "")
+
+if [[ -n "$BLOB_LIST" ]]; then
+  echo "$BLOB_LIST" | while read -r blob; do
+    local_path="/app/data/${blob}"
+    copy_blob_to_container "$blob" "$local_path"
+  done
+else
+  echo "  No processed bar files found in blob storage."
+fi
+
+# Sync model files
+echo ""
+echo "[2/3] Syncing model files..."
+MODEL_BLOBS=$(az storage blob list \
+  --account-name "$STORAGE_ACCOUNT" \
+  --container-name "$CONTAINER_NAME" \
+  --prefix "models/" \
+  --query "[].name" -o tsv 2>/dev/null || echo "")
+
+if [[ -n "$MODEL_BLOBS" ]]; then
+  echo "$MODEL_BLOBS" | while read -r blob; do
+    local_path="/app/${blob}"
+    copy_blob_to_container "$blob" "$local_path"
+  done
+else
+  echo "  No model files found in blob storage."
+fi
+
+# Sync raw tick files (if any)
+echo ""
+echo "[3/3] Syncing raw tick files..."
+TICK_BLOBS=$(az storage blob list \
+  --account-name "$STORAGE_ACCOUNT" \
+  --container-name "$CONTAINER_NAME" \
+  --prefix "raw/" \
+  --query "[].name" -o tsv 2>/dev/null || echo "")
+
+if [[ -n "$TICK_BLOBS" ]]; then
+  echo "$TICK_BLOBS" | while read -r blob; do
+    local_path="/app/data/${blob}"
+    copy_blob_to_container "$blob" "$local_path"
+  done
+else
+  echo "  No raw tick files found in blob storage."
+fi
+
+# Verify sync
+echo ""
+echo "=========================================="
+echo "  Data sync complete - verifying..."
+echo "=========================================="
+
+az container exec \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --exec-command "ls -la /app/data/processed/ 2>/dev/null || echo '  No processed files found'" \
+  --output table
+
+az container exec \
+  --name "$ACI_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --exec-command "ls -la /app/models/ 2>/dev/null || echo '  No model files found'" \
+  --output table
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 
 DASHBOARD_IP=$(az container show \

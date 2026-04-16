@@ -23,7 +23,9 @@ def test_concurrent_tick_writes_correct_total(storage):
             Tick(
                 timestamp=datetime(2024, 1, 15, 10, thread_id, i),
                 symbol="EUR_USD",
-                bid=1.0850, ask=1.0852, source="TWELVE",
+                bid=1.0850,
+                ask=1.0852,
+                source="TWELVE",
             )
             for i in range(ticks_per_thread)
         ]
@@ -33,9 +35,13 @@ def test_concurrent_tick_writes_correct_total(storage):
         except Exception as e:
             errors.append(e)
 
-    threads = [threading.Thread(target=write_batch, args=(i,)) for i in range(num_threads)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    threads = [
+        threading.Thread(target=write_batch, args=(i,)) for i in range(num_threads)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     assert errors == []
     df = pd.read_parquet(storage.raw_dir / "EUR_USD_ticks.parquet")
@@ -51,7 +57,10 @@ def test_concurrent_bar_writes_correct_total(storage):
         bar = Bar(
             timestamp=datetime(2024, 1, 15, 10, thread_id, 0),
             symbol="EUR_USD",
-            open_price=1.0850, high=1.0865, low=1.0848, close=1.0860,
+            open=1.0850,
+            high=1.0865,
+            low=1.0848,
+            close=1.0860,
             volume=100 + thread_id,
         )
         barrier.wait()
@@ -60,9 +69,13 @@ def test_concurrent_bar_writes_correct_total(storage):
         except Exception as e:
             errors.append(e)
 
-    threads = [threading.Thread(target=write_bar, args=(i,)) for i in range(num_threads)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    threads = [
+        threading.Thread(target=write_bar, args=(i,)) for i in range(num_threads)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     assert errors == []
     df = pd.read_parquet(storage.processed_dir / "EUR_USD_M1.parquet")
@@ -76,7 +89,10 @@ def test_concurrent_read_write_no_corruption(storage):
         for i in range(20):
             tick = Tick(
                 timestamp=datetime(2024, 1, 15, 10, 0, i),
-                symbol="EUR_USD", bid=1.0850, ask=1.0852, source="TWELVE",
+                symbol="EUR_USD",
+                bid=1.0850,
+                ask=1.0852,
+                source="TWELVE",
             )
             try:
                 storage.save_tick_batch([tick])
@@ -92,8 +108,10 @@ def test_concurrent_read_write_no_corruption(storage):
 
     t1 = threading.Thread(target=write_ticks)
     t2 = threading.Thread(target=read_timestamps)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert errors == []
 
 
@@ -104,7 +122,10 @@ def test_concurrent_writes_different_symbols_no_interference(storage):
         for i in range(10):
             tick = Tick(
                 timestamp=datetime(2024, 1, 15, 10, 0, i),
-                symbol="EUR_USD", bid=1.0850, ask=1.0852, source="TWELVE",
+                symbol="EUR_USD",
+                bid=1.0850,
+                ask=1.0852,
+                source="TWELVE",
             )
             storage.save_tick_batch([tick])
 
@@ -112,14 +133,19 @@ def test_concurrent_writes_different_symbols_no_interference(storage):
         for i in range(10):
             tick = Tick(
                 timestamp=datetime(2024, 1, 15, 10, 0, i),
-                symbol="GBP_USD", bid=1.2650, ask=1.2652, source="QUOTEX",
+                symbol="GBP_USD",
+                bid=1.2650,
+                ask=1.2652,
+                source="QUOTEX",
             )
             storage.save_tick_batch([tick])
 
     t1 = threading.Thread(target=write_eur)
     t2 = threading.Thread(target=write_gbp)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     eur_df = pd.read_parquet(storage.raw_dir / "EUR_USD_ticks.parquet")
     gbp_df = pd.read_parquet(storage.raw_dir / "GBP_USD_ticks.parquet")
@@ -136,7 +162,10 @@ def test_no_data_loss_on_simultaneous_flush_and_write(storage):
         for i in range(30):
             tick = Tick(
                 timestamp=datetime(2024, 1, 15, 10, 0, i),
-                symbol="EUR_USD", bid=1.0850, ask=1.0852, source="TWELVE",
+                symbol="EUR_USD",
+                bid=1.0850,
+                ask=1.0852,
+                source="TWELVE",
             )
             try:
                 storage.save_tick_batch([tick])
@@ -152,8 +181,10 @@ def test_no_data_loss_on_simultaneous_flush_and_write(storage):
 
     t1 = threading.Thread(target=write)
     t2 = threading.Thread(target=read_count)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert errors == []
 
 
@@ -164,7 +195,10 @@ def test_list_symbols_safe_during_concurrent_writes(storage):
         for i in range(5):
             tick = Tick(
                 timestamp=datetime(2024, 1, 15, 10, 0, i),
-                symbol="EUR_USD", bid=1.0850, ask=1.0852, source="TWELVE",
+                symbol="EUR_USD",
+                bid=1.0850,
+                ask=1.0852,
+                source="TWELVE",
             )
             storage.save_tick_batch([tick])
 
@@ -177,8 +211,10 @@ def test_list_symbols_safe_during_concurrent_writes(storage):
 
     t1 = threading.Thread(target=write_symbols)
     t2 = threading.Thread(target=list_repeatedly)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert errors == []
 
 
@@ -193,8 +229,10 @@ def test_two_threads_same_timestamp_one_row(storage):
 
     t1 = threading.Thread(target=write)
     t2 = threading.Thread(target=write)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     df = pd.read_parquet(storage.raw_dir / "EUR_USD_ticks.parquet")
     assert len(df) == 1
@@ -204,8 +242,9 @@ def test_lock_released_after_storage_error(storage, valid_tick):
     from src.data.storage import StorageError
     from unittest.mock import patch
 
-    with patch.object(storage, "_atomic_upsert",
-                      side_effect=StorageError("forced failure")):
+    with patch.object(
+        storage, "_atomic_upsert", side_effect=StorageError("forced failure")
+    ):
         with pytest.raises(StorageError):
             storage.save_tick_batch([valid_tick])
 

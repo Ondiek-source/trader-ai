@@ -175,7 +175,7 @@ class Bar:
     Attributes:
         timestamp: Start time of the candle window (UTC).
         symbol: Pure currency pair name (e.g., "EUR_USD").
-        open_price: First traded price in the window.
+        open: First traded price in the window.
         high: Highest traded price in the window.
         low: Lowest traded price in the window.
         close: Last traded price in the window.
@@ -187,7 +187,7 @@ class Bar:
         >>> bar = Bar(
         ...     timestamp=datetime.utcnow(),
         ...     symbol="EUR_USD",
-        ...     open_price=1.0850,
+        ...     open=1.0850,
         ...     high=1.0865,
         ...     low=1.0848,
         ...     close=1.0860,
@@ -199,7 +199,7 @@ class Bar:
 
     timestamp: datetime
     symbol: str
-    open_price: float
+    open: float
     high: float
     low: float
     close: float
@@ -213,9 +213,7 @@ class Bar:
         """
         # Logic constraints
         is_low_too_high: bool = self.low > self.high
-        is_open_out_of_bounds: bool = (
-            self.open_price > self.high or self.open_price < self.low
-        )
+        is_open_out_of_bounds: bool = self.open > self.high or self.open < self.low
         is_close_out_of_bounds: bool = self.close > self.high or self.close < self.low
         is_negative_volume: bool = self.volume < 0
 
@@ -238,7 +236,7 @@ class Bar:
         ):
             raise ValueError(
                 f"[%] Bar integrity failure for {self.symbol} at {self.timestamp}: "
-                f"O={self.open_price} H={self.high} L={self.low} C={self.close} V={self.volume}"
+                f"O={self.open} H={self.high} L={self.low} C={self.close} V={self.volume}"
             )
         # Engine -- owns the logging and the decision to crash on invalid data
 
@@ -268,7 +266,7 @@ class Bar:
         """
         return (
             f"Bar({self.symbol} "
-            f"O={self.open_price:.5f} H={self.high:.5f} "
+            f"O={self.open:.5f} H={self.high:.5f} "
             f"L={self.low:.5f} C={self.close:.5f} "
             f"V={self.volume} complete={self.is_complete})"
         )
