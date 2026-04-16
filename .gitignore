@@ -47,7 +47,7 @@ pyrightconfig.json
 models/
 
 # Data directory (runtime generated)
-data/
+/data/
 
 # Deploy logs (runtime generated)
 deploy/logs/
