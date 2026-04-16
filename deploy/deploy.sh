@@ -68,6 +68,34 @@ fi
 
 IMAGE_TAG="${ACR_LOGIN_SERVER}/trader-ai:latest"
 
+# ── Pre-flight: verify Azure subscription ──────────────────────────
+REQUIRED_SUB="9086726b-ad07-4df0-90de-2ef7b6f6389b"
+
+CURRENT_SUB=$(az account show --query "id" -o tsv 2>/dev/null || true)
+
+if [ -z "$CURRENT_SUB" ]; then
+  echo "Not logged in — running az login..."
+  az login
+  CURRENT_SUB=$(az account show --query "id" -o tsv)
+fi
+
+if [ "$CURRENT_SUB" != "$REQUIRED_SUB" ]; then
+  echo "Switching subscription: $CURRENT_SUB → $REQUIRED_SUB"
+  az account set --subscription "$REQUIRED_SUB"
+  echo "✓ Switched."
+fi
+
+# Verify resource group exists
+if ! az group show -n "$RESOURCE_GROUP" &>/dev/null; then
+  echo "❌ Resource group '$RESOURCE_GROUP' not found"
+  echo "   Create it:  az group create -n $RESOURCE_GROUP -l eastus"
+  exit 1
+fi
+
+echo "✓ Subscription: $REQUIRED_SUB"
+echo "✓ Resource group: $RESOURCE_GROUP"
+
+
 # ── Helper: upsert a key=value line into a .env file ──────────────────────────
 
 _upsert_env() {
@@ -77,36 +105,6 @@ _upsert_env() {
   grep -v "^${key}=" "$file" > "$tmp" 2>/dev/null || true
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
   mv "$tmp" "$file"
-}
-
-# ── Cleanup: old blob logs ────────────────────────────────────────────────────
-
-cleanup_logs() {
-  echo "Deleting blob logs older than 7 days..."
-
-  local cutoff_date
-  cutoff_date=$(date -d "7 days ago" +%Y-%m-%d 2>/dev/null \
-            || date -v-7d +%Y-%m-%d)
-
-  az storage blob list \
-    --account-name "$STORAGE_ACCOUNT" \
-    --container-name "$CONTAINER_NAME" \
-    --prefix "logs/" \
-    --query "[].name" \
-    --output tsv 2>/dev/null | while IFS= read -r blob; do
-      local blob_date
-      blob_date=$(echo "$blob" | cut -d'/' -f2)
-      if [[ -n "$blob_date" && "$blob_date" < "$cutoff_date" ]]; then
-        echo "  Deleting: $blob"
-        az storage blob delete \
-          --account-name "$STORAGE_ACCOUNT" \
-          --container-name "$CONTAINER_NAME" \
-          --name "$blob" \
-          --output none 2>/dev/null || true
-      fi
-  done
-
-  echo "  Log cleanup complete."
 }
 
 # ── Cleanup: old ACR images ───────────────────────────────────────────────────
@@ -119,10 +117,10 @@ cleanup_acr() {
     --name "$ACR_NAME" \
     --repository trader-ai \
     --orderby time_desc \
-    --query output tsv 2>/dev/null || true)
+    --query "[]" -o tsv 2>/dev/null)
 
   if [[ -z "$all_tags" ]]; then
-    echo "  No non-latest tags found — nothing to delete."
+    echo "  No tags found — nothing to delete."
     return
   fi
 
@@ -131,23 +129,26 @@ cleanup_acr() {
 
   if (( tag_count > 2 )); then
     echo "$all_tags" | tail -n +3 | while IFS= read -r tag; do
-      [[ -z "$tag" ]] && continue
+      [[ -z "$tag" || "$tag" == "latest" ]] && continue
       echo "  Deleting: trader-ai:$tag"
-      az acr repository delete \
-        --name "$ACR_NAME" \
-        --image "trader-ai:$tag" \
-        --yes \
-        --output none 2>/dev/null || true
+      if ! az acr repository delete \
+          --name "$ACR_NAME" \
+          --image "trader-ai:$tag" \
+          --yes \
+          --output none; then
+        echo "  ⚠ Failed to delete trader-ai:$tag"
+      fi
     done
   fi
 
-  echo "  Purging untagged manifests older than 7 days..."
+  echo "  Purging untagged manifests..."
   az acr run --registry "$ACR_NAME" \
     --cmd 'acr purge --filter "trader-ai:.*" --untagged --ago 7d' \
-    /dev/null 2>/dev/null || true
+    /dev/null || echo "  ⚠ Purge command failed"
 
   echo "  ACR cleanup complete."
 }
+
 
 # ── Step 0: Sync .env with current storage connection string ──────────────────
 
@@ -189,7 +190,6 @@ done
 # ── Step 3 (optional): Clean up old ACR images and logs ──────────────────────
 # Uncomment to enable:
 # cleanup_acr
-# cleanup_logs
 
 # ── Step 4: Parse .env into plain and secure environment variables ─────────────
 
@@ -280,33 +280,48 @@ if az container show \
     --output none
 fi
 
+
 _CREATE_CMD=(
-  az container create
-    --name "$ACI_NAME"
-    --resource-group "$RESOURCE_GROUP"
-    --image "$IMAGE_TAG"
-    --registry-login-server "$ACR_LOGIN_SERVER"
-    --registry-username "$ACR_USERNAME"
-    --registry-password "$ACR_PASSWORD"
-    --cpu "$ACI_CPU"
-    --memory "$ACI_MEMORY"
-    --location "$LOCATION"
-
-    --os-type Linux
-    --restart-policy Always
-    --ports "$CONTAINER_PORT"
-    --ip-address Public
-    --dns-name-label "$DNS_LABEL"
+  az container create \
+    --resource-group "$RESOURCE_GROUP" \
+    --name "$ACI_NAME" \
+    --image "$IMAGE_TAG" \
+    --registry-login-server "$ACR_LOGIN_SERVER" \
+    --registry-username "$ACR_USERNAME" \
+    --registry-password "$ACR_PASSWORD" \
+    --cpu "$ACI_CPU" \
+    --memory "$ACI_MEMORY" \
+    --os-type Linux \
+    --ports "$CONTAINER_PORT" \
+    --ip-address Public \
+    --dns-name-label "$DNS_LABEL" \
+    --environment-variables "${_ENV_KV_PAIRS[@]}" \
+    --secure-environment-variables "${_SECURE_KV_PAIRS[@]}" \
+    --location "$LOCATION" \
+    --restart-policy Always \
     --output table
-)
+  )
 
-if (( ${#_ENV_KV_PAIRS[@]} > 0 )); then
-  _CREATE_CMD+=(--environment-variables "${_ENV_KV_PAIRS[@]}")
-fi
+    echo "=== DIAGNOSTIC: .env file location ==="
+    echo "APP_ENV resolved to: $APP_ENV"
+    echo "File exists: $(test -f "$APP_ENV" && echo YES || echo NO)"
+    echo ""
+    echo "=== DIAGNOSTIC: _ENV_KV_PAIRS (${#_ENV_KV_PAIRS[@]} items) ==="
+    if [[ ${#_ENV_KV_PAIRS[@]} -gt 0 ]]; then
+      printf '  %s\n' "${_ENV_KV_PAIRS[@]}"
+    else
+      echo "  EMPTY — no plain vars were collected"
+    fi
+    echo ""
+    echo "=== DIAGNOSTIC: _SECURE_KV_PAIRS (${#_SECURE_KV_PAIRS[@]} items) ==="
+    if [[ ${#_SECURE_KV_PAIRS[@]} -gt 0 ]]; then
+      printf '  %s\n' "${_SECURE_KV_PAIRS[@]}"
+    else
+      echo "  EMPTY — no secure vars were collected"
+    fi
+    echo "=========================================="
 
-if (( ${#_SECURE_KV_PAIRS[@]} > 0 )); then
-  _CREATE_CMD+=(--secure-environment-variables "${_SECURE_KV_PAIRS[@]}")
-fi
+
 
 "${_CREATE_CMD[@]}"
 
