@@ -493,6 +493,11 @@ class FeatureEngineer:
         fe = fe.ffill(limit=_MAX_FFILL_BARS)
 
         # Guard against missing columns
+        bars = (
+            bars.rename(columns={"open_price": "open"})
+            if "open_price" in bars.columns
+            else bars
+        )
         required = {"open", "high", "low", "close", "volume"}
         missing = required - set(fe.columns)
         if missing:
