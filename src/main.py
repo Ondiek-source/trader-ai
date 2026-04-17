@@ -68,7 +68,7 @@ def _configure_logging() -> None:
 
 
 async def _run() -> None:
-    """Import and run the Pipeline (deferred so logging is configured first)."""
+    """Import and run the Pipeline (deferred so logging is configured first) always cleanly exits to main() for error handling."""
     from core.pipeline import Pipeline
 
     pipeline = Pipeline()
