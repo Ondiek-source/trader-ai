@@ -1157,7 +1157,7 @@ class Storage:
 
                 # Final trim in case the last row group contained more rows than needed.
                 if max_rows is not None and len(df) > max_rows:
-                    df = df.tail(max_rows).reset_index(drop=True)
+                    df = df.tail(max_rows)
 
                 logger.info(f"Loaded {len(df)} bars for {symbol} [{timeframe}].")
                 return df

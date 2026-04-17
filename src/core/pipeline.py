@@ -626,7 +626,7 @@ class Pipeline:
 
         for symbol in self._settings.pairs:
             try:
-                engine = LiveEngine(symbol=symbol, expiry_key=expiry_key)
+                engine = await LiveEngine.create(symbol, expiry_key)
 
             except LiveEngineError as exc:
                 error_block = (
@@ -804,6 +804,7 @@ class Pipeline:
             class _Orchestrator:
                 def get_status(self) -> dict[str, Any]:
                     from core.dashboard import status_store
+
                     return status_store.get()
 
                 def stop(self) -> str:
@@ -862,8 +863,10 @@ class Pipeline:
                 await self._reporter._telegram.send_message(message, parse_mode="HTML")
             if hasattr(self._reporter, "_discord") and self._reporter._discord:
                 plain = (
-                    message.replace("<b>", "**").replace("</b>", "**")
-                    .replace("<code>", "`").replace("</code>", "`")
+                    message.replace("<b>", "**")
+                    .replace("</b>", "**")
+                    .replace("<code>", "`")
+                    .replace("</code>", "`")
                     .replace("<br>", "\n")
                 )
                 await self._reporter._discord.send_alert_async(plain, level="info")
@@ -960,9 +963,7 @@ class Pipeline:
                 )
 
             except Exception as exc:
-                logger.warning(
-                    {"event": "quotex_status_poll_error", "error": str(exc)}
-                )
+                logger.warning({"event": "quotex_status_poll_error", "error": str(exc)})
 
             await asyncio.sleep(30)
 
@@ -1037,9 +1038,7 @@ class Pipeline:
                 logger.info({"event": "daily_report_sent"})
 
             except Exception as exc:
-                logger.warning(
-                    {"event": "daily_report_failed", "error": str(exc)}
-                )
+                logger.warning({"event": "daily_report_failed", "error": str(exc)})
 
     async def _safe_engine_run(self, engine: LiveEngine) -> None:
         """

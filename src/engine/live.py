@@ -238,7 +238,6 @@ class LiveEngine:
         self._model_manager: ModelManager = ModelManager(
             storage_dir=self._settings.model_dir
         )
-        self._cold_start()
 
         # ── 5. Signal Generator (fail-hard) ───────────────────────────────
         self._signal_gen: SignalGenerator = SignalGenerator(
@@ -277,6 +276,43 @@ class LiveEngine:
         )
 
     # ── Initialisation Helpers ────────────────────────────────────────────────
+    @classmethod
+    async def create(
+        cls,
+        symbol: str,
+        expiry_key: str = "1_MIN",
+    ) -> "LiveEngine":
+        """
+        Async factory method to create and initialize a LiveEngine.
+
+        This is the recommended way to instantiate LiveEngine since it
+        properly awaits the async _cold_start() method.
+
+        Args:
+            symbol: Currency pair to trade, e.g. "EUR_USD".
+            expiry_key: Expiry window, e.g. "1_MIN".
+
+        Returns:
+            LiveEngine: Fully initialized and ready to run.
+        """
+        # Create instance (__init__ does NOT call _cold_start)
+        engine = cls(symbol, expiry_key)
+
+        # Connect the stream if it's QuotexReader
+        if hasattr(engine._stream, "connect"):
+            connected = await engine._stream.connect()
+            if not connected:
+                raise LiveEngineError(f"Failed to connect to Quotex for {symbol}")
+
+        # Now await the async cold start to pull the model artifact before the inference loop starts.
+        await engine._cold_start()
+
+        # Reload with lock for safety, the model into SignalGenerator now that artifact is on disk
+        async with engine._reload_lock:
+            if engine._signal_gen._model is None:
+                engine._signal_gen.reload()
+
+        return engine
 
     def _init_stream(self) -> Any:
         """
@@ -345,7 +381,7 @@ class LiveEngine:
                 stage="init_stream",
             ) from exc
 
-    def _cold_start(self) -> None:
+    async def _cold_start(self) -> None:
         """
         Restore the latest model artifact from Azure Blob before inference.
 
@@ -358,7 +394,7 @@ class LiveEngine:
         no-op — SignalGenerator will run in SKIP-only mode.
         """
         try:
-            result = self._model_manager.pull_from_blob(
+            result = await self._model_manager.pull_from_blob(
                 symbol=self.symbol,
                 expiry_key=self.expiry_key,
             )
