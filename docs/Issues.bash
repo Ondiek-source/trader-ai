@@ -257,7 +257,7 @@ self._quotex_reader = QuotexReader(
     email=settings.quotex_email,
     password=settings.quotex_password,
     practice_mode=settings.practice_mode,
-    symbols=settings.pairs  # ['EUR_USD', 'GBP_USD', ...]
+    symbols=settings.pairs  # ['EUR_USD', 'GBP_USD', 'USD_JPY'...]
 )
 
 # In LiveEngine - each gets a filtered stream
