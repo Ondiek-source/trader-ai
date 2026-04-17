@@ -1125,11 +1125,35 @@ class Storage:
                     df = pf.read().to_pandas()
 
                 if df.empty:
+                    logger.warning(
+                        f"[%] Bar file for {symbol} [{timeframe}] exists but is empty."
+                    )
                     return None
 
+                # Ensure timestamp column exists
+                if _TS_COLUMN not in df.columns:
+                    error_block = (
+                        f"\n{'!' * 60}\n"
+                        f"STORAGE ERROR: Missing timestamp column\n"
+                        f"Symbol: {symbol}\n"
+                        f"Timeframe: {timeframe}\n"
+                        f"File: {file_path.name}\n"
+                        f"Columns found: {df.columns.tolist()}\n"
+                        f"Expected column: '{_TS_COLUMN}'\n"
+                        f"{'!' * 60}"
+                    )
+                    logger.critical(error_block)
+                    raise StorageError(
+                        f"Missing timestamp column in {file_path.name}",
+                        symbol=symbol,
+                        path=str(file_path),
+                    )
+
+                # Convert timestamp to datetime and set as index
+                df[_TS_COLUMN] = pd.to_datetime(df[_TS_COLUMN])
+                df.set_index(_TS_COLUMN, inplace=True)
                 # Sort chronologically — ML models require temporal order.
-                df.sort_values(_TS_COLUMN, inplace=True)
-                df.reset_index(drop=True, inplace=True)
+                df.sort_index(inplace=True)
 
                 # Final trim in case the last row group contained more rows than needed.
                 if max_rows is not None and len(df) > max_rows:
@@ -1267,7 +1291,7 @@ class Storage:
                 logger.info(f"✓ Synced to Azure: {blob_name}")
             except Exception as e:
                 logger.warning(f"X Failed to sync to Azure: {e}")
-        
+
         return True
 
     # ── Public: Diagnostics ───────────────────────────────────────────────────

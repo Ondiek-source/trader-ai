@@ -199,3 +199,88 @@ Priority Fix Order
 7. StatusStore deep-copy (H6)                          — subtle shared-state bug
 8. Per-symbol write locks (M2)                         — throughput improvement
 The most impactful single change is items 1 + 4 together: swapping list buffers for deques and chunking the Parquet reads. Those two address all four CRITICAL findings and cut peak RSS by an estimated 60-70% under live trading load.
+
+
+
+
+Golden Prompt - Multiple Symbol Support for QuotexReader
+text
+## Context
+I have a trading system where `LiveEngine` creates one `QuotexReader` instance per symbol (e.g., EUR_USD, GBP_USD). Currently, each engine creates its own separate Quotex WebSocket connection to the same account.
+
+## Current Behavior
+- Each symbol gets its own `QuotexReader` instance
+- Each instance opens its own WebSocket connection
+- Works fine for 1-3 symbols
+
+## Problem
+- Multiple WebSocket connections to same account may cause rate limiting or session conflicts
+- Resource waste (multiple connections when one could handle all symbols)
+
+## Goal
+Refactor `QuotexReader` to support multiple symbols with a SINGLE WebSocket connection.
+
+## Requirements
+
+1. **Single connection, multiple subscriptions**
+   - One `QuotexReader` instance manages all symbols
+   - Connect once, subscribe to multiple symbols
+   - Price updates for all symbols flow through the same connection
+
+2. **API method to add symbols**
+   ```python
+   async def add_symbol(self, symbol: str) -> None:
+       """Subscribe to price updates for an additional symbol."""
+Subscribe generator per symbol
+
+python
+async def subscribe(self, symbol: str):
+    """Async generator that yields ticks for a specific symbol."""
+Symbol mapping
+
+Internal symbol: "EUR_USD"
+
+Quotex OTC symbol: "EURUSD_otc"
+
+Use self._settings.quotex_symbols for conversion
+
+Thread safety
+
+Use asyncio.Queue per symbol to distribute ticks
+
+Or use a single queue with symbol filtering
+
+Expected Usage
+python
+# In pipeline.py - single QuotexReader for all symbols
+self._quotex_reader = QuotexReader(
+    email=settings.quotex_email,
+    password=settings.quotex_password,
+    practice_mode=settings.practice_mode,
+    symbols=settings.pairs  # ['EUR_USD', 'GBP_USD', ...]
+)
+
+# In LiveEngine - each gets a filtered stream
+stream = self._quotex_reader.subscribe(self.symbol)
+Current Code Reference
+src/engine/quotex_reader.py - Current implementation (single symbol)
+
+src/engine/live.py - _init_stream() method creates per-symbol readers
+
+src/core/config.py - quotex_symbols property handles symbol conversion
+
+Success Criteria
+One WebSocket connection for all symbols
+
+Each symbol receives its own price ticks independently
+
+No cross-symbol contamination
+
+Clean shutdown when all symbols unsubscribe
+
+Constraints
+Preserve existing subscribe() interface for backward compatibility
+
+Maintain error handling and reconnection logic
+
+Keep logging clear about which symbol each tick belongs to

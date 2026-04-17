@@ -308,6 +308,7 @@ class LiveEngine:
                     email=self._settings.quotex_email,
                     password=self._settings.quotex_password,
                     practice_mode=self._settings.practice_mode,
+                    symbol=otc_symbol,
                 )
             else:
                 from engine.twelveticks_stream import TwelveDataStream

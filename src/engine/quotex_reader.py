@@ -31,6 +31,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,9 +95,13 @@ class QuotexReader:
         self,
         email: str,
         password: str,
+        symbol: str,
         practice_mode: bool = True,
         client: Any = None,
     ) -> None:
+        self._settings = get_settings()
+        self.symbol = symbol
+
         self._email = email
         self._password = password
         self._practice_mode = practice_mode
@@ -651,6 +657,48 @@ class QuotexReader:
             "pending_signals": len(self._pending),
             "result_queue_size": self._result_queue.qsize(),
         }
+
+    # ── Subscribe for LiveEngine ─────────────────────────────────────────────
+
+    async def subscribe(self):
+        """
+        Async generator that yields real-time price ticks for Quotex OTC pairs.
+        Since pyquotex doesn't support a real price stream, this method polls
+        the latest price every 500 ms using start_realtime_price() with batch_size=1
+        """
+        otc_asset = self.symbol
+
+        while self._connected:
+            try:
+                if hasattr(self._client, "start_realtime_price"):
+                    result = await self._client.start_realtime_price(otc_asset, 1)
+
+                    if result and isinstance(result, dict) and otc_asset in result:
+                        price_points = result[otc_asset]
+                        for price_point in price_points:
+                            tick = {
+                                "symbol": self.symbol,
+                                "bid": float(price_point["price"]),
+                                "ask": float(price_point["price"]),
+                                "timestamp": datetime.fromtimestamp(
+                                    price_point["time"], tz=timezone.utc
+                                ),
+                                "source": "QUOTEX",
+                                "mid_price": float(price_point["price"]),
+                            }
+                            yield tick
+
+                await asyncio.sleep(0.5)  # Poll every 500ms for fresh price
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in subscribe: {e}")
+                await asyncio.sleep(1)
+
+        # Cleanup
+        if hasattr(self._client, "stop_candles_stream"):
+            self._client.stop_candles_stream(otc_asset)
 
     # ── Reconnection ──────────────────────────────────────────────────────────
 
