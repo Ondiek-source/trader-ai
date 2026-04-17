@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -42,16 +43,16 @@ _API_BASE: str = "https://api.twelvedata.com"
 _BARS_PER_REQUEST: int = 5000
 
 # Free-tier rate limit: 8 req/min → 1 req per 8 s (with 1-second safety margin)
-_REQUEST_INTERVAL_S: float = 8.0
+_REQUEST_INTERVAL_S: float = 10.0
 
 # HTTP request timeout in seconds (Twelve Data is generally fast, 30 s is generous)
-_HTTP_TIMEOUT_S: float = 30.0
+_HTTP_TIMEOUT_S: float = 45.0
 
 # Number of retry attempts for each chunk on transient HTTP failure
-_MAX_RETRIES: int = 3
+_MAX_RETRIES: int = 5
 
 # Initial backoff delay in seconds before the first retry; doubles on each attempt
-_RETRY_BACKOFF_S: float = 15.0
+_RETRY_BACKOFF_S: float = 30.0
 
 # Calendar-day window covered by a single API request.
 # Forex pairs trade ~24 hours/day on weekdays (no stock-market lunch break).
@@ -600,7 +601,32 @@ class Historian:
                             backoff *= 2
                         continue
 
-                    data: dict = await resp.json()
+                    try:
+                        data: dict = await resp.json()
+                    except Exception as exc:
+                        error_type = type(exc).__name__
+                        critical_block = (
+                            f"\n{'!' * 60}\n"
+                            f"API RESPONSE ERROR\n"
+                            f"Symbol: {symbol}\n"
+                            f"Chunk: {start_dt.date()} → {end_dt.date()}\n"
+                            f"API response mishapen {_HTTP_TIMEOUT_S}s\n"
+                            f"Attempt {attempt}/{_MAX_RETRIES}.\n"
+                            f"Sleeping for {backoff:.0f}s before retrying.\n"
+                            f"{'!' * 60}"
+                        )
+                        if attempt < _MAX_RETRIES:
+                            await asyncio.sleep(backoff)
+                            backoff *= 2
+                            continue
+                        else:
+                            critical_block += (
+                                f"MAX RETRIES EXHAUSTED - BACKFILL ABORTED\n"
+                                f"System cannot recover. Container will exit.\n"
+                                f"{'!' * 60}"
+                            )
+                            logger.critical(critical_block)
+                            sys.exit(1)  # Force container exit
 
                     # Twelve Data returns an error status in the JSON body even
                     # on HTTP 200 when the request is semantically invalid
