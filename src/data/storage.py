@@ -504,8 +504,17 @@ class Storage:
 
         with self._get_file_lock(file_path):
             self._atomic_upsert(file_path, new_data)
-
         logger.info(f"[+] Committed {len(ticks)} ticks for {symbol}.")
+        # Sync to Azure if in CLOUD mode, but do not fail the write if the upload fails — the local file is the source of truth and can be re-synced later if needed.
+        if self._container_client is not None:
+            blob_name = f"raw/{symbol}_ticks.parquet"
+            try:
+                blob_client = self._container_client.get_blob_client(blob_name)
+                with open(file_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                logger.debug(f"✓ Synced ticks to Azure: {blob_name}")
+            except Exception as e:
+                logger.warning(f"X Failed to sync ticks to Azure: {e}")
         return True
 
     def save_bar(self, bar: Bar) -> bool:
@@ -1249,6 +1258,16 @@ class Storage:
             f"{'+' * 60}"
         )
         logger.info(info_block)
+        if self._container_client is not None:
+            blob_name = f"processed/{symbol}_{timeframe}.parquet"
+            try:
+                blob_client = self._container_client.get_blob_client(blob_name)
+                with open(file_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                logger.info(f"✓ Synced to Azure: {blob_name}")
+            except Exception as e:
+                logger.warning(f"X Failed to sync to Azure: {e}")
+        
         return True
 
     # ── Public: Diagnostics ───────────────────────────────────────────────────

@@ -18,7 +18,6 @@ RUN apt-get update && \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
-
 # 3. Security: Create non-root user
 RUN groupadd --gid 1000 appuser && \
     useradd  --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
@@ -70,6 +69,10 @@ RUN mkdir -p /app/data/raw /app/data/processed /app/models /tmp/fallback && \
 # Using --chown here is faster and more secure than a separate RUN chown
 COPY --chown=appuser:appuser . .
 
+# Copy entrypoint script
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 # 7. Runtime Configuration
 USER appuser
 
@@ -78,4 +81,5 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -sf http://localhost:${DASHBOARD_PORT:-8080}/status > /dev/null || exit 1
 
-CMD ["python", "src/main.py"]
+ENTRYPOINT ["/entrypoint.sh"]
+# CMD ["python", "src/main.py"]
