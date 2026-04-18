@@ -1196,9 +1196,18 @@ class Pipeline:
                         ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
                         ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
                         ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
-                        ("LSTM", LSTMTrainer(expiry_key=expiry_key)),
-                        ("GRU", GRUTrainer(expiry_key=expiry_key)),
-                        ("TCN", TCNTrainer(expiry_key=expiry_key)),
+                        (
+                            "LSTM",
+                            LSTMTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                        ),
+                        (
+                            "GRU",
+                            GRUTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                        ),
+                        (
+                            "TCN",
+                            TCNTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                        ),
                     ]
 
                     for model_name, trainer in models_to_try:
@@ -1220,6 +1229,7 @@ class Pipeline:
 
                         except Exception as e:
                             logger.warning(f"{model_name} failed for {symbol}: {e}")
+                            logger.exception(f"Full traceback for {model_name}:")
 
                     if best_result:
                         logger.info(f"Best model for {symbol}: AUC={best_auc:.4f}")

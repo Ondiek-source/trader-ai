@@ -1367,6 +1367,9 @@ def _train_torch_model(
                 )
                 break
 
+        logger.info(
+            f"[{model.__class__.__name__}] Epoch {epoch+1}/{epochs} - val_loss: {val_loss:.6f}, best: {best_val_loss:.6f}"
+        )
     # Restore best weights regardless of early stopping.
     if best_weights:
         model.load_state_dict(best_weights)
