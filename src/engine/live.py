@@ -670,6 +670,11 @@ class LiveEngine:
         Args:
             tick: Tick object from the stream. Type varies by stream.
         """
+        # ── Push tick counter to dashboard immediately, before any early returns ──
+        # This ensures elapsed_minutes and ticks always update even when bars
+        # are missing, warmup is incomplete, or feature engineering fails.
+        self._ticks_processed += 1
+        self._push_stream_status_tick_only()
         # ── 1. Load recent bars (capped at _BAR_WINDOW) ───────────────────
         try:
             bars_df: pd.DataFrame | None = self._storage.get_bars(
@@ -752,7 +757,6 @@ class LiveEngine:
 
         # Reset consecutive error counter on a successful inference.
         self._consecutive_errors = 0
-        self._ticks_processed += 1
         if signal.direction != "SKIP":
             self._signals_fired += 1
 
@@ -1051,6 +1055,45 @@ class LiveEngine:
             )
         except Exception:
             pass  # Dashboard is optional — never block on it
+
+    def _push_stream_status_tick_only(self) -> None:
+        """
+        Minimal dashboard push on every tick — updates elapsed time, tick
+        count, and connection state regardless of whether inference succeeded.
+        Called before any early returns in _process_tick().
+        """
+        try:
+            from datetime import datetime, timezone as _tz
+            from core.dashboard import status_store
+
+            connected = bool(getattr(self._stream, "_connected", True))
+            balance = float(getattr(self._stream, "_balance", 0.0))
+
+            snapshot = status_store.get()
+            elapsed_minutes = 0.0
+            started_at_raw = snapshot.get("started_at")
+            if started_at_raw:
+                started_at = datetime.fromisoformat(started_at_raw)
+                elapsed_minutes = (
+                    datetime.now(_tz.utc) - started_at
+                ).total_seconds() / 60.0
+
+            status_store.update(
+                {
+                    "stream": {
+                        "connected": connected,
+                        "ticks_received": self._ticks_processed,
+                    },
+                    "quotex": {"connected": connected, "balance": balance},
+                    "session": {
+                        **snapshot.get("session", {}),
+                        "elapsed_minutes": round(elapsed_minutes, 1),
+                        "is_active": self.is_running,
+                    },
+                }
+            )
+        except Exception:
+            pass
 
     def _push_threshold_to_dashboard(self) -> None:
         """
