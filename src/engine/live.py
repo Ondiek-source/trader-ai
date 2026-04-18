@@ -877,7 +877,10 @@ class LiveEngine:
             return
 
         try:
-            self._journal_client.record_signal(signal.to_dict())
+            if isinstance(signal, dict):
+                self._journal_client.record_signal(signal)
+            else:
+                self._journal_client.record_signal(signal.to_dict())
         except Exception as exc:
             warning_block = (
                 f"\n{'%' * 60}\n"
@@ -895,7 +898,6 @@ class LiveEngine:
             )
             logger.warning(warning_block)
             traceback.print_stack()
-            sys.exit(1)
 
     # ── Threshold / Martingale helpers ────────────────────────────────────────
 

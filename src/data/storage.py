@@ -1012,7 +1012,13 @@ class Storage:
             ...     historian.backfill_gap(symbol, since=last_ts)
         """
         file_path: Path = self._raw_path(symbol)
+
         with self._get_file_lock(file_path):
+            # If local doesn't exist, try to pull from Azure FIRST
+            if not file_path.exists() and self._container_client is not None:
+                blob_name = f"raw/{symbol}_ticks.parquet"
+                self.pull_from_azure(blob_name, file_path)
+
             if not file_path.exists():
                 logger.info(
                     f"No tick file found for {symbol}. "
@@ -1088,11 +1094,17 @@ class Storage:
         """
         file_path: Path = self._processed_path(symbol, timeframe)
 
+        # If local file doesn't exist, try to pull from Azure
+        if not file_path.exists() and self._container_client is not None:
+            blob_name = f"processed/{symbol}_{timeframe}.parquet"
+            success = self.pull_from_azure(blob_name, file_path)
+            if success:
+                logger.info(f"Pulled {blob_name} from Azure to {file_path}")
+            else:
+                logger.debug(f"No blob found for {blob_name}, will need backfill")
+        # Now check again after potential pull
         if not file_path.exists():
-            logger.info(
-                f"No processed bar file found for {symbol} [{timeframe}]. "
-                f"Training data not yet available."
-            )
+            logger.info(f"No processed bar file found for {symbol} [{timeframe}].")
             return None
         with self._get_file_lock(file_path):
             try:
@@ -1354,3 +1366,21 @@ class Storage:
         except Exception as e:
             logger.warning(f"[%] Could not list symbols from raw directory: {e}")
             return []
+
+
+# ── Singleton ────────────────────────────────────────────────────────────────
+
+_storage_singleton: Storage | None = None
+
+
+def get_storage() -> Storage:
+    """
+    Return the global Storage singleton instance.
+
+    Ensures only one Storage instance exists across the entire application,
+    so the Azure Blob client is initialized once and reused everywhere.
+    """
+    global _storage_singleton
+    if _storage_singleton is None:
+        _storage_singleton = Storage()
+    return _storage_singleton

@@ -60,10 +60,19 @@ from typing import Any
 
 from core.config import get_settings
 from data.historian import Historian, HistorianError, get_historian
-from data.storage import Storage, StorageError
+from data.storage import Storage, StorageError, get_storage
 from ml_engine.features import FeatureEngineerError, get_feature_engineer
 from ml_engine.model_manager import ModelManager
-from ml_engine.trainer import DataShaper, XGBoostTrainer
+from ml_engine.trainer import (
+    DataShaper,
+    XGBoostTrainer,
+    CatBoostTrainer,
+    RandomForestTrainer,
+    GRUTrainer,
+    TCNTrainer,
+    LightGBMTrainer,
+    LSTMTrainer,
+)
 from ml_engine.labeler import Labeler
 from engine.live import LiveEngine, LiveEngineError
 
@@ -271,7 +280,7 @@ class Pipeline:
             PipelineError: If Storage construction fails.
         """
         try:
-            storage = Storage()
+            storage = get_storage()
             info_block = (
                 f"\n{'+' * 60}\n"
                 f"STAGE 1 COMPLETE: STORAGE LINKED\n"
@@ -1094,7 +1103,7 @@ class Pipeline:
 
         Wakes every _RETRAIN_CHECK_INTERVAL_S seconds and checks whether
         model_retrain_interval has elapsed since the last retrain. If so,
-        runs a full XGBoost training cycle for each symbol, saves the
+        runs a full training cycle for each symbol, saves the
         artifact, and hot-reloads each matching LiveEngine.
 
         Uses the Stage 1 Storage instance — does not construct a second one.
@@ -1110,6 +1119,8 @@ class Pipeline:
 
         inv_map: dict[int, str] = _SECONDS_TO_EXPIRY_KEY
 
+        is_first_run: bool = True
+
         while not self._shutdown_requested:
             await asyncio.sleep(_RETRAIN_CHECK_INTERVAL_S)
 
@@ -1119,13 +1130,17 @@ class Pipeline:
             now: datetime = datetime.now(timezone.utc)
             elapsed: float = (now - self._last_retrain_time).total_seconds()
 
-            if elapsed < self._settings.model_retrain_interval:
+            if not is_first_run and elapsed < self._settings.model_retrain_interval:
                 continue
 
-            logger.info(
-                "[^] Retrain scheduler: interval elapsed (%.0fs). Starting cycle.",
-                elapsed,
-            )
+            if is_first_run:
+                logger.info("[^] FIRST BOOT: Training immediately!")
+                is_first_run = False
+            else:
+                logger.info(
+                    "[^] Retrain scheduler: interval elapsed (%.0fs). Starting cycle.",
+                    elapsed,
+                )
 
             expiry_key: str | None = inv_map.get(self._settings.expiry_seconds)
             if expiry_key is None:
@@ -1171,14 +1186,47 @@ class Pipeline:
                     shaper = DataShaper()
                     split = shaper.split(feature_matrix, labels, expiry_key)
 
-                    trainer = XGBoostTrainer(expiry_key=expiry_key)
-                    result = trainer.train(split)
+                    # Train multiple models and pick the best
+                    best_result = None
+                    best_auc = -1.0
 
-                    # ── 4. Save artifact and push to Blob ─────────────────
-                    artifact_path_str: str = manager.save(result)
-                    artifact_path = Path(artifact_path_str)
-                    metadata_path = artifact_path.with_suffix(".json")
-                    storage.save_model(artifact_path, metadata_path)
+                    # List all models you want to train
+                    models_to_try = [
+                        ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
+                        ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
+                        ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
+                        ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
+                        ("LSTM", LSTMTrainer(expiry_key=expiry_key)),
+                        ("GRU", GRUTrainer(expiry_key=expiry_key)),
+                        ("TCN", TCNTrainer(expiry_key=expiry_key)),
+                    ]
+
+                    for model_name, trainer in models_to_try:
+                        try:
+                            logger.info(f"Training {model_name} for {symbol}...")
+                            result = trainer.train(split)
+                            auc = result.metrics.get("auc", 0)
+                            logger.info(f"{model_name} AUC: {auc:.4f}")
+
+                            # ── 4. Save artifact and push to Blob ─────────────────
+                            artifact_path = Path(manager.save(result))
+                            metadata_path = artifact_path.with_suffix(".json")
+                            storage.save_model(artifact_path, metadata_path)
+
+                            # Track best by AUC
+                            if auc > best_auc:
+                                best_auc = auc
+                                best_result = result
+
+                        except Exception as e:
+                            logger.warning(f"{model_name} failed for {symbol}: {e}")
+
+                    if best_result:
+                        logger.info(f"Best model for {symbol}: AUC={best_auc:.4f}")
+                        result = best_result
+                    else:
+                        logger.warning(f"No model trained successfully for {symbol}")
+                        continue
 
                     logger.info(
                         "[^] Retrain complete: symbol=%s expiry=%s auc=%.4f",

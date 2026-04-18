@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 
 from core.config import get_settings
-from data.storage import Storage, StorageError
+from data.storage import Storage, StorageError, get_storage
 from ml_engine.model import Bar, Timeframe
 
 logger = logging.getLogger(__name__)
@@ -154,7 +154,7 @@ class Historian:
             StorageError: If Storage cannot provision its data directories.
         """
         self._settings = get_settings()
-        self._storage: Storage = Storage()
+        self._storage: Storage = get_storage()
 
         # Monotonic timestamp of the last API request.
         # Initialised to 0.0 so the first request fires immediately.

@@ -611,14 +611,27 @@ class Journal:
             >>> success = journal.record_signal(signal_entry)
             >>> assert success is True
         """
-        self._append_to_table("signals", [entry.to_dict()])
+        # Extract metadata for logging BEFORE append (handles both types)
+        if isinstance(entry, dict):
+            symbol = entry.get("symbol", "UNKNOWN")
+            direction = entry.get("direction", "UNKNOWN")
+            confidence = entry.get("confidence", 0.0)
+            model_version = entry.get("model_version", "UNKNOWN")
+            self._append_to_table("signals", [entry])
+        else:
+            symbol = entry.symbol
+            direction = entry.direction
+            confidence = entry.confidence
+            model_version = entry.model_version
+            self._append_to_table("signals", [entry.to_dict()])
+
         info_block = (
             f"\n{'%' * 60}\n"
             f"SIGNAL ENTRY COMMITTED\n"
-            f"Symbol : {entry.symbol}\n"
-            f"Direction : {entry.direction}\n"
-            f"Confidence : {entry.confidence:.3f}\n"
-            f"Model Version : {entry.model_version}\n"
+            f"Symbol : {symbol}\n"
+            f"Direction : {direction}\n"
+            f"Confidence : {confidence:.3f}\n"
+            f"Model Version : {model_version}\n"
             f"{'%' * 60}"
         )
         logger.info(info_block)

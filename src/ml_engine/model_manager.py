@@ -76,7 +76,7 @@ import torch
 from ml_engine.features import _VERSION
 from ml_engine.trainer import TrainerResult
 from core.config import get_settings
-from data.storage import Storage
+from data.storage import get_storage
 
 logger = logging.getLogger(__name__)
 
@@ -220,9 +220,7 @@ class ModelManager:
         """
         self._settings = get_settings()
         self._storage_dir: Path = Path(storage_dir).resolve()
-        # Lazy singleton — created once on first save() or pull_from_blob() call
-        # so that every save does not open a new Azure connection pool.
-        self._blob_storage: Storage | None = None
+        self._storage = get_storage()
 
         try:
             self._storage_dir.mkdir(parents=True, exist_ok=True)
@@ -252,24 +250,6 @@ class ModelManager:
         )
 
     # ── Internal helpers ─────────────────────────────────────────────────────
-
-    @property
-    def _storage(self) -> Storage:
-        """
-        Lazy singleton Storage instance shared across save() and pull_from_blob().
-
-        Storage.__init__ opens an Azure BlobServiceClient (CLOUD mode) which
-        holds a connection pool and TCP socket. Creating a new Storage() on every
-        save() call would leak one connection per checkpoint. This property
-        ensures a single instance is created once and reused for the lifetime
-        of this ModelManager.
-
-        Returns:
-            Storage: The shared Storage instance.
-        """
-        if self._blob_storage is None:
-            self._blob_storage = Storage()
-        return self._blob_storage
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
@@ -816,9 +796,7 @@ class ModelManager:
                         or download failed.
         """
         if self._storage._container_client is None:
-            logger.debug(
-                "[^] pull_from_blob: DATA_MODE is LOCAL — skipping Blob pull."
-            )
+            logger.debug("[^] pull_from_blob: DATA_MODE is LOCAL — skipping Blob pull.")
             return None
 
         try:
@@ -830,7 +808,8 @@ class ModelManager:
 
             # Filter to .artifact files only — sidecars are pulled alongside.
             artifact_blobs = [
-                b for b in blobs
+                b
+                for b in blobs
                 if b.name.endswith(".artifact")
                 and f"_{symbol}_" in b.name
                 and f"_{expiry_key}_" in b.name
