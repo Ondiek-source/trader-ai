@@ -1510,8 +1510,12 @@ class LSTMTrainer(BaseTrainer):
             TrainerError: If training fails.
         """
         try:
+            logger.info(f"[LSTM] Starting training with {len(split.X_train)} samples")
             n_features: int = split.X_train.shape[1]
-
+            logger.info(
+                f"[LSTM] Features: {n_features}, Window size: {self.window_size}"
+            )
+            logger.info("[LSTM] Creating datasets...")
             train_dataset = _NumpySequenceDataset(
                 split.X_train, split.y_train, self.window_size
             )
@@ -1519,6 +1523,7 @@ class LSTMTrainer(BaseTrainer):
                 split.X_val, split.y_val, self.window_size
             )
 
+            logger.info("[LSTM] Creating DataLoaders...")
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
@@ -1532,10 +1537,12 @@ class LSTMTrainer(BaseTrainer):
                 pin_memory=torch.cuda.is_available(),
             )
 
+            logger.info(f"[LSTM] Building network with hidden_dim={self.hidden_dim}...")
             net = _LSTMNet(input_dim=n_features, hidden_dim=self.hidden_dim).to(
                 self.device
             )
 
+            logger.info(f"[LSTM] Starting training loop on {self.device}...")
             net, val_losses = _train_torch_model(
                 model=net,
                 train_loader=train_loader,
@@ -1546,11 +1553,15 @@ class LSTMTrainer(BaseTrainer):
                 patience=self.patience,
             )
 
+            logger.info(f"[LSTM] Training completed! {len(val_losses)} epochs run")
             self.model = net
 
+            logger.info("[LSTM] Running validation predictions...")
             # Evaluate on val set using a flat array of probabilities.
             val_probs = self._predict_from_dataset(val_dataset)
             y_val_trimmed = split.y_val[self.window_size - 1 :]
+
+            logger.info("[LSTM] Computing metrics...")
             metrics = _compute_metrics(
                 y_true=y_val_trimmed[: len(val_probs)],
                 y_prob=val_probs,
@@ -1558,6 +1569,7 @@ class LSTMTrainer(BaseTrainer):
 
             logger.info(
                 "[^] LSTMTrainer: epochs_run=%d final_val_loss=%.6f",
+                "f[LSTM] Final metrics: {metrics}",
                 len(val_losses),
                 val_losses[-1] if val_losses else float("nan"),
             )
@@ -1569,6 +1581,7 @@ class LSTMTrainer(BaseTrainer):
             )
 
         except Exception as exc:
+            logger.error(f"[LSTM] Training failed with exception: {exc}", exc_info=True)
             raise TrainerError(
                 f"LSTMTrainer.train() failed: {exc}", stage="train"
             ) from exc
