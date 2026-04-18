@@ -89,7 +89,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
+import traceback
 from typing import Any
 
 import pandas as pd
@@ -867,6 +869,10 @@ class LiveEngine:
             signal: TradeSignal to record. to_dict() produces the
                     JSON-serialisable dict the journal consumes.
         """
+        logger.warning(
+            f"DEBUG: _write_journal type={type(signal).__name__}, has_to_dict={hasattr(signal, 'to_dict')}"
+        )
+
         if self._journal_client is None:
             return
 
@@ -888,6 +894,8 @@ class LiveEngine:
                 f"{'%' * 60}"
             )
             logger.warning(warning_block)
+            traceback.print_stack()
+            sys.exit(1)
 
     # ── Threshold / Martingale helpers ────────────────────────────────────────
 

@@ -88,7 +88,6 @@ fi
 # Verify resource group exists
 if ! az group show -n "$RESOURCE_GROUP" &>/dev/null; then
   echo "❌ Resource group '$RESOURCE_GROUP' not found"
-  echo "   Create it:  az group create -n $RESOURCE_GROUP -l eastus"
   exit 1
 fi
 
