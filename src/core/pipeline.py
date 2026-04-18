@@ -1198,15 +1198,15 @@ class Pipeline:
                         ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
                         (
                             "LSTM",
-                            LSTMTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                            LSTMTrainer(expiry_key=expiry_key),
                         ),
                         (
                             "GRU",
-                            GRUTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                            GRUTrainer(expiry_key=expiry_key),
                         ),
                         (
                             "TCN",
-                            TCNTrainer(expiry_key=expiry_key, epochs=10, patience=3),
+                            TCNTrainer(expiry_key=expiry_key),
                         ),
                     ]
 
