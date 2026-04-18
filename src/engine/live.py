@@ -565,6 +565,12 @@ class LiveEngine:
         self.is_running = True
         self._consecutive_errors = 0
 
+        # Start result consumer task (only for Quotex)
+        result_task = None
+        if hasattr(self._stream, "get_result"):
+            result_task = asyncio.create_task(self._consume_results())
+            logger.info("[^] LiveEngine: result consumer task started")
+
         try:
             async for tick in self._stream.subscribe():
                 if not self.is_running:
@@ -629,6 +635,13 @@ class LiveEngine:
             raise
 
         finally:
+            # Clean up result consumer
+            if result_task:
+                result_task.cancel()
+                try:
+                    await result_task
+                except asyncio.CancelledError:
+                    pass
             logger.info(
                 "[^] LiveEngine.run(): stopped — symbol=%s expiry=%s",
                 self.symbol,
@@ -962,12 +975,16 @@ class LiveEngine:
         try:
             from core.dashboard import status_store
 
+            # Get Quotex balance if available
+            quotex_balance = 0.0
+
             # Detect stream type and read its live properties.
             # QuotexReader exposes ._connected (bool).
             # TwelveDataStream exposes ._thread (threading.Thread).
             # Fallback: a tick was just received, so treat as connected.
             if hasattr(self._stream, "_connected"):
                 connected: bool = bool(self._stream._connected)
+                quotex_balance = self._stream._balance
             elif hasattr(self._stream, "_thread") and self._stream._thread is not None:
                 connected = self._stream._thread.is_alive()
             else:
@@ -1010,6 +1027,10 @@ class LiveEngine:
                         "connected": connected,
                         "ticks_received": ticks_received,
                     },
+                    "quotex": {
+                        "connected": connected,
+                        "balance": quotex_balance,
+                    },
                     "last_event": event_text,
                     "session": {
                         **snapshot.get("session", {}),
@@ -1041,6 +1062,75 @@ class LiveEngine:
             )
         except Exception:
             pass  # Dashboard is optional — never block on it
+
+    def _push_trade_result_to_dashboard(self, result: dict[str, Any]) -> None:
+        """Push trade outcome to dashboard session stats."""
+        try:
+            from core.dashboard import status_store
+
+            snapshot = status_store.get()
+            session = snapshot.get("session", {})
+
+            outcome = result["result"]
+
+            if outcome == "win":
+                session["wins"] = session.get("wins", 0) + 1
+                session["net_profit"] = session.get("net_profit", 0) + result["payout"]
+            elif outcome == "loss":
+                session["losses"] = session.get("losses", 0) + 1
+                session["net_profit"] = session.get("net_profit", 0) - result["stake"]
+            elif outcome == "draw":
+                session["draws"] = session.get("draws", 0) + 1
+                # Draw: no profit change, no streak change
+            else:
+                # No trade placed (result is None) - do nothing
+                return
+
+            status_store.update({"session": session})
+
+        except Exception:
+            pass
+
+    async def _consume_results(self) -> None:
+        """
+        Background task to consume trade results from QuotexReader.
+        """
+        while self.is_running:
+            try:
+                if not hasattr(self._stream, "get_result"):
+                    await asyncio.sleep(1)
+                    continue
+
+                result = await self._stream.get_result(timeout=0.5)
+                if result:
+                    outcome = result["result"]  # 'win', 'loss', or 'draw'
+
+                    # Update threshold manager ONLY for win/loss (not draw)
+                    if outcome == "win":
+                        self._threshold_mgr.on_win()
+                    elif outcome == "loss":
+                        self._threshold_mgr.on_loss()
+                    # draw: do nothing - streak unchanged, threshold unchanged
+
+                    # Update dashboard
+                    self._push_trade_result_to_dashboard(result)
+
+                    logger.info(
+                        {
+                            "event": "trade_result_processed",
+                            "signal_id": result.get("signal_id"),
+                            "result": outcome,
+                            "payout": result.get("payout"),
+                            "stake": result.get("stake"),
+                            "streak": self._threshold_mgr.streak,
+                            "threshold": self._threshold_mgr.get_threshold(),
+                        }
+                    )
+
+            except Exception as exc:
+                logger.debug(f"Result consumer error: {exc}")
+
+            await asyncio.sleep(0.5)
 
     def get_threshold_state(self) -> dict[str, object]:
         """

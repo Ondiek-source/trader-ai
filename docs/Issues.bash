@@ -284,3 +284,53 @@ Preserve existing subscribe() interface for backward compatibility
 Maintain error handling and reconnection logic
 
 Keep logging clear about which symbol each tick belongs to
+
+
+
+I want to commit my processed Parquet files as seed data directly into my Git repository so that every container deployment starts with a complete historical dataset without needing to backfill from the API every time.
+
+Please help me:
+1. Add `/app/data/processed/*.parquet` to my .gitignore (except a seed folder)
+2. Create a `data/seed/` directory in my project root
+3. Copy the current processed bar files from my running container to `data/seed/`
+4. Write a script `scripts/seed_data.sh` that:
+   - Copies seed data to `/app/data/processed/` on container startup
+   - Only copies if the processed directory is empty
+   - Preserves existing data if present
+5. Modify my Dockerfile to copy seed data during build
+6. Modify my entrypoint script to restore seed data if no data exists
+7. Compress the seed data to reduce repo size (Parquet already compressed, but could gzip)
+8. Add a CI check that seed data matches expected schema version
+
+This way:
+- New containers start with 404k bars immediately
+- No API backfill needed on first boot
+- Data is version-controlled with code
+- Works even without Azure Blob
+- Cheap and fast deployments
+
+## Known Limitations
+
+# Pseudo-code for your orchestrator
+if no_active_trade:
+    # Check all pairs for signals
+    for pair in pairs:
+        signal = generator.generate(pair)
+        if signal.is_executable():
+            # Execute this trade
+            await webhook.fire(signal)
+            # Wait for result before checking next pair
+            result = await reader.get_result(timeout=65)
+            # Process result, then continue loop
+            break
+    # If no trade executed, wait and retry
+
+    
+Due to Quotex API constraints:
+- No trade ID returned when placing trades
+- No asset/symbol in trade history
+- No webhook/callback for trade closure
+
+**Impact:** The bot cannot reliably match results to 
+signals when trading multiple pairs in parallel. Sequential 
+trading (one pair at a time) is required for accurate result detection.

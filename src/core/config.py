@@ -41,10 +41,21 @@ VALID_PAIRS: set[str] = {
     "XAU_USD",
 }
 
+VALID_OTC_BASE_PAIRS: set[str] = {
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCAD",
+    "USDCHF",
+    "XAUUSD",
+}
+
 VALID_EXPIRIES: set[int] = {60, 300, 900}
 VALID_SOURCES: set[str] = {"TWELVE", "QUOTEX"}
 
 # ── Value truncation helper ───────────────────────────────────────────────────
+
 
 def _trunc(val: object, max_len: int = 120) -> str:
     """
@@ -274,41 +285,86 @@ def _parse_and_validate_pairs(name: str, raw: str) -> list[str]:
 
 def _parse_otc_pairs(raw: str) -> list[str]:
     """
-    Parse ``OTC_PAIRS`` env var.
+    Parse and validated ``OTC_PAIRS`` from env var.
 
-    Accepts comma-separated Quotex symbol names, e.g.::
+    Process:
+        1. Split by comma, strip whitespace
+        2. Remove any suffix (_OTC, _otc, -OTC, etc.) to get base pair
+        3. Convert base pair to UPPERCASE for validation
+        4. Validate base pair against allowed list
+        5. Reconstruct with CORRECT format: basepair_otc (lowercase)
 
-        "EURUSD-OTC,GBPUSD-OTC,USDJPY-OTC,XAUUSD-OTC"
+    Accepts valid comma-separated Quotex otc symbol names, e.g.::
+
+        "EURUSD_otc,GBPUSD_otc,USDJPY_otc,XAUUSD_otc"
 
     If empty, symbols are derived from ``PAIRS`` at stream start time
-    (``EUR_USD`` → ``EURUSD-OTC``).
+    (``EUR_USD`` → ``EURUSD_otc``).
 
     Args:
         raw: Raw comma-separated string from the environment variable.
 
     Returns:
-        List of OTC symbol names, or empty list if unset.
+        List of validated OTC symbol names, or empty list if unset.
     """
     if not raw.strip():
         return []
-    pairs: list[str] = [p.strip().upper() for p in raw.split(",") if p.strip()]
-    if not pairs:
+
+    # Split and clean
+    raw_symbols = [p.strip().replace("_", "") for p in raw.split(",") if p.strip()]
+    if not raw_symbols:
         error_block = (
             f"\n{'='*60}\n"
             f"PARSING ERROR: OTC_PAIRS\n"
             f"Input Received: '{raw}'\n"
             f"Status: String contains no valid symbols (only delimiters?).\n\n"
-            f"SYSTEM SNAPSHOT:\n"
-            f"  - Working Directory: {CWD}\n"
-            f"  - .env File Present: {ENV_FILE_EXISTS}\n"
-            f"\nFIX: OTC_PAIRS must contain at least one symbol name.\n"
+            f"FIX: OTC_PAIRS must contain at least one symbol name.\n"
             f"     Example: OTC_PAIRS=EURUSD_otc,GBPUSD_otc\n"
             f"     If you do not need OTC overrides, leave OTC_PAIRS blank.\n"
             f"{'='*60}"
         )
         logger.critical(error_block)
         raise ValueError("OTC_PAIRS is set but contains no valid pairs.")
-    return pairs
+
+    validated_pairs = []
+    for raw_symbol in raw_symbols:
+        # Step 1: Remove any suffix to get base pair
+        base_pair = raw_symbol.upper()  # Start with uppercase for processing
+
+        # Remove common suffixes
+        for suffix in ["OTC", "otc", "OTC", "otc", "Otc", "oTC"]:
+            if base_pair.endswith(suffix):
+                base_pair = base_pair[: -len(suffix)]
+                break
+
+        # Step 2: Validate base pair
+        if base_pair not in VALID_OTC_BASE_PAIRS:
+            error_block = (
+                f"\n{'!'*60}\n"
+                f"VALIDATION ERROR: UNSUPPORTED BASE PAIR IN OTC_PAIRS\n"
+                f"Raw input     : '{raw_symbol}'\n"
+                f"Extracted base: '{base_pair}'\n"
+                f"Valid pairs   : {sorted(VALID_OTC_BASE_PAIRS)}\n\n"
+                f"CONTEXT: The OTC symbol could not be mapped to a valid forex pair.\n"
+                f"  - Check for typos in your .env file.\n"
+                f"  - Supported pairs: EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, XAUUSD\n"
+                f"\nFIX: Correct OTC_PAIRS in .env or remove it to use auto-translation.\n"
+                f"{'!'*60}"
+            )
+            logger.critical(error_block)
+            raise ValueError(f"Unsupported base pair in OTC_PAIRS: '{base_pair}'")
+
+        # Step 3: Reconstruct with CORRECT format (uppercase _otc)
+        correct_symbol = f"{base_pair.upper()}_otc"
+        validated_pairs.append(correct_symbol)
+
+        # Log the transformation for transparency
+        if raw_symbol != correct_symbol:
+            logger.info(
+                f"[CONFIG] OTC symbol normalized: '{raw_symbol}' -> '{correct_symbol}'"
+            )
+
+    return validated_pairs
 
 
 # ── Configuration dataclass ───────────────────────────────────────────────────
@@ -372,14 +428,14 @@ class Config:
     max_rf_rows: int
     memory_saver_mode: bool
     gpu_enabled: bool
-    
+
     # Feature Toggles
     feat_momentum_enabled: bool
     feat_volatility_enabled: bool
     feat_price_action_enabled: bool
     feat_micro_enabled: bool
     feat_context_enabled: bool
-    
+
     # Gate Thresholds
     gate_min_rvol: float
     gate_max_spread: float
@@ -425,7 +481,9 @@ class Config:
                 f"{'%'*60}"
             )
             logger.critical(error_block)
-            raise ValueError(f"TICK_FLUSH_SIZE must be > 0, got {_trunc(self.tick_flush_size)}")
+            raise ValueError(
+                f"TICK_FLUSH_SIZE must be > 0, got {_trunc(self.tick_flush_size)}"
+            )
 
         # Webhook key must be set if a webhook URL is configured
         if self.webhook_url and not self.webhook_key:
@@ -514,7 +572,10 @@ class Config:
             )
 
         # Ceiling check: base_threshold + max_streak * step must be < 1.0
-        _threshold_ceiling = self.confidence_threshold + self.martingale_max_streak * self.martingale_step
+        _threshold_ceiling = (
+            self.confidence_threshold
+            + self.martingale_max_streak * self.martingale_step
+        )
         if _threshold_ceiling >= 1.0:
             error_block = (
                 f"\n{'%'*60}\n"

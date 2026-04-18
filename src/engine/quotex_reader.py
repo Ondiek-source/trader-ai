@@ -90,6 +90,7 @@ class QuotexReader:
     BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
     MAX_RECONNECT_DELAY = 120  # seconds
+    STREAM_LOG_ONCE = True  # Circuit switch for unavailable stream
 
     def __init__(
         self,
@@ -385,7 +386,17 @@ class QuotexReader:
 
     async def _safe_get_balance(self) -> float:
         """Fetch balance with a 5-second timeout; returns cached value on failure."""
+        debug_block = {
+            "event": "safe_get_balance",
+            "client_exists": self._client is not None,
+            "connected": self._connected,
+            "function": "_safe_get_balance",
+        }
+        logger.debug(debug_block)
         if not self._client or not self._connected:
+            logger.debug(
+                f"[DEBUG] Returning cached balance (not connected): {self._balance}"
+            )
             return self._balance
         try:
             bal = await asyncio.wait_for(self._client.get_balance(), timeout=5.0)
@@ -447,29 +458,21 @@ class QuotexReader:
 
         # ── Strategy 3: near-zero delta fallback = draw ────────────────────
         # If balance hasn't moved at all after expiry + buffer, and history
-        # also found nothing, the most likely outcome is a draw (stake returned).
-        # Only treat as draw when delta is genuinely zero — not just below our
-        # 0.001 noise threshold on a loss.
-        if abs(delta) < 0.001:
+        # also found nothing, the most likely outcome is no trade occured e.g.
+        # autosignal didn't place the trade or quotex rejected or even < 75% payout.
+        if abs(delta) < 0.001 and not history_result:
             logger.info(
                 {
                     "event": "result_from_zero_delta",
                     "signal_id": signal_id,
                     "pair": pair,
+                    "expiry_time": expiry_time.isoformat(),
                     "delta": round(delta, 6),
-                    "outcome": "draw",
+                    "reason": "No trade found near expiry and balance unchanged",
                 }
             )
-            return self._make_result(
-                signal_id,
-                pair,
-                direction,
-                "draw",
-                payout=0.0,
-                stake=0.0,
-            )
-
-        return None
+            # Return None - signal is dead, do NOT create a result
+            return None
 
     # ── History-based matching ─────────────────────────────────────────────────
 
@@ -491,103 +494,75 @@ class QuotexReader:
             if not history or not isinstance(history, list):
                 return None
 
-            # Log first call for schema discovery
-            if not hasattr(self, "_logged_history"):
-                logger.info(
+            # Remove timezone for comparison
+            target_time = expiry_time.replace(tzinfo=None)
+
+            # Find trade with close_time closest to target_time
+            closest_trade = None
+            smallest_diff = float("inf")
+
+            for trade in history:
+                close_time_str = trade.get("close_time", "")
+                if not close_time_str:
+                    continue
+
+                try:
+                    # Parse Quotex timestamp format: "2026-04-17 19:44:27"
+                    trade_time = datetime.strptime(close_time_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+
+                # Calculate time difference in seconds
+                time_diff = abs((trade_time - target_time).total_seconds())
+
+                # Only consider trades within 60 seconds of expiry
+                if time_diff < 66 and time_diff < smallest_diff:
+                    smallest_diff = time_diff
+                    closest_trade = trade
+
+            if not closest_trade:
+                logger.warning(
                     {
-                        "event": "quotex_history_sample",
-                        "type": type(history).__name__,
-                        "count": len(history),
-                        "sample": str(history[:2])[:500],
-                    }
-                )
-                self._logged_history = True
-
-            asset_candidates = {
-                a.upper() for a in PAIR_TO_ASSETS.get(pair, [pair.replace("_", "")])
-            }
-            window_start = expiry_time - timedelta(seconds=60)
-
-            for item in reversed(history):
-                if not isinstance(item, dict):
-                    continue
-
-                # Asset match
-                item_asset = str(
-                    item.get("asset", item.get("symbol", item.get("active", "")))
-                ).upper()
-                if not any(
-                    c in item_asset or item_asset in c for c in asset_candidates
-                ):
-                    continue
-
-                # Profit — per docs the field is "profitAmount"
-                profit = None
-                for key in ("profitAmount", "profit", "payout", "amount"):
-                    if key in item:
-                        try:
-                            profit = float(item[key])
-                            break
-                        except (ValueError, TypeError):
-                            continue
-
-                if profit is None:
-                    continue
-
-                # Result from get_result(id) if we have a ticket
-                ticket = item.get("ticket")
-                if ticket is not None:
-                    try:
-                        status, details = await asyncio.wait_for(
-                            self._client.get_result(ticket), timeout=5.0
-                        )
-                        logger.info(
-                            {
-                                "event": "quotex_result_detail",
-                                "ticket": ticket,
-                                "status": status,
-                                "profit": profit,
-                            }
-                        )
-                        outcome = "win" if str(status).lower() == "win" else "loss"
-                        return self._make_result(
-                            "",
-                            pair,
-                            direction,
-                            outcome,
-                            payout=abs(profit) if outcome == "win" else 0.0,
-                            stake=abs(profit) if outcome == "loss" else 0.0,
-                        )
-                    except Exception:
-                        pass
-
-                # Infer outcome from profit sign
-                if profit > 0:
-                    outcome = "win"
-                elif profit == 0:
-                    outcome = "draw"
-                else:
-                    outcome = "loss"
-
-                logger.info(
-                    {
-                        "event": "quotex_history_match",
+                        "event": "no_trade_near_expiry",
                         "pair": pair,
-                        "asset": item_asset,
-                        "profit": profit,
-                        "outcome": outcome,
-                        "ticket": item.get("ticket"),
+                        "expiry_time": expiry_time.isoformat(),
                     }
                 )
-                return self._make_result(
-                    "",
-                    pair,
-                    direction,
-                    outcome,
-                    payout=abs(profit) if outcome == "win" else 0.0,
-                    stake=abs(profit) if outcome == "loss" else 0.0,
-                )
+                return None
 
+            # Get profit from the closest trade
+            profit = float(
+                closest_trade.get("profitAmount", closest_trade.get("profit", 0))
+            )
+
+            if profit > 0:
+                outcome = "win"
+                payout = profit
+                stake = 0.0
+            elif profit < 0:
+                outcome = "loss"
+                payout = 0.0
+                stake = abs(profit)
+            else:
+                outcome = "draw"
+                payout = 0.0
+                stake = 0.0
+
+            logger.info(
+                {
+                    "event": "quotex_history_match",
+                    "pair": pair,
+                    "profit": profit,
+                    "outcome": outcome,
+                    "ticket": closest_trade.get("ticket"),
+                    "close_time": closest_trade.get("close_time"),
+                    "time_diff_seconds": round(smallest_diff, 2),
+                }
+            )
+
+            return self._make_result(
+                "", pair, direction, outcome, payout=payout, stake=stake
+            )
         except asyncio.TimeoutError:
             logger.warning({"event": "quotex_history_timeout", "pair": pair})
         except Exception as exc:
@@ -664,37 +639,61 @@ class QuotexReader:
         """
         Async generator that yields real-time price ticks for Quotex OTC pairs.
         Since pyquotex doesn't support a real price stream, this method polls
-        the latest price every 500 ms using start_realtime_price() with batch_size=1
+        the latest price every 1000 ms using start_realtime_price() with batch_size=1
         """
         otc_asset = self.symbol
+        # ok | degraded
+        state = "ok"
 
         while self._connected:
             try:
-                if hasattr(self._client, "start_realtime_price"):
-                    result = await self._client.start_realtime_price(otc_asset, 1)
+                if not hasattr(self._client, "start_realtime_price"):
+                    if state != "degraded":
+                        logger.error(
+                            f"[STREAM ERROR] start_realtime_price() not available for {otc_asset}"
+                        )
+                        state = "degraded"
+                    await asyncio.sleep(1)
+                    continue
 
-                    if result and isinstance(result, dict) and otc_asset in result:
-                        price_points = result[otc_asset]
-                        for price_point in price_points:
-                            tick = {
-                                "symbol": self.symbol,
-                                "bid": float(price_point["price"]),
-                                "ask": float(price_point["price"]),
-                                "timestamp": datetime.fromtimestamp(
-                                    price_point["time"], tz=timezone.utc
-                                ),
-                                "source": "QUOTEX",
-                                "mid_price": float(price_point["price"]),
-                            }
-                            yield tick
+                result = await self._client.start_realtime_price(otc_asset, 1)
 
-                await asyncio.sleep(0.5)  # Poll every 500ms for fresh price
+                if result and isinstance(result, dict) and otc_asset in result:
+                    # Stream is healthy we have data
+                    if state == "degraded":
+                        logger.info(
+                            f"[STREAM IS UP] Real-time data available for {otc_asset}"
+                        )
+                        state = "ok"
 
+                    price_points = result[otc_asset]
+                    for price_point in price_points:
+                        yield {
+                            "symbol": self.symbol,
+                            "bid": float(price_point["price"]),
+                            "ask": float(price_point["price"]),
+                            "timestamp": datetime.fromtimestamp(
+                                price_point["time"], tz=timezone.utc
+                            ),
+                            "source": "QUOTEX",
+                            "mid_price": float(price_point["price"]),
+                        }
+
+                else:
+                    # No streaming data available
+                    if state != "degraded":
+                        logger.warning(
+                            f"[STREAM OFFLINE] No real-time data for {otc_asset}. Symbol may be offline. Will retry every 1s."
+                        )
+                        state = "degraded"
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in subscribe: {e}")
-                await asyncio.sleep(1)
+                if state != "degraded":
+                    logger.error(f"[STREAM ERROR] {otc_asset}: {type(e).__name__}: {e}")
+                    state = "degraded"
+
+            await asyncio.sleep(1)  # Poll every 1000ms for fresh price
 
         # Cleanup
         if hasattr(self._client, "stop_candles_stream"):
