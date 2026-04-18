@@ -353,7 +353,7 @@ class Historian:
             return start
 
         # Resume: one minute after the last stored bar to avoid re-fetching it
-        raw_ts = df["timestamp"].iloc[-1]  # last row after sort-by-timestamp
+        raw_ts = df.index[-1]  # last row after sort-by-timestamp
         last_dt: datetime = (
             raw_ts.to_pydatetime() if hasattr(raw_ts, "to_pydatetime") else raw_ts
         )
