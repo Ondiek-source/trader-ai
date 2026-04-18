@@ -481,15 +481,34 @@ class FeatureEngineer:
         gap_mask = fe["close"].isna()
         n_gaps = int(gap_mask.sum())
         if n_gaps > 0:
-            logger.warning(
-                "[%%] RESAMPLE GAP: %d M1 bars missing (%.1f%% of %d total) after "
-                "resampling. Forward-filling up to %d consecutive bars. "
-                "Longer gaps will be dropped by dropna(). Investigate data source.",
-                n_gaps,
-                n_gaps / len(fe) * 100,
-                len(fe),
-                _MAX_FFILL_BARS,
+            # Build the full expected minute-by-minute index
+            full_index = pd.date_range(
+                start=fe.index.min(), end=fe.index.max(), freq="min"
             )
+            missing_timestamps = full_index.difference(pd.DatetimeIndex(fe.index))
+            # A gap is a weekend if the missing timestamp falls on Sat (5) or Sun (6)
+            weekend_gaps = missing_timestamps[missing_timestamps.dayofweek.isin([5, 6])]
+            unexpected_gaps = n_gaps - len(weekend_gaps)
+
+            if unexpected_gaps > 0:
+                logger.warning(
+                    "[%%] UNEXPECTED DATA GAP: %d M1 bars missing (%.1f%% of %d total) "
+                    "outside normal weekend closures. Forward-filling up to %d bars. "
+                    "Check data source for API failures or broker outages.",
+                    unexpected_gaps,
+                    unexpected_gaps / (len(fe) + n_gaps) * 100,
+                    len(fe) + n_gaps,
+                    _MAX_FFILL_BARS,
+                )
+            else:
+                logger.info(
+                    "[^] Weekend/holiday gaps: %d M1 bars (%.1f%% of %d total) — normal. "
+                    "Forward-filling up to %d consecutive bars.",
+                    n_gaps,
+                    n_gaps / (len(fe) + n_gaps) * 100,
+                    len(fe) + n_gaps,
+                    _MAX_FFILL_BARS,
+                )
         fe = fe.ffill(limit=_MAX_FFILL_BARS)
 
         # Guard against missing columns

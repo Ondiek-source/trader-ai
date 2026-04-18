@@ -567,6 +567,31 @@ class LiveEngine:
         self.is_running = True
         self._consecutive_errors = 0
 
+        # ── Reset dashboard session clock to actual engine start time ─────
+        # started_at is seeded at StatusStore.__init__ (module import time).
+        # Resetting it here means elapsed_minutes counts from when the engine
+        # actually begins trading, not from container boot / backfill time.
+        try:
+            from datetime import datetime, timezone as _tz
+            from core.dashboard import status_store
+
+            status_store.update(
+                {
+                    "started_at": datetime.now(_tz.utc).isoformat(),
+                    "session": {
+                        "is_active": True,
+                        "wins": 0,
+                        "losses": 0,
+                        "draws": 0,
+                        "net_profit": 0.0,
+                        "signals_fired": 0,
+                        "elapsed_minutes": 0.0,
+                    },
+                }
+            )
+        except Exception:
+            pass
+
         # Start result consumer task (only for Quotex)
         result_task = None
         if hasattr(self._stream, "get_result"):
@@ -873,10 +898,6 @@ class LiveEngine:
             signal: TradeSignal to record. to_dict() produces the
                     JSON-serialisable dict the journal consumes.
         """
-        logger.warning(
-            f"DEBUG: _write_journal type={type(signal).__name__}, has_to_dict={hasattr(signal, 'to_dict')}"
-        )
-
         if self._journal_client is None:
             return
 
