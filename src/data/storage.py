@@ -810,7 +810,7 @@ class Storage:
         """
         Download a model artifact and its JSON metadata sidecar from Azure.
 
-        Pulls both the artifact and its ``<stem>_metadata.json`` sidecar
+        Pulls both the artifact and its ``<stem>.json`` sidecar
         from the ``models/`` prefix in the shared container. Both files are
         written into ``local_dir`` (or the project's ``models/`` directory
         by default). Returns the local artifact path on success so the

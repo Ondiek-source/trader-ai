@@ -491,7 +491,7 @@ class FeatureEngineer:
             unexpected_gaps = n_gaps - len(weekend_gaps)
 
             if unexpected_gaps > 0:
-                logger.warning(
+                logger.info(
                     "[%%] UNEXPECTED DATA GAP: %d M1 bars missing (%.1f%% of %d total) "
                     "outside normal weekend closures. Forward-filling up to %d bars. "
                     "Check data source for API failures or broker outages.",

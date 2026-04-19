@@ -686,6 +686,7 @@ class QuotexReader:
                             f"[STREAM OFFLINE] No real-time data for {otc_asset}. Symbol may be offline. Will retry every 1s."
                         )
                         state = "degraded"
+                    await asyncio.sleep(4)  # Backoff muthafucker
             except asyncio.CancelledError:
                 break
             except Exception as e:
