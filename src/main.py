@@ -33,25 +33,32 @@ class _JSONFormatter(logging.Formatter):
     def __init__(self, verbose_events: set[str]):
         super().__init__()
         self._verbose_events = verbose_events
-        self._minimal_mode = len(self._verbose_events) == 0
+        self._allow_all = "ALL" in verbose_events
+        self._minimal_mode = len(verbose_events) == 0
         # Always allow these critical events even in minimal mode
         self._critical_events = {"BOOT", "SHUTDOWN", "FATAL_CRASH"}
 
     def format(self, record: logging.LogRecord) -> str:
-        msg: str = record.getMessage()
-        try:
-            payload: dict = json.loads(msg) if msg.startswith("{") else {"message": msg}
-            event = payload.get("event")
-            if self._minimal_mode:
-                # Minimal mode: only log critical events
-                if event not in self._critical_events:
-                    return ""  # ← RETURN EMPTY STRING TO SKIP LOGGING
-            else:
-                # Verbose mode: only log events explicitly listed
-                if event and event not in self._verbose_events:
-                    return ""
-        except (json.JSONDecodeError, ValueError):
-            payload = {"message": msg}
+        # Handle dict messages directly — avoids str(dict) round-trip which
+        # produces single-quoted keys that json.loads() rejects silently.
+        if isinstance(record.msg, dict):
+            payload: dict = record.msg
+        else:
+            msg: str = record.getMessage()
+            try:
+                payload = json.loads(msg) if msg.startswith("{") else {"message": msg}
+            except json.JSONDecodeError:
+                payload = {"message": msg}
+
+        event = payload.get("event")
+        if self._minimal_mode:
+            if event not in self._critical_events:
+                return ""
+        elif not self._allow_all:
+            # Verbose mode: only log events explicitly listed; pass through
+            # plain-string records that have no event key.
+            if event and event not in self._verbose_events:
+                return ""
 
         entry: dict = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -113,11 +120,28 @@ def main() -> None:
         # Parse verbose events from config
         verbose_events = set()
         if config.log_verbose_events:
-            verbose_events = set(
+            verbose_events = {
                 e.strip() for e in config.log_verbose_events.split(",") if e.strip()
-            )
+            }
 
         _configure_logging(verbose_events, config.log_level)
+
+        # Emit mode event now that the structured handler is in place.
+        _mode_logger = logging.getLogger("config")
+        if config.practice_mode:
+            _mode_logger.info(
+                {
+                    "event": "CONFIG_PRACTICE_MODE",
+                    "message": "Signals will fire but treat results as simulation.",
+                }
+            )
+        else:
+            _mode_logger.warning(
+                {
+                    "event": "CONFIG_LIVE_MODE",
+                    "message": "LIVE trading mode — review all parameters and risk settings.",
+                }
+            )
 
     except ConfigError as e:
         # Config errors are fatal at startup - always log them
@@ -161,16 +185,21 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info({"event": "SHUTDOWN", "message": "KeyboardInterrupt"})
     except SystemExit:
-        # Force flush to stderr BEFORE exit
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
         raise
+    except (TraderAIError, FatalError) as exc:
+        # Structured app exceptions — use .to_log_entry() to preserve the
+        # event name (e.g. PIPELINE_ERROR_STORAGE) and stage/field context.
+        logger.critical(exc.to_log_entry(), exc_info=True)
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        sys.exit(1)
     except Exception as exc:
         logger.critical(
             {"event": "FATAL_CRASH", "error": str(exc), "type": type(exc).__name__},
             exc_info=True,
         )
-        # Force flush to stderr BEFORE exit
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
         sys.exit(1)

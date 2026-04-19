@@ -92,6 +92,7 @@ import logging
 import sys
 import threading
 import traceback
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -142,7 +143,7 @@ class LiveEngineError(Exception):
         self.stage = stage
 
     def __repr__(self) -> str:  # pragma: no cover
-        return f"LiveEngineError(stage={self.stage!r}, " f"message={str(self)!r})"
+        return f"LiveEngineError(stage={self.stage!r}, message={str(self)!r})"
 
 
 class LiveEngine:
@@ -200,8 +201,7 @@ class LiveEngine:
             )
         if expiry_key not in BINARY_EXPIRY_RULES:
             raise ValueError(
-                f"[!] Invalid expiry_key: '{expiry_key}'. "
-                f"Must be one of {list(BINARY_EXPIRY_RULES.keys())}."
+                f"[!] Invalid expiry_key: '{expiry_key}'. Must be one of {list(BINARY_EXPIRY_RULES.keys())}."
             )
 
         self._settings = get_settings()
@@ -215,6 +215,10 @@ class LiveEngine:
         # Running counters pushed to the dashboard on every tick.
         self._ticks_processed: int = 0
         self._signals_fired: int = 0
+
+        # M1 bar-close gate: only run inference when the UTC minute advances.
+        # -1 ensures the very first tick of a session is always processed.
+        self._last_processed_minute: int = -1
 
         # Reload lock: prevents reload_model() from mutating SignalGenerator
         # state while _process_tick() is mid-inference. Both the asyncio
@@ -668,7 +672,7 @@ class LiveEngine:
                 try:
                     await result_task
                 except asyncio.CancelledError:
-                    pass
+                    raise
             logger.info(
                 "[^] LiveEngine.run(): stopped — symbol=%s expiry=%s",
                 self.symbol,
@@ -700,16 +704,23 @@ class LiveEngine:
         # are missing, warmup is incomplete, or feature engineering fails.
         self._ticks_processed += 1
         self._push_stream_status_tick_only()
+
+        # ── M1 bar-close gate ─────────────────────────────────────────────
+        # QuotexReader polls every ~1 s. Without this guard the full feature
+        # engineering + model inference pipeline fires ~60× per minute.
+        # We run inference exactly once per UTC minute (i.e. once per M1 bar).
+        _now_minute = datetime.now(timezone.utc).minute
+        if _now_minute == self._last_processed_minute:
+            return
+        self._last_processed_minute = _now_minute
+
         # ── 1. Load recent bars (capped at _BAR_WINDOW) ───────────────────
-        try:
-            bars_df: pd.DataFrame | None = self._storage.get_bars(
-                symbol=self.symbol,
-                timeframe="M1",
-                max_rows=_BAR_WINDOW,
-            )
-        except StorageError:
-            # Storage failures are fatal — propagate to run().
-            raise
+        # StorageError propagates to run() as a fatal failure.
+        bars_df: pd.DataFrame | None = self._storage.get_bars(
+            symbol=self.symbol,
+            timeframe="M1",
+            max_rows=_BAR_WINDOW,
+        )
 
         if bars_df is None or bars_df.empty:
             logger.debug(
@@ -1032,12 +1043,11 @@ class LiveEngine:
                 ticks_received = int(self._stream.ticks_received)
 
             direction = signal.direction
-            event_text = (
-                f"{self.symbol} {direction} @ {signal.confidence:.1%} "
-                f"[{signal.expiry_key}] gate={'✓' if signal.gate_passed else '✗'}"
-                if direction != "SKIP"
-                else f"{self.symbol} SKIP ({signal.confidence:.1%})"
-            )
+            if direction != "SKIP":
+                gate_icon = "✓" if signal.gate_passed else "✗"
+                event_text = f"{self.symbol} {direction} @ {signal.confidence:.1%} [{signal.expiry_key}] gate={gate_icon}"
+            else:
+                event_text = f"{self.symbol} SKIP ({signal.confidence:.1%})"
 
             snapshot = status_store.get()
 

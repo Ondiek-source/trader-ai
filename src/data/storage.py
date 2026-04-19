@@ -16,7 +16,6 @@ from __future__ import annotations
 
 
 import os
-import sys
 import logging
 import threading
 import pandas as pd
@@ -167,42 +166,36 @@ class Storage:
                 underlying OS exception to provide context in the log.
         """
         dirs_to_provision = [self.raw_dir, self.processed_dir]
+        failed_path: Path | None = None
 
         try:
             for path in dirs_to_provision:
+                failed_path = path
                 path.mkdir(parents=True, exist_ok=True)
-                # Proactive Dictator Check: Can we actually write here?
+                # Proactive write-check: fail now rather than at first I/O.
                 test_file = path / ".write_test"
                 test_file.touch()
                 test_file.unlink()
-                debug_block = (
-                    f"\n{'=' * 60}\n"
-                    f"STORAGE INITIALIZATION SUCCESS\n"
-                    f"Data directory structure is in place and writable.\n"
-                    f"Root       : {self.root_dir}\n"
-                    f"Raw        : {self.raw_dir}\n"
-                    f"Processed  : {self.processed_dir}\n"
-                    f"Path       : {'Writable' if all(p.is_dir() and os.access(p, os.W_OK) for p in dirs_to_provision) else 'Not Writable'}\n"
-                    f"{'=' * 60}"
-                )
-                logger.info(debug_block)
+
+            logger.info(
+                {
+                    "event": "STORAGE_INIT_SUCCESS",
+                    "root": str(self.root_dir),
+                    "raw": str(self.raw_dir),
+                    "processed": str(self.processed_dir),
+                    "writable": all(
+                        p.is_dir() and os.access(p, os.W_OK)
+                        for p in dirs_to_provision
+                    ),
+                }
+            )
 
         except OSError as e:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"STORAGE INITIALIZATION FAILURE\n"
-                f"Cannot provision directory: {path}\n"
-                f"OS Error: {e}\n\n"
-                f"CONTEXT: Storage requires write access to the data directory.\n"
-                f"  - On Linux VPS: Check that the process user owns /data/.\n"
-                f"  - On Windows: Ensure the path is not read-only or OneDrive-synced.\n"
-                f"  - In Docker: Confirm the volume mount is writable.\n"
-                f"\nFIX: Grant write permissions to: {path}\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
-            # Storage is non-functional without a writable data directory, so we raise an error and exit immediately.
-            sys.exit(1)
+            raise StorageError(
+                f"Cannot provision directory '{failed_path}': {e}. "
+                f"Grant write permissions or check volume mounts.",
+                path=str(failed_path),
+            ) from e
 
     def _init_azure_client(self) -> ContainerClient | None:
         """
@@ -230,14 +223,13 @@ class Storage:
                 in a structured diagnostic block before exiting.
         """
         if self._settings.data_mode != "CLOUD":
-            debug_block = (
-                f"\n{'=' * 60}\n"
-                f"LOCAL MODE — Azure Blob client not initialised\n"
-                f"Container : {self._settings.container_name}\n"
-                f"Mode      : {self._settings.data_mode}\n"
-                f"{'=' * 60}"
+            logger.debug(
+                {
+                    "event": "AZURE_BLOB_SKIPPED",
+                    "container": self._settings.container_name,
+                    "mode": self._settings.data_mode,
+                }
             )
-            logger.debug(debug_block)
             return None
         try:
             service: BlobServiceClient = BlobServiceClient.from_connection_string(
@@ -250,31 +242,20 @@ class Storage:
             # first upload, so boot failures surface immediately.
             client.get_container_properties()
 
-            info_block = (
-                f"\n{'=' * 60}\n"
-                f"AZURE BLOB CONNECTED\n"
-                f"Container : {self._settings.container_name}\n"
-                f"Mode      : {self._settings.data_mode}\n"
-                f"{'=' * 60}"
+            logger.info(
+                {
+                    "event": "AZURE_BLOB_CONNECTED",
+                    "container": self._settings.container_name,
+                    "mode": self._settings.data_mode,
+                }
             )
-            logger.info(info_block)
             return client
 
         except Exception as e:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"AZURE CONNECTION FAILURE\n"
-                f"Container : {self._settings.container_name}\n"
-                f"Error     : {e}\n\n"
-                f"CONTEXT: DATA_MODE is 'CLOUD' but Azure Blob Storage is unreachable.\n"
-                f"  [!] Check AZURE_STORAGE_CONN in your .env file.\n"
-                f"  [!] Verify the container '{self._settings.container_name}' exists.\n"
-                f"  [^] Confirm network connectivity from this host to Azure.\n"
-                f"\nFIX: Correct AZURE_STORAGE_CONN or switch DATA_MODE=LOCAL for offline use.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
-            sys.exit(1)
+            raise StorageError(
+                f"Azure Blob unreachable (container='{self._settings.container_name}'): {e}. "
+                f"Check AZURE_STORAGE_CONN or set DATA_MODE=LOCAL for offline use."
+            ) from e
 
     def _get_file_lock(self, file_path: Path) -> threading.Lock:
         """

@@ -94,7 +94,8 @@ _WARMUP_BARS: int = 100
 
 # How often the retrain scheduler wakes to check if the interval has elapsed.
 # Actual retraining only fires when model_retrain_interval seconds have passed.
-_RETRAIN_CHECK_INTERVAL_S: int = 60
+# First-boot retrain is immediate regardless of this interval (is_first_run guard).
+_RETRAIN_CHECK_INTERVAL_S: int = 3600
 
 # Canonical mapping of expiry key to seconds.
 # Must stay in sync with _EXPIRY_SECONDS in labeler.py — the assert in
@@ -107,6 +108,14 @@ _EXPIRY_KEY_MAP: dict[str, int] = {
 
 # Inverse map: seconds -> expiry key. Derived once at module load.
 _SECONDS_TO_EXPIRY_KEY: dict[int, str] = {v: k for k, v in _EXPIRY_KEY_MAP.items()}
+
+# Active trainers pulled from Blob and used during retraining.
+# RandomForest excluded: produces multi-GiB artifacts that break container boot.
+_ACTIVE_TRAINERS: list[str] = [
+    "XGBoostTrainer",
+    "LightGBMTrainer",
+    "CatBoostTrainer",
+]
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -174,7 +183,7 @@ class Pipeline:
                     "message": "Pipeline has started",
                 }
             )
-            self._storage = self._stage_storage()
+            self._storage = await self._stage_storage()
             await self._stage_historian_sync()
             self._stage_feature_warmup(self._storage)
             model_map = await self._stage_model_load()
@@ -253,13 +262,15 @@ class Pipeline:
 
     # ── Stage 1: Storage Link ─────────────────────────────────────────────────
 
-    def _stage_storage(self) -> Storage:
+    async def _stage_storage(self) -> Storage:
         """
         Construct and verify the Storage custodian.
 
         Storage provisions the data directory hierarchy and (in CLOUD mode)
-        establishes the Azure Blob connection. Both operations happen at
-        construction time and fail immediately if they cannot complete.
+        establishes the Azure Blob connection — including a live network probe
+        via get_container_properties(). That probe is a blocking synchronous
+        call, so we run Storage construction in a thread to avoid stalling the
+        event loop during the TLS handshake.
 
         Returns:
             Storage: The initialised, verified Storage instance. Passed to
@@ -269,7 +280,7 @@ class Pipeline:
             PipelineError: If Storage construction fails.
         """
         try:
-            storage = get_storage()
+            storage = await asyncio.to_thread(get_storage)
             logger.info(
                 {
                     "event": "STAGE_COMPLETE",
@@ -387,29 +398,15 @@ class Pipeline:
 
     # ── Stage 4: Model Load ───────────────────────────────────────────────────
 
-    async def _stage_model_load(self) -> dict[tuple[str, str], Any]:
-        """
-        Pull model artifacts from Blob and load them into memory.
-
-        For each (symbol, expiry_key) pair: attempts a cold-start Blob pull,
-        queries the registry for the best current-version artifact, and loads it.
-
-        Returns:
-            dict keyed by (symbol, expiry_key) -> (model_artifact, ModelRecord).
-            Pairs with no available model are absent from the dict.
-
-        Raises:
-            PipelineError: If no model found for any symbol/expiry pair.
-        """
-        manager = ModelManager(storage_dir=self._settings.model_dir)
-        model_map: dict[tuple[str, str], Any] = {}
-
-        for symbol in self._settings.pairs:
-            for expiry_key in _EXPIRY_KEY_MAP:
-
-                # 4a: Cold-start Blob pull
+    async def _pull_model_artifacts(
+        self, symbol: str, expiry_key: str, manager: ModelManager
+    ) -> None:
+        for trainer_name in _ACTIVE_TRAINERS:
+            try:
                 pulled = await manager.pull_from_blob(
-                    symbol=symbol, expiry_key=expiry_key
+                    symbol=symbol,
+                    expiry_key=expiry_key,
+                    model_name=trainer_name,
                 )
                 if pulled:
                     logger.info(
@@ -417,47 +414,82 @@ class Pipeline:
                             "event": "MODEL_PULLED_TO_LOCAL_DISK",
                             "symbol": symbol,
                             "expiry_key": expiry_key,
+                            "trainer": trainer_name,
                             "artifact": pulled,
                         }
                     )
+            except Exception as exc:
+                logger.warning(
+                    {
+                        "event": "MODEL_PULL_FAILED",
+                        "symbol": symbol,
+                        "expiry_key": expiry_key,
+                        "trainer": trainer_name,
+                        "error": str(exc),
+                    }
+                )
 
-                # 4b: Query registry for best artifact
-                record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
-                if record is None:
-                    logger.warning(
-                        {
-                            "event": "MODEL_NOT_FOUND",
-                            "symbol": symbol,
-                            "expiry_key": expiry_key,
-                            "message": "No model found - retrain scheduler will train on first boot",
-                        }
-                    )
-                    continue
+    def _load_best_model(
+        self, symbol: str, expiry_key: str, manager: ModelManager
+    ) -> tuple[Any, Any] | None:
+        record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
+        if record is None:
+            logger.warning(
+                {
+                    "event": "MODEL_NOT_FOUND",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "message": "No model found - retrain scheduler will train on first boot",
+                }
+            )
+            return None
+        try:
+            model = manager.load(record.artifact_path)
+            logger.info(
+                {
+                    "event": "MODEL_LOADED",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "model_name": record.model_name,
+                    "auc": record.auc,
+                }
+            )
+            return model, record
+        except Exception as exc:
+            logger.warning(
+                {
+                    "event": "MODEL_LOAD_FAILED",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "error": str(exc),
+                    "message": "Skipping — retrain scheduler will recover on first boot",
+                }
+            )
+            return None
 
-                # 4c: Skip PyTorch — requires architecture injection
-                if record.is_pytorch:
-                    # TODO
-                    continue
+    async def _stage_model_load(self) -> dict[tuple[str, str], Any]:
+        """
+        Pull model artifacts from Blob and load them into memory.
 
-                # 4d: Load artifact into memory
-                try:
-                    model = manager.load(record.artifact_path)
-                    model_map[(symbol, expiry_key)] = (model, record)
-                    logger.info(
-                        {
-                            "event": "MODEL_LOADED",
-                            "symbol": symbol,
-                            "expiry_key": expiry_key,
-                            "model_name": record.model_name,
-                            "auc": record.auc,
-                        }
-                    )
+        For each (symbol, expiry_key) pair: pulls each active trainer artifact
+        individually so a single large or corrupt artifact cannot block others.
+        Queries the registry for the best current-version artifact and loads it.
+        Load failures are demoted to warnings — the retrain scheduler recovers
+        on first boot.
 
-                except Exception as exc:
-                    raise PipelineError(
-                        f"Failed to load model artifact for {symbol} {expiry_key}: {exc}",
-                        stage="model_load",
-                    ) from exc
+        Returns:
+            dict keyed by (symbol, expiry_key) -> (model_artifact, ModelRecord).
+            Pairs with no available model are absent from the dict.
+        """
+        manager = ModelManager(storage_dir=self._settings.model_dir)
+        model_map: dict[tuple[str, str], Any] = {}
+
+        for symbol in self._settings.pairs:
+            for expiry_key in _EXPIRY_KEY_MAP:
+                await self._pull_model_artifacts(symbol, expiry_key, manager)
+                result = self._load_best_model(symbol, expiry_key, manager)
+                if result is not None:
+                    model_map[(symbol, expiry_key)] = result
 
         logger.info(
             {
@@ -994,7 +1026,11 @@ class Pipeline:
                     return
 
             logger.info(
-                {"event": "RETRAIN_TRAINING_START", "symbol": symbol, "model_name": model_name}
+                {
+                    "event": "RETRAIN_TRAINING_START",
+                    "symbol": symbol,
+                    "model_name": model_name,
+                }
             )
             result = trainer.train(split)
             auc = result.metrics.get("auc", 0)
@@ -1025,12 +1061,22 @@ class Pipeline:
                 reloaded = await engine.reload_model()
                 if reloaded:
                     logger.info(
-                        {"event": "ENGINE_RELOADED", "symbol": symbol, "expiry_key": expiry_key}
+                        {
+                            "event": "ENGINE_RELOADED",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                        }
                     )
-                    status_store.add_event(f"Engine reloaded: {symbol}", event_type="info")
+                    status_store.add_event(
+                        f"Engine reloaded: {symbol}", event_type="info"
+                    )
                 else:
                     logger.warning(
-                        {"event": "ENGINE_RELOAD_FAILED", "symbol": symbol, "expiry_key": expiry_key}
+                        {
+                            "event": "ENGINE_RELOAD_FAILED",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                        }
                     )
                     status_store.add_event(
                         f"Engine reload failed: {symbol}", event_type="kill"
@@ -1047,12 +1093,18 @@ class Pipeline:
     ) -> None:
         try:
             max_rows: int | None = (
-                None if self._settings.train_on_full_history else self._settings.max_rf_rows
+                None
+                if self._settings.train_on_full_history
+                else self._settings.max_rf_rows
             )
             bars_df = storage.get_bars(symbol, timeframe="M1", max_rows=max_rows)
             if bars_df is None or bars_df.empty:
                 logger.warning(
-                    {"event": "RETRAIN_NO_DATA", "symbol": symbol, "message": "No bar data found, skipping"}
+                    {
+                        "event": "RETRAIN_NO_DATA",
+                        "symbol": symbol,
+                        "message": "No bar data found, skipping",
+                    }
                 )
                 return
 
@@ -1062,7 +1114,7 @@ class Pipeline:
 
             models_to_try = [
                 ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
-                ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
+                # ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),  # excluded: 4.67 GiB artifact breaks container boot
                 ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
                 ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
                 # These need to be fixed to work with AUC
@@ -1082,13 +1134,24 @@ class Pipeline:
 
             for model_name, trainer in models_to_try:
                 await self._train_model(
-                    model_name, trainer, split, symbol, expiry_key, manager, storage, first_boot
+                    model_name,
+                    trainer,
+                    split,
+                    symbol,
+                    expiry_key,
+                    manager,
+                    storage,
+                    first_boot,
                 )
 
             record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
             if record is None:
                 logger.warning(
-                    {"event": "RETRAIN_NO_BEST_MODEL", "symbol": symbol, "expiry_key": expiry_key}
+                    {
+                        "event": "RETRAIN_NO_BEST_MODEL",
+                        "symbol": symbol,
+                        "expiry_key": expiry_key,
+                    }
                 )
                 return
 
@@ -1116,7 +1179,9 @@ class Pipeline:
                     "error": str(exc),
                 }
             )
-            status_store.add_event(f"Retrain failed for {symbol}: {exc}", event_type="kill")
+            status_store.add_event(
+                f"Retrain failed for {symbol}: {exc}", event_type="kill"
+            )
 
     async def _retrain_scheduler(self, storage: Storage) -> None:
         """
@@ -1141,7 +1206,11 @@ class Pipeline:
         is_first_run: bool = True
 
         while not self._shutdown_requested:
-            await asyncio.sleep(_RETRAIN_CHECK_INTERVAL_S)
+            # First boot: run immediately without sleeping so missing models
+            # are trained as soon as engines are up. Subsequent cycles sleep
+            # for _RETRAIN_CHECK_INTERVAL_S (1 h) before re-checking.
+            if not is_first_run:
+                await asyncio.sleep(_RETRAIN_CHECK_INTERVAL_S)
 
             if self._shutdown_requested:
                 break
@@ -1154,10 +1223,20 @@ class Pipeline:
 
             first_boot = is_first_run
             if is_first_run:
-                logger.info({"event": "RETRAIN_FIRST_BOOT", "message": "Checking for missing models"})
+                logger.info(
+                    {
+                        "event": "RETRAIN_FIRST_BOOT",
+                        "message": "Checking for missing models",
+                    }
+                )
                 is_first_run = False
             else:
-                logger.info({"event": "RETRAIN_CYCLE_STARTED", "elapsed_seconds": round(elapsed, 1)})
+                logger.info(
+                    {
+                        "event": "RETRAIN_CYCLE_STARTED",
+                        "elapsed_seconds": round(elapsed, 1),
+                    }
+                )
                 status_store.add_event("Retrain cycle started", event_type="info")
 
             expiry_key: str | None = inv_map.get(self._settings.expiry_seconds)
@@ -1172,7 +1251,9 @@ class Pipeline:
                 continue
 
             for symbol in self._settings.pairs:
-                await self._retrain_symbol(symbol, expiry_key, storage, manager, engineer, first_boot)
+                await self._retrain_symbol(
+                    symbol, expiry_key, storage, manager, engineer, first_boot
+                )
 
             self._last_retrain_time = now
             logger.info(

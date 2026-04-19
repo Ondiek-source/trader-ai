@@ -308,15 +308,9 @@ def _parse_otc_pairs(raw: str) -> list[str]:
         if raw_symbol != correct_symbol:
             normalized_count += 1
 
-    if normalized_count > 0:
-        logger.info(
-            {
-                "event": "CONFIG_OTC_NORMALIZE",
-                "normalized_count": normalized_count,
-                "total_pairs": len(validated_pairs),
-            }
-        )
-
+    # NOTE: do not log here — _parse_otc_pairs is called from load_config()
+    # before logging is configured. Normalization count is visible in the
+    # validated pair list returned to the caller.
     return validated_pairs
 
 
@@ -554,21 +548,9 @@ class Config:
                 reason=f"Must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL",
             )
 
-        # Live mode warning
-        if not self.practice_mode:
-            logger.warning(
-                {
-                    "event": "CONFIG_LIVE_MODE",
-                    "message": "System configured for LIVE trading. Ensure you have reviewed all parameters and risk settings.",
-                }
-            )
-        else:
-            logger.info(
-                {
-                    "event": "CONFIG_PRACTICE_MODE",
-                    "message": "Signals will fire but treat results as simulation.",
-                }
-            )
+        # NOTE: do not log here — logging is not yet configured when __post_init__
+        # runs. main.py emits CONFIG_LIVE_MODE / CONFIG_PRACTICE_MODE after
+        # _configure_logging() so the event reaches the structured handler.
 
     @property
     def quotex_symbols(self) -> dict[str, str]:
