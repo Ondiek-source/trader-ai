@@ -174,9 +174,9 @@ class Pipeline:
                     "message": "Pipeline has started",
                 }
             )
-            self._storage = await self._stage_storage()
-            await self._stage_historian_sync(self._storage)
-            await self._stage_feature_warmup(self._storage)
+            self._storage = self._stage_storage()
+            await self._stage_historian_sync()
+            self._stage_feature_warmup(self._storage)
             model_map = await self._stage_model_load()
             await self._stage_ignition(model_map)
             await self._run_task_group()
@@ -253,7 +253,7 @@ class Pipeline:
 
     # ── Stage 1: Storage Link ─────────────────────────────────────────────────
 
-    async def _stage_storage(self) -> Storage:
+    def _stage_storage(self) -> Storage:
         """
         Construct and verify the Storage custodian.
 
@@ -285,7 +285,7 @@ class Pipeline:
 
     # ── Stage 2: Historian Sync ───────────────────────────────────────────────
 
-    async def _stage_historian_sync(self, storage: Storage) -> dict[str, int]:
+    async def _stage_historian_sync(self) -> dict[str, int]:
         """
         Fill the time gap since the last session for every backfill pair.
 
@@ -297,11 +297,6 @@ class Pipeline:
 
         A return value of 0 from backfill() means the data was already
         current (start_dt >= now_utc). This is not a failure.
-
-        Args:
-            storage: Stage 1 Storage instance (passed for audit context only —
-                        the Historian constructs its own internal Storage via
-                        get_historian() which shares the same singleton).
 
         Returns:
             dict[str, int]: Mapping of {symbol: bars_committed}.
@@ -338,7 +333,7 @@ class Pipeline:
 
     # ── Stage 3: Feature Warmup ───────────────────────────────────────────────
 
-    async def _stage_feature_warmup(self, storage: Storage) -> dict[str, int]:
+    def _stage_feature_warmup(self, storage: Storage) -> dict[str, int]:
         """
         Verify that each trading pair has enough bars for feature engineering.
 
@@ -751,6 +746,35 @@ class Pipeline:
 
     # ── Quotex status polling loop ────────────────────────────────────────────
 
+    def _update_connection_flags(
+        self,
+        connected: bool,
+        lost_logged: bool,
+        restored_logged: bool,
+    ) -> tuple[bool, bool]:
+        if not connected and not lost_logged:
+            status_store.add_event("Quotex not connected", event_type="kill")
+            return True, False
+        if connected and not restored_logged:
+            status_store.add_event("Quotex connected", event_type="info")
+            return False, True
+        return lost_logged, restored_logged
+
+    def _calc_elapsed_minutes(self, snapshot: dict) -> float:
+        try:
+            started_at = datetime.fromisoformat(snapshot["started_at"])
+            return (datetime.now(timezone.utc) - started_at).total_seconds() / 60
+        except Exception as exc:
+            logger.error(
+                {
+                    "event": "ELAPSED_TIME_CALC_ERROR",
+                    "error": str(exc),
+                    "snapshot_keys": list(snapshot.keys()),
+                    "function": "_quotex_status_loop",
+                }
+            )
+            return 0.0
+
     async def _quotex_status_loop(self) -> None:
         """
         Poll each engine's QuotexReader every 30 s and push live account
@@ -775,49 +799,27 @@ class Pipeline:
 
         while not self._shutdown_requested:
             try:
-                # Use the first engine's stream — all engines share the same
-                # Quotex account so one poll is sufficient.
                 stream = self._engines[0]._stream if self._engines else None
                 if stream is None or not hasattr(stream, "_connected"):
                     await asyncio.sleep(30)
                     continue
 
                 connected: bool = bool(getattr(stream, "_connected", False))
-
-                # Log connection state changes to dashboard
-                if not connected and not connection_lost_logged:
-                    status_store.add_event("Quotex not connected", event_type="kill")
-                    connection_lost_logged = True
-                    connection_restored_logged = False
-                elif connected and not connection_restored_logged:
-                    status_store.add_event("Quotex connected", event_type="info")
-                    connection_restored_logged = True
-                    connection_lost_logged = False
+                connection_lost_logged, connection_restored_logged = (
+                    self._update_connection_flags(
+                        connected, connection_lost_logged, connection_restored_logged
+                    )
+                )
 
                 balance: float = 0.0
                 pending: int = 0
-
                 if connected:
                     health = stream.health()
                     balance = health.get("balance", 0.0)
                     pending = health.get("pending_signals", 0)
 
                 snapshot = status_store.get()
-                try:
-                    started_at = datetime.fromisoformat(snapshot["started_at"])
-                    elapsed_minutes = (
-                        datetime.now(timezone.utc) - started_at
-                    ).total_seconds() / 60
-                except Exception as exc:
-                    logger.error(
-                        {
-                            "event": "ELAPSED_TIME_CALC_ERROR",
-                            "error": str(exc),
-                            "snapshot_keys": list(snapshot.keys()),
-                            "function": "_quotex_status_loop",
-                        }
-                    )
-                    elapsed_minutes = 0
+                elapsed_minutes = self._calc_elapsed_minutes(snapshot)
 
                 status_store.update(
                     {
@@ -830,12 +832,7 @@ class Pipeline:
                     }
                 )
             except Exception as exc:
-                logger.error(
-                    {
-                        "event": "QUOTEX_STATUS_POLL_ERROR",
-                        "error": str(exc),
-                    }
-                )
+                logger.error({"event": "QUOTEX_STATUS_POLL_ERROR", "error": str(exc)})
                 status_store.add_event(
                     f"Quotex status poll error: {exc}", event_type="kill"
                 )
@@ -967,6 +964,160 @@ class Pipeline:
 
     # ── Retrain Scheduler ─────────────────────────────────────────────────────
 
+    async def _train_model(
+        self,
+        model_name: str,
+        trainer: Any,
+        split: Any,
+        symbol: str,
+        expiry_key: str,
+        manager: ModelManager,
+        storage: Storage,
+        first_boot: bool,
+    ) -> None:
+        try:
+            if first_boot:
+                existing = await manager.pull_from_blob(
+                    symbol=symbol,
+                    expiry_key=expiry_key,
+                    model_name=f"{model_name}Trainer",
+                )
+                if existing:
+                    logger.info(
+                        {
+                            "event": "RETRAIN_MODEL_EXISTS",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "model_name": model_name,
+                        }
+                    )
+                    return
+
+            logger.info(
+                {"event": "RETRAIN_TRAINING_START", "symbol": symbol, "model_name": model_name}
+            )
+            result = trainer.train(split)
+            auc = result.metrics.get("auc", 0)
+            logger.info(
+                {
+                    "event": "RETRAIN_TRAINING_COMPLETE",
+                    "symbol": symbol,
+                    "model_name": model_name,
+                    "auc": round(auc, 4),
+                }
+            )
+            artifact_path = Path(manager.save(result))
+            storage.save_model(artifact_path, artifact_path.with_suffix(".json"))
+
+        except Exception as e:
+            logger.warning(
+                {
+                    "event": "RETRAIN_MODEL_FAILED",
+                    "symbol": symbol,
+                    "model_name": model_name,
+                    "error": str(e),
+                }
+            )
+
+    async def _reload_engines_for_symbol(self, symbol: str, expiry_key: str) -> None:
+        for engine in self._engines:
+            if engine.symbol == symbol and engine.expiry_key == expiry_key:
+                reloaded = await engine.reload_model()
+                if reloaded:
+                    logger.info(
+                        {"event": "ENGINE_RELOADED", "symbol": symbol, "expiry_key": expiry_key}
+                    )
+                    status_store.add_event(f"Engine reloaded: {symbol}", event_type="info")
+                else:
+                    logger.warning(
+                        {"event": "ENGINE_RELOAD_FAILED", "symbol": symbol, "expiry_key": expiry_key}
+                    )
+                    status_store.add_event(
+                        f"Engine reload failed: {symbol}", event_type="kill"
+                    )
+
+    async def _retrain_symbol(
+        self,
+        symbol: str,
+        expiry_key: str,
+        storage: Storage,
+        manager: ModelManager,
+        engineer: Any,
+        first_boot: bool,
+    ) -> None:
+        try:
+            max_rows: int | None = (
+                None if self._settings.train_on_full_history else self._settings.max_rf_rows
+            )
+            bars_df = storage.get_bars(symbol, timeframe="M1", max_rows=max_rows)
+            if bars_df is None or bars_df.empty:
+                logger.warning(
+                    {"event": "RETRAIN_NO_DATA", "symbol": symbol, "message": "No bar data found, skipping"}
+                )
+                return
+
+            feature_matrix = engineer.build_matrix(bars_df, symbol)
+            labels = Labeler(expiry_key=expiry_key).compute_labels(bars_df)
+            split = DataShaper().split(feature_matrix, labels, expiry_key)
+
+            models_to_try = [
+                ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
+                ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
+                ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
+                ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
+                # These need to be fixed to work with AUC
+                """ (
+                    "LSTM",
+                    LSTMTrainer(expiry_key=expiry_key),
+                ),
+                (
+                    "GRU",
+                    GRUTrainer(expiry_key=expiry_key),
+                ),
+                (
+                    "TCN",
+                    TCNTrainer(expiry_key=expiry_key),
+                ), """,
+            ]
+
+            for model_name, trainer in models_to_try:
+                await self._train_model(
+                    model_name, trainer, split, symbol, expiry_key, manager, storage, first_boot
+                )
+
+            record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
+            if record is None:
+                logger.warning(
+                    {"event": "RETRAIN_NO_BEST_MODEL", "symbol": symbol, "expiry_key": expiry_key}
+                )
+                return
+
+            logger.info(
+                {
+                    "event": "RETRAIN_COMPLETE",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "best_model": record.model_name,
+                    "auc": round(record.auc, 4),
+                }
+            )
+            status_store.add_event(
+                f"Retrain complete: {symbol} - {record.model_name} (AUC: {record.auc:.4f})",
+                event_type="info",
+            )
+            await self._reload_engines_for_symbol(symbol, expiry_key)
+
+        except Exception as exc:
+            logger.warning(
+                {
+                    "event": "RETRAIN_SYMBOL_FAILED",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "error": str(exc),
+                }
+            )
+            status_store.add_event(f"Retrain failed for {symbol}: {exc}", event_type="kill")
+
     async def _retrain_scheduler(self, storage: Storage) -> None:
         """
         Background loop that triggers periodic model retraining.
@@ -1001,23 +1152,12 @@ class Pipeline:
             if not is_first_run and elapsed < self._settings.model_retrain_interval:
                 continue
 
-            first_boot = is_first_run  # Snapshot before clearing
-
+            first_boot = is_first_run
             if is_first_run:
-                logger.info(
-                    {
-                        "event": "RETRAIN_FIRST_BOOT",
-                        "message": "Checking for missing models",
-                    }
-                )
+                logger.info({"event": "RETRAIN_FIRST_BOOT", "message": "Checking for missing models"})
                 is_first_run = False
             else:
-                logger.info(
-                    {
-                        "event": "RETRAIN_CYCLE_STARTED",
-                        "elapsed_seconds": round(elapsed, 1),
-                    }
-                )
+                logger.info({"event": "RETRAIN_CYCLE_STARTED", "elapsed_seconds": round(elapsed, 1)})
                 status_store.add_event("Retrain cycle started", event_type="info")
 
             expiry_key: str | None = inv_map.get(self._settings.expiry_seconds)
@@ -1032,178 +1172,7 @@ class Pipeline:
                 continue
 
             for symbol in self._settings.pairs:
-                try:
-                    # ── 1. Load bar data ──────────────────────────────────
-                    max_rows: int | None = (
-                        None
-                        if self._settings.train_on_full_history
-                        else self._settings.max_rf_rows
-                    )
-                    bars_df = storage.get_bars(
-                        symbol, timeframe="M1", max_rows=max_rows
-                    )
-                    if bars_df is None or bars_df.empty:
-                        logger.warning(
-                            {
-                                "event": "RETRAIN_NO_DATA",
-                                "symbol": symbol,
-                                "message": "No bar data found, skipping",
-                            }
-                        )
-                        continue
-
-                    # ── 2. Build feature matrix and labels ────────────────
-                    feature_matrix = engineer.build_matrix(bars_df, symbol)
-                    labeler = Labeler(expiry_key=expiry_key)
-                    labels = labeler.compute_labels(bars_df)
-
-                    # ── 3. Split and train ────────────────────────────────
-                    shaper = DataShaper()
-                    split = shaper.split(feature_matrix, labels, expiry_key)
-
-                    # List all models you want to train
-                    models_to_try = [
-                        ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
-                        ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
-                        ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
-                        ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
-                        # These need to be fixed to work with AUC
-                        """ (
-                            "LSTM",
-                            LSTMTrainer(expiry_key=expiry_key),
-                        ),
-                        (
-                            "GRU",
-                            GRUTrainer(expiry_key=expiry_key),
-                        ),
-                        (
-                            "TCN",
-                            TCNTrainer(expiry_key=expiry_key),
-                        ), """,
-                    ]
-
-                    for model_name, trainer in models_to_try:
-                        try:
-                            # First boot only: skip this model if a blob artifact
-                            # already exists. Scheduled retrains always run all models.
-
-                            if first_boot:
-                                existing = await manager.pull_from_blob(
-                                    symbol=symbol,
-                                    expiry_key=expiry_key,
-                                    model_name=f"{model_name}Trainer",
-                                )
-                                if existing:
-                                    logger.info(
-                                        {
-                                            "event": "RETRAIN_MODEL_EXISTS",
-                                            "symbol": symbol,
-                                            "expiry_key": expiry_key,
-                                            "model_name": model_name,
-                                        }
-                                    )
-                                    continue
-
-                            logger.info(
-                                {
-                                    "event": "RETRAIN_TRAINING_START",
-                                    "symbol": symbol,
-                                    "model_name": model_name,
-                                }
-                            )
-                            result = trainer.train(split)
-                            auc = result.metrics.get("auc", 0)
-                            logger.info(
-                                {
-                                    "event": "RETRAIN_TRAINING_COMPLETE",
-                                    "symbol": symbol,
-                                    "model_name": model_name,
-                                    "auc": round(auc, 4),
-                                }
-                            )
-
-                            # ── 4. Save artifact and push to Blob ─────────────────
-                            artifact_path = Path(manager.save(result))
-                            metadata_path = artifact_path.with_suffix(".json")
-                            storage.save_model(artifact_path, metadata_path)
-
-                        except Exception as e:
-                            logger.warning(
-                                {
-                                    "event": "RETRAIN_MODEL_FAILED",
-                                    "symbol": symbol,
-                                    "model_name": model_name,
-                                    "error": str(e),
-                                }
-                            )
-
-                    # ── 4. Delegate best model selection to registry ───────
-                    record = manager.get_best_model(
-                        symbol=symbol, expiry_key=expiry_key
-                    )
-                    if record is None:
-                        logger.warning(
-                            {
-                                "event": "RETRAIN_NO_BEST_MODEL",
-                                "symbol": symbol,
-                                "expiry_key": expiry_key,
-                            }
-                        )
-                        continue
-
-                    logger.info(
-                        {
-                            "event": "RETRAIN_COMPLETE",
-                            "symbol": symbol,
-                            "expiry_key": expiry_key,
-                            "best_model": record.model_name,
-                            "auc": round(record.auc, 4),
-                        }
-                    )
-                    status_store.add_event(
-                        f"Retrain complete: {symbol} - {record.model_name} (AUC: {record.auc:.4f})",
-                        event_type="info",
-                    )
-
-                    # ── 5. Hot-reload matching engines ────────────────────
-                    for engine in self._engines:
-                        if engine.symbol == symbol and engine.expiry_key == expiry_key:
-                            reloaded = await engine.reload_model()
-                            if reloaded:
-                                logger.info(
-                                    {
-                                        "event": "ENGINE_RELOADED",
-                                        "symbol": symbol,
-                                        "expiry_key": expiry_key,
-                                    }
-                                )
-                                status_store.add_event(
-                                    f"Engine reloaded: {symbol}", event_type="info"
-                                )
-                            else:
-                                logger.warning(
-                                    {
-                                        "event": "ENGINE_RELOAD_FAILED",
-                                        "symbol": symbol,
-                                        "expiry_key": expiry_key,
-                                    }
-                                )
-                                status_store.add_event(
-                                    f"Engine reload failed: {symbol}", event_type="kill"
-                                )
-
-                except Exception as exc:
-                    logger.warning(
-                        {
-                            "event": "RETRAIN_SYMBOL_FAILED",
-                            "symbol": symbol,
-                            "expiry_key": expiry_key,
-                            "error": str(exc),
-                        }
-                    )
-                    status_store.add_event(
-                        f"Retrain failed for {symbol}: {exc}", event_type="kill"
-                    )
+                await self._retrain_symbol(symbol, expiry_key, storage, manager, engineer, first_boot)
 
             self._last_retrain_time = now
             logger.info(

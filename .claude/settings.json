@@ -5,7 +5,8 @@
       "Read(//c/Users/Martin.Owaga.IMPAXAFRICA.000/.claude/**)",
       "Skill(sonarqube:integrate)",
       "Skill(sonarqube:integrate:*)",
-      "Bash(where sonar *)"
+      "Bash(where sonar *)",
+      "mcp__sonarqube__search_my_sonarqube_projects"
     ],
     "additionalDirectories": [
       "C:\\Users\\Martin.Owaga.IMPAXAFRICA.000\\.claude"
