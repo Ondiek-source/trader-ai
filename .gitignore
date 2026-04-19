@@ -1,6 +1,9 @@
 # Secrets — never commit
 .env
 deploy/azure.env
+env.txt
+session.json
+.mcp.json
 
 # Python
 __pycache__/
