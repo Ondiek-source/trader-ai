@@ -300,14 +300,17 @@ class ModelManager:
                 "artifact=None. Train the model before saving."
             )
 
-        timestamp: str = datetime.now(tz=timezone.utc).strftime(_TIMESTAMP_FMT)
         safe_symbol: str = result.symbol.replace("/", "_").replace(" ", "_")
-        base_name: str = (
-            f"{result.model_name}_{safe_symbol}_" f"{result.expiry_key}_{timestamp}"
-        )
+        base_name: str = f"{result.model_name}_{safe_symbol}_" f"{result.expiry_key}"
 
         artifact_path: Path = self._storage_dir / f"{base_name}{_ARTIFACT_SUFFIX}"
         metadata_path: Path = self._storage_dir / f"{base_name}{_METADATA_SUFFIX}"
+
+        # Delete old files if they exist
+        for p in (artifact_path, metadata_path):
+            if p.exists():
+                p.unlink()
+                logger.debug(f"[^] Removed old file: {p.name}")
 
         # Detect serialisation format from the artifact type.
         is_sb3: bool = self._is_sb3_model(result.artifact)
@@ -770,13 +773,16 @@ class ModelManager:
         model_name: str | None = None,
     ) -> str | None:
         """
-        Pull the latest matching model artifact from Azure Blob to local disk.
+        Pull the matching model artifact from Azure Blob to local disk.
 
         Called during container cold-start by pipeline.py before
         get_best_model() is invoked. Queries the Azure "models/" prefix
-        for the most recently uploaded artifact matching the symbol,
-        expiry_key, and optional model_name, then downloads both the
-        .artifact and .json sidecar to the local storage directory.
+        for the artifact matching the symbol, expiry_key, and optional
+        model_name, then downloads both the .artifact and .json sidecar
+        to the local storage directory.
+
+        Artifacts are overwritten in-place on each training run, so
+        exactly one blob per symbol/expiry/model combination is expected.
 
         In LOCAL mode this is a no-op and returns None — local files
         are already present on disk. In CLOUD mode, if no matching blob
@@ -833,9 +839,7 @@ class ModelManager:
                 logger.warning(warning_block)
                 return None
 
-            # Pick the most recently modified blob (last-modified timestamp).
-            latest_blob = max(artifact_blobs, key=lambda b: b.last_modified)
-            artifact_filename = Path(latest_blob.name).name
+            artifact_filename = Path(artifact_blobs[0].name).name
 
             local_path = self._storage.load_model(
                 artifact_filename=artifact_filename,

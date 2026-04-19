@@ -825,7 +825,7 @@ class Storage:
             artifact_filename: Filename of the artifact blob within the
                                ``models/`` prefix (e.g., ``"lstm_v3.pt"``).
                                The metadata sidecar is derived automatically
-                               as ``<stem>_metadata.json``.
+                               as ``<stem>.json``.
             local_dir:         Directory on disk where both files will be
                                written. Created automatically if absent.
                                Defaults to ``<project_root>/models/``.
@@ -853,7 +853,7 @@ class Storage:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         artifact_stem = Path(artifact_filename).stem
-        metadata_filename = f"{artifact_stem}_metadata.json"
+        metadata_filename = f"{artifact_stem}.json"
 
         try:
             for filename in (artifact_filename, metadata_filename):

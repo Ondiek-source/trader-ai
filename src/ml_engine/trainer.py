@@ -800,7 +800,6 @@ class XGBoostTrainer(BaseTrainer):
                 scale_pos_weight=spw,
                 early_stopping_rounds=self.early_stopping_rounds,
                 eval_metric="auc",
-                use_label_encoder=False,
                 verbosity=0,
             )
 
@@ -1527,7 +1526,7 @@ class LSTMTrainer(BaseTrainer):
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=False,
                 pin_memory=torch.cuda.is_available(),
             )
             val_loader = torch.utils.data.DataLoader(
@@ -1566,10 +1565,9 @@ class LSTMTrainer(BaseTrainer):
                 y_true=y_val_trimmed[: len(val_probs)],
                 y_prob=val_probs,
             )
-
+            logger.info("[LSTM] Final metrics: %s", metrics)
             logger.info(
                 "[^] LSTMTrainer: epochs_run=%d final_val_loss=%.6f",
-                "f[LSTM] Final metrics: {metrics}",
                 len(val_losses),
                 val_losses[-1] if val_losses else float("nan"),
             )
@@ -1728,7 +1726,7 @@ class GRUTrainer(LSTMTrainer):
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=False,
                 pin_memory=torch.cuda.is_available(),
             )
             val_loader = torch.utils.data.DataLoader(
@@ -1932,7 +1930,7 @@ class TCNTrainer(LSTMTrainer):
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=False,
                 pin_memory=torch.cuda.is_available(),
             )
             val_loader = torch.utils.data.DataLoader(
@@ -2067,7 +2065,7 @@ class CNNLSTMTrainer(LSTMTrainer):
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=False,
                 pin_memory=torch.cuda.is_available(),
             )
             val_loader = torch.utils.data.DataLoader(
@@ -2217,7 +2215,7 @@ class TransformerTrainer(LSTMTrainer):
             train_loader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=False,
                 pin_memory=torch.cuda.is_available(),
             )
             val_loader = torch.utils.data.DataLoader(
