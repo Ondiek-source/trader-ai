@@ -429,10 +429,15 @@ class Pipeline:
                 # 4b: Query registry for best artifact
                 record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
                 if record is None:
-                    raise PipelineError(
-                        f"No model found for {symbol} {expiry_key}",
-                        stage="model_load",
+                    logger.warning(
+                        {
+                            "event": "MODEL_NOT_FOUND",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "message": "No model found - retrain scheduler will train on first boot",
+                        }
                     )
+                    continue
 
                 # 4c: Skip PyTorch — requires architecture injection
                 if record.is_pytorch:

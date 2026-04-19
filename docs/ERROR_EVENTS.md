@@ -44,6 +44,7 @@
 - DAILY_REPORT_FAILED - Failed to send daily report
 - ENGINE_CRASHED - LiveEngine crashed
 - ENGINE_CRASHED_UNEXPECTED - LiveEngine crashed with unknown error
+- MODEL_NOT_FOUND - No model found in local folder or blob storage
 - RETRAIN_FIRST_BOOT - First boot checking for missing models
 - RETRAIN_CYCLE_STARTED - Scheduled retrain cycle began
 - RETRAIN_SKIPPED - Retrain skipped due to invalid expiry
