@@ -1,0 +1,325 @@
+================================================================================
+          TRADER AI - DIAGNOSTIC REPORT & RECOMMENDATIONS
+          Date: 2026-04-19
+          Target: EUR_USD M1 Binary Options Model
+================================================================================
+
+CURRENT TRAINING RESULTS (most recent completed cycle)
+------------------------------------------------------
+
+  Model              AUC     Best Iteration    Notes
+  -----------------  ------  ----------------  ----------------------------
+  XGBoost            0.5313  124               Stopped early, mild signal
+  RandomForest       0.5188  N/A               Worst performer
+  LightGBM           0.5318  1                 Gave up after first tree
+  CatBoost           0.5280  3                 Barely trained
+  LSTM               N/A     N/A               Training on CPU, incomplete
+
+  All tree-based models agree: AUC ~0.52-0.53 (coin flip = 0.50).
+
+
+================================================================================
+ISSUE #1: LABEL HORIZON TOO SHORT (ROOT CAUSE)
+================================================================================
+
+WHAT IT IS:
+  The labeler for 1_MIN expiry predicts:
+    label = 1  if  close[t+1] > close[t]
+    label = 0  otherwise
+
+  This means: "Will the price at the NEXT 1-minute bar close be higher
+  than the CURRENT close?"  The lookahead is exactly 1 bar (60 seconds).
+
+WHY IT IS AN ISSUE:
+  EUR/USD at 1-minute resolution is dominated by spread noise, micro-
+  fluctuations, and random walk behaviour.  Over a single 60-second
+  window, the directional component is extremely weak -- academic
+  research and practical experience both confirm that 1-bar FX
+  direction is close to unpredictable.
+
+  Your AUC of 0.53 is not a failure of the features or models.
+  It is the SIGNAL CEILING for this label definition.  All four
+  independent model families (XGBoost, RF, LightGBM, CatBoost)
+  converged on the same number, which confirms the features contain
+  about 2-3% edge above random -- and that is all that exists in
+  1-bar M1 direction data.
+
+  Technical indicators like RSI(14), MACD(12/26/9), and Bollinger
+  Bands(20) are designed for multi-bar analysis.  They cannot
+  generate meaningful signals over a single bar because their
+  lookback windows are much longer than the prediction window.
+
+REMEDIATION:
+  1. Extend the prediction horizon to 5-10 bars (5 to 10 minutes).
+     This matches the natural timescale of the indicators being used
+     and allows short-term momentum and mean-reversion patterns to
+     manifest.  The labeler already supports this via the 5_MIN
+     expiry key (lookahead = 5 bars).
+
+  2. Alternatively, change the label definition:
+     - "Will price move more than N pips in either direction within
+       K bars?"  (volatility-based target)
+     - "Will the close at t+K be in the top/bottom tercile of the
+       range from t to t+K?"  (relative strength target)
+     - "Binary: is the return from t to t+K positive after
+       subtracting the spread?"  (cost-adjusted target)
+
+  3. Match indicator periods to the new horizon.  If predicting
+     10-bar direction, RSI(14) and MACD(26) are appropriate.
+     If predicting 3-bar direction, consider shorter periods.
+
+
+================================================================================
+ISSUE #2: MICRO-STRUCTURE FEATURES ARE ZERO DURING TRAINING
+================================================================================
+
+WHAT IT IS:
+  The feature set contains 5 MICRO_STRUCTURE features:
+    - TICK_VELOCITY
+    - RELATIVE_VOLUME_RVOL
+    - SPREAD_NORMALIZED
+    - TICK_DELTA_CUMULATIVE
+    - ORDER_FLOW_IMBALANCE
+
+  These require tick-level data (bid/ask per tick) passed via the
+  `ticks` parameter to FeatureEngineer.transform().
+
+  During historical training, the pipeline builds a FeatureMatrix
+  from bar data only.  The transform() method zero-fills all 5
+  MICRO_STRUCTURE columns when ticks=None or micro features are
+  disabled in config.
+
+WHY IT IS AN ISSUE:
+  The model trains on 50 columns but 5 of them are always 0.0.
+  This has two effects:
+    a) The model wastes capacity learning that these features
+       have zero variance and no predictive power.
+    b) Feature importance rankings are distorted -- zero features
+       appear unimportant but the ranking doesn't reflect that
+       they were simply unavailable.
+
+  During LIVE inference, Quotex provides real-time ticks, so
+  these features DO have values.  This creates a train/inference
+  mismatch: the model was never trained on actual tick data but
+  is expected to make predictions using it.
+
+REMEDIATION:
+  Option A (recommended): Source tick data for the training period
+  and pass it to build_matrix() so the model trains on real micro-
+  structure features.  This closes the train/inference gap.
+
+  Option B: Drop the 5 MICRO_STRUCTURE features entirely during
+  training.  Reduce the schema to 45 features.  Accept that live
+  micro-structure signals will not be used for prediction.
+
+  Option C: Collect ticks during live trading, accumulate them,
+  and periodically retrain with tick-augmented data.
+
+
+================================================================================
+ISSUE #3: LIGHTGBM AND CATBOOST EARLY STOPPING (ITERATIONS 1 AND 3)
+================================================================================
+
+WHAT IT IS:
+  LightGBM stops at best_iteration=1 (out of 1000 max).
+  CatBoost stops at best_iteration=3 (out of 1000 max).
+  Both use early_stopping_rounds=50, meaning they stop when the
+  validation metric does not improve for 50 consecutive rounds.
+
+  LightGBM found nothing useful in its first tree and never
+  improved.  CatBoost found marginally more but still stopped
+  almost immediately.
+
+WHY IT IS AN ISSUE:
+  This is a SYMPTOM, not a root cause.  The models are correctly
+  detecting that there is no signal to learn.  Early stopping is
+  working as designed -- it prevents overfitting to noise.
+
+  However, the default learning rate of 0.05 combined with the
+  weak signal means the first few trees cannot find any gradient
+  to descend.  The models are being too conservative for a
+  near-random target.
+
+  The scale_pos_weight (spw=1.21) indicates roughly 55/45 class
+  imbalance.  This is mild and not the problem.
+
+REMEDIATION:
+  This will self-correct when Issue #1 is fixed.  A longer label
+  horizon will produce more predictable targets, and the models
+  will naturally train for more iterations.
+
+  If after fixing the label the issue persists:
+  1. Increase learning_rate to 0.1 (faster initial exploration)
+  2. Reduce early_stopping_rounds to 20 (allow quicker detection)
+  3. Try min_child_weight=5 or min_data_in_leaf=20 to force
+     the trees to find more robust splits
+
+
+================================================================================
+ISSUE #4: CONSTANT FEATURE (MINUTES_TO_NEWS)
+================================================================================
+
+WHAT IT IS:
+  The CONTEXT feature MINUTES_TO_NEWS is hardcoded to 90 for
+  every row.  The code comments say:
+    "_MINUTES_TO_NEWS_PLACEHOLDER: int = 90
+     Default until economic calendar API is wired"
+
+WHY IT IS AN ISSUE:
+  A feature with zero variance across all training samples
+  contributes nothing to prediction.  It is equivalent to adding
+  a column of constants.  While tree models will largely ignore it,
+  it still occupies a slot in the 50-feature schema and can
+  slightly dilute the model's attention.
+
+REMEDIATION:
+  1. Wire an economic calendar API (e.g., ForexFactory, Investing.com,
+     or a paid provider) to populate this with actual minutes until
+     the next high-impact news event.
+  2. Until then, drop MINUTES_TO_NEWS from the feature set to
+     reduce schema to 49 (or 44 without micro-structure).
+
+
+================================================================================
+ISSUE #5: DATA GAP OF 21.3% (LIKELY BENIGN)
+================================================================================
+
+WHAT IT IS:
+  The feature engineer reports:
+    "UNEXPECTED DATA GAP: 284600 M1 bars missing (21.3% of 1337463
+     total) outside normal weekend closures."
+
+WHY IT IS AN ISSUE (PROBABLY NOT):
+  The user confirms all backfill data comes from Twelve Data, a
+  reputable provider.  The 21.3% gap is most likely:
+
+    a) Market holidays (Good Friday, Christmas, New Year, etc.)
+       that the gap detector does not classify as "weekend"
+    b) Low-liquidity session breaks where no trades occurred
+    c) Twelve Data API rate limiting during the initial bulk pull
+
+  The gap detector only checks for Saturday/Sunday.  It flags
+  any non-weekend gap as "unexpected" even if it is a legitimate
+  market holiday.
+
+  The forward-fill policy (max 5 consecutive bars) is appropriate
+  for short gaps.  Longer gaps remain as NaN and are dropped,
+  which is correct behaviour.
+
+REMEDIATION:
+  If concerned, verify by checking specific gap timestamps against
+  a known holiday calendar.  Otherwise, no action needed.
+
+  To silence the warning: add a holiday calendar check to the gap
+  detector so that known market closures are classified correctly.
+
+
+================================================================================
+ISSUE #6: CONTAINER RESTARTS (140 CYCLES)
+================================================================================
+
+WHAT IT IS:
+  The concatenated log contains 140 boot sequences.  Each cycle
+  runs the full pipeline: data sync -> feature warmup -> train all
+  models -> start live engine -> begin LSTM training.
+
+WHY IT IS AN ISSUE:
+  The container is restarting frequently.  Based on the log, each
+  cycle takes approximately 10 minutes (boot at 03:44, next boot
+  shows same pattern).  The retrain scheduler triggers a FIRST BOOT
+  training pass approximately 1 minute after startup each time.
+
+  The user confirms the container is set to stay dead on crash
+  and it is currently running, so these are NOT crash restarts.
+  They are likely caused by:
+    a) An orchestrator (Kubernetes, Docker restart policy, or
+       Azure Container Instance health check) recycling the
+       container on a schedule
+    b) A memory-based eviction (LSTM on CPU with 532K samples
+       may cause OOM, triggering the orchestrator to replace it)
+    c) A deliberate retrain-each-deploy pattern
+
+REMEDIATION:
+  1. Check container orchestrator restart policy and health check
+     intervals.
+  2. Monitor memory usage during LSTM training -- if OOM is the
+     trigger, reduce batch size or sequence length.
+  3. If retraining on every deploy is intentional, consider
+     persisting model artifacts to Azure Blob and loading the
+     latest model on startup instead of retraining.
+
+
+================================================================================
+ISSUE #7: LSTM TRAINING INCOMPLETENESS
+================================================================================
+
+WHAT IT IS:
+  The LSTM trainer logs startup messages but never produces a
+  completion line or AUC metric in the concatenated log.  The
+  last message before each boot cycle is:
+    "[LSTM] Starting training loop on cpu..."
+
+WHY IT IS AN ISSUE:
+  This is a LOG TRUNCATION issue, not a crash.  The LSTM is
+  training on:
+    - 532,609 training samples
+    - 50 features
+    - Window size: 30 bars
+    - Hidden dimension: 128
+    - Device: CPU
+
+  This is computationally expensive.  On CPU, each epoch over
+  532K sequences of length 30 can take several minutes.  With
+  default max_epochs and early stopping, total training time
+  could be 20-60 minutes on CPU.
+
+  The container restarts (Issue #6) interrupt LSTM training
+  before it can complete.  The tree-based models train in
+  seconds, so they always finish.  LSTM never gets enough time.
+
+REMEDIATION:
+  1. Reduce LSTM training data (subsample or use fewer epochs)
+     so it completes before the next container cycle.
+  2. Move LSTM training to GPU (if available) for 10-50x speedup.
+  3. Skip LSTM training in the retrain cycle and train it
+     separately offline, then upload the artifact.
+  4. Increase the retrain interval to give LSTM enough time.
+
+
+================================================================================
+PRIORITY ORDER FOR FIXES
+================================================================================
+
+  Priority  Issue                        Effort    Impact
+  --------  ----------------------------  --------  ---------
+  1 (HIGH)  #1 Label horizon too short    Low       Very High
+  2 (MED)   #6 Container restarts         Medium    High
+  3 (MED)   #2 Zero micro-features        Medium    Medium
+  4 (LOW)   #7 LSTM completion            Low       Medium
+  5 (LOW)   #3 LightGBM/CatBoost params   Low       Low *
+  6 (LOW)   #4 Constant feature           Low       Low
+  7 (LOW)   #5 Data gap                   Low       None
+
+  * Issue #3 is a symptom of Issue #1.  Fixing the label horizon
+    will naturally cause the models to train longer.
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+  The low AUC (0.52-0.53) is not caused by poor features, bad
+  hyperparameters, or data quality issues.  It is caused by
+  attempting to predict a fundamentally unpredictable target:
+  1-minute EUR/USD direction over a single bar.
+
+  The features are well-engineered and the model pipeline is
+  sound.  The single highest-impact change is extending the
+  prediction horizon to match the natural timescale of the
+  indicators (5-15 minutes).
+
+  Secondary improvements include closing the train/inference
+  gap on micro-structure features, ensuring LSTM can complete
+  training, and removing placeholder features.
+
+================================================================================

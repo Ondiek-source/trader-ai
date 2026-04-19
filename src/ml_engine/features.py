@@ -75,30 +75,28 @@ _RESAMPLE_MAP: dict[str, str] = {"M1": "1min", "M5": "5min", "M15": "15min"}
 
 # Feature engineering schema version. Increment when the column set or
 # computation logic changes in a way that invalidates cached vectors.
-_VERSION: str = "3.1.0-full-binary"
+_VERSION: str = "3.3.0-full-binary"
 
 # ── Indicator Periods ───────────────────────────────────────────────────────
 # All look-back periods are defined here so they can be found and changed in
 # one place without hunting through the computation methods.
 
 # Momentum
-_RSI_PERIOD: int = 14  # Wilder RSI look-back
-_CCI_PERIOD: int = 14  # Commodity Channel Index look-back
-_MACD_FAST: int = 12  # MACD fast EMA span
-_MACD_SLOW: int = 26  # MACD slow EMA span — longest warmup period
-_MACD_SIGNAL_PERIOD: int = 9  # MACD signal EMA span
-_MOMENTUM_PERIOD: int = 10  # Classic momentum oscillator look-back
+_RSI_PERIOD: int = 5  # Wilder RSI look-back
+_CCI_PERIOD: int = 10  # Commodity Channel Index look-back
+_MACD_FAST: int = 6  # MACD fast EMA span
+_MACD_SLOW: int = 18  # MACD slow EMA span — longest warmup period
+_MACD_SIGNAL_PERIOD: int = 5  # MACD signal EMA span
+_MOMENTUM_PERIOD: int = 3  # Classic momentum oscillator look-back
 
 # Volatility
-_ATR_PERIOD: int = 14  # Wilder ATR look-back
-_BB_PERIOD: int = 20  # Bollinger Band SMA period
+_ATR_PERIOD: int = 5  # Wilder ATR look-back
+_BB_PERIOD: int = 10  # Bollinger Band SMA period
 _BB_MULTIPLIER: float = 2.0  # Bollinger Band standard-deviation width
 _KC_MULTIPLIER: float = 1.5  # Keltner Channel ATR width
 
 # Derived / gate thresholds
-_DERIVED_MA_PERIOD: int = (
-    20  # Rolling MA period for BB_WIDTH_MA_20 / ATR_14_MA_20 gates
-)
+_DERIVED_MA_PERIOD: int = 10  # Rolling MA period for BB_WIDTH_MA / ATR_MA gates
 
 # Gap-filling policy
 # Maximum consecutive M1 bars to forward-fill after a resample gap.
@@ -115,7 +113,7 @@ _MINUTES_TO_NEWS_PLACEHOLDER: int = 90  # Default until economic calendar API is
 
 FEATURE_SET_BINARY_OPTIONS_AI = {
     "MOMENTUM": [
-        "RSI_14",
+        "RSI",
         "MACD_VALUE",
         "MACD_SIGNAL",
         "MACD_HIST",
@@ -126,17 +124,18 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
         "RETURN_3",
         "RETURN_5",
         "MOMENTUM_OSCILLATOR",
-        "CCI_14",
+        "CCI",
     ],
     "VOLATILITY": [
-        "ATR_14",
+        "ATR",
         "BB_UPPER_DIST",
         "BB_LOWER_DIST",
         "BB_WIDTH",
         "BB_PERCENT_B",
         "KC_WIDTH",
-        "NATR_14",
+        "NATR",
         "RANGE_EXPANSION_RATIO",
+        "RELATIVE_VOLUME_RVOL",
     ],
     "PRICE_ACTION": [
         "BODY_TO_RANGE_RATIO",
@@ -157,7 +156,6 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
     ],
     "MICRO_STRUCTURE": [
         "TICK_VELOCITY",
-        "RELATIVE_VOLUME_RVOL",
         "SPREAD_NORMALIZED",
         "TICK_DELTA_CUMULATIVE",
         "ORDER_FLOW_IMBALANCE",
@@ -173,6 +171,10 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
         "DAY_OF_WEEK_COSINE",
         "MINUTES_TO_NEWS",
         "HOUR_OF_DAY_NORMALIZED",
+        "IS_GAP_OPEN",
+        "GAP_MINUTES",
+        "GAP_PIPS",
+        "IS_MONDAY_OPEN",
     ],
 }
 
@@ -188,14 +190,14 @@ TOP_WEIGHTED_FEATURES = [
     "BB_WIDTH",
     "ROC_5_ACCELERATION",
     "ENGULFING_BINARY",
-    "ATR_14_RATIO_CHANGE",
+    "ATR_RATIO_CHANGE",
     "THREE_BAR_SLOPE",
     "SPREAD_NORMALIZED",
 ]
 
 TRADE_ELIGIBILITY_GATES = [
-    "BB_WIDTH > BB_WIDTH_MA_20",
-    "ATR_14 > ATR_14_MA_20",
+    "BB_WIDTH > BB_WIDTH_MA",
+    "ATR > ATR_MA",
     "RVOL > 1.5",
     "SPREAD_NORMALIZED < 0.0005",
 ]
@@ -203,7 +205,7 @@ TRADE_ELIGIBILITY_GATES = [
 BINARY_EXPIRY_RULES = {
     "1_MIN": ["TICK_VELOCITY", "RVOL", "BODY_TO_RANGE_RATIO"],
     "5_MIN": ["ROC_5", "BB_WIDTH", "THREE_BAR_SLOPE"],
-    "15_MIN": ["MACD_HIST_SLOPE", "ATR_14", "SESSION_CONTEXT"],
+    "15_MIN": ["MACD_HIST_SLOPE", "ATR", "SESSION_CONTEXT"],
 }
 
 
@@ -718,7 +720,7 @@ class FeatureEngineer:
         Compute all MOMENTUM features.
 
         Features computed:
-            RSI_14, CCI_14, MACD_VALUE, MACD_SIGNAL, MACD_HIST,
+            RSI, CCI, MACD_VALUE, MACD_SIGNAL, MACD_HIST,
             ROC_5, ROC_10, ROC_20, RETURN_1, RETURN_3, RETURN_5,
             MOMENTUM_OSCILLATOR
         """
@@ -739,13 +741,13 @@ class FeatureEngineer:
         ).mean()
 
         rs = avg_gain / avg_loss.replace(0, _EPS)
-        fe["RSI_14"] = 100 - (100 / (1 + rs))
+        fe["RSI"] = 100 - (100 / (1 + rs))
 
         # ── CCI ──────────────────────────────────────────────────────────
         tp = (fe["high"] + fe["low"] + fe["close"]) / 3
         tp_mean = tp.rolling(_CCI_PERIOD).mean()
         tp_std = tp.rolling(_CCI_PERIOD).std().replace(0, _EPS)
-        fe["CCI_14"] = (tp - tp_mean) / (0.015 * tp_std)
+        fe["CCI"] = (tp - tp_mean) / (0.015 * tp_std)
 
         # ── MACD ─────────────────────────────────────────────────────────
         ema_fast = fe["close"].ewm(span=_MACD_FAST, adjust=False).mean()
@@ -782,8 +784,9 @@ class FeatureEngineer:
         Compute all VOLATILITY features.
 
         Features computed:
-            ATR_14, NATR_14, BB_WIDTH, BB_UPPER_DIST, BB_LOWER_DIST,
-            BB_PERCENT_B, KC_WIDTH, RANGE_EXPANSION_RATIO
+            ATR, NATR, BB_WIDTH, BB_UPPER_DIST, BB_LOWER_DIST,
+            BB_PERCENT_B, KC_WIDTH, RANGE_EXPANSION_RATIO,
+            RELATIVE_VOLUME_RVOL
         """
 
         # ── True Range & ATR ─────────────────────────────────────────────
@@ -796,10 +799,10 @@ class FeatureEngineer:
             axis=1,
         )
         tr = tr_components.max(axis=1)
-        fe["ATR_14"] = tr.ewm(
+        fe["ATR"] = tr.ewm(
             alpha=1 / _ATR_PERIOD, min_periods=_ATR_PERIOD, adjust=False
         ).mean()
-        fe["NATR_14"] = (fe["ATR_14"] / fe["close"].replace(0, _EPS)) * 100
+        fe["NATR"] = (fe["ATR"] / fe["close"].replace(0, _EPS)) * 100
 
         # ── Bollinger Bands ──────────────────────────────────────────────
         sma_bb = fe["close"].rolling(_BB_PERIOD).mean()
@@ -815,8 +818,8 @@ class FeatureEngineer:
 
         # ── Keltner Channels ─────────────────────────────────────────────
         ema_kc = fe["close"].ewm(span=_BB_PERIOD, adjust=False).mean()
-        kc_upper = ema_kc + _KC_MULTIPLIER * fe["ATR_14"]
-        kc_lower = ema_kc - _KC_MULTIPLIER * fe["ATR_14"]
+        kc_upper = ema_kc + _KC_MULTIPLIER * fe["ATR"]
+        kc_lower = ema_kc - _KC_MULTIPLIER * fe["ATR"]
         fe["KC_WIDTH"] = (kc_upper - kc_lower) / ema_kc.replace(0, _EPS)
 
         # ── Range Expansion Ratio ────────────────────────────────────────
@@ -824,6 +827,11 @@ class FeatureEngineer:
         current_range = fe["high"] - fe["low"]
         avg_range = current_range.rolling(_BB_PERIOD).mean().replace(0, _EPS)
         fe["RANGE_EXPANSION_RATIO"] = current_range / avg_range
+
+        # ── Relative Volume (RVOL) ───────────────────────────────────────
+        # Bar volume relative to its rolling average — detects volume surges.
+        vol_ma = fe["volume"].rolling(_BB_PERIOD).mean().replace(0, _EPS)
+        fe["RELATIVE_VOLUME_RVOL"] = fe["volume"] / vol_ma
 
         return fe
 
@@ -839,7 +847,7 @@ class FeatureEngineer:
         Compute all MICRO_STRUCTURE features from tick-level data.
 
         Features computed:
-            TICK_VELOCITY, RELATIVE_VOLUME_RVOL, SPREAD_NORMALIZED,
+            TICK_VELOCITY, SPREAD_NORMALIZED,
             TICK_DELTA_CUMULATIVE, ORDER_FLOW_IMBALANCE
 
         Args:
@@ -851,10 +859,6 @@ class FeatureEngineer:
         # Number of ticks per bar window (1-min resample)
         tick_counts = ticks["bid"].resample(target_freq).count()
         fe["TICK_VELOCITY"] = tick_counts.reindex(fe.index).fillna(0)
-
-        # ── Relative Volume (RVOL) ───────────────────────────────────────
-        vol_ma = fe["volume"].rolling(_BB_PERIOD).mean().replace(0, _EPS)
-        fe["RELATIVE_VOLUME_RVOL"] = fe["volume"] / vol_ma
 
         # ── Spread Normalized ────────────────────────────────────────────
         # Tick-level ask-bid spread averaged per bar, then normalised by close.
@@ -954,6 +958,30 @@ class FeatureEngineer:
         # API is integrated (see backlog BL-XX: news-feed integration).
         fe["MINUTES_TO_NEWS"] = _MINUTES_TO_NEWS_PLACEHOLDER
 
+        # ── Gap-Aware Features ───────────────────────────────────────────
+        # These describe the time gap between consecutive bars so the model
+        # learns that post-weekend / post-holiday bars are a different regime.
+        # No fabricated price data is needed — the gap itself is the signal.
+
+        time_deltas = fe.index.to_series().diff().dt.total_seconds().div(60)
+
+        # Flag: did this bar open after a gap longer than 2 minutes?
+        fe["IS_GAP_OPEN"] = (time_deltas > 2).astype(int)
+
+        # How many minutes was the gap? Capped at 1 week (10080 min) to
+        # prevent extreme outliers from distorting the model.
+        fe["GAP_MINUTES"] = time_deltas.clip(upper=10080).fillna(0)
+
+        # Price gap in pips (open vs previous close). Zero on non-gap bars.
+        prev_close = fe["close"].shift(1)
+        raw_gap_pips = (fe["open"] - prev_close).abs() / 0.0001
+        fe["GAP_PIPS"] = raw_gap_pips.where(fe["IS_GAP_OPEN"] == 1, other=0.0).fillna(0)
+
+        # Flag: Monday open (post-weekend regime — typically gappy and noisy)
+        fe["IS_MONDAY_OPEN"] = ((fe.index.dayofweek == 0) & (fe.index.hour < 4)).astype(
+            int
+        )
+
         return fe
 
     # ── 6. DERIVED (Gates + Top-Weighted + Expiry Helpers) ──────────────────
@@ -964,7 +992,7 @@ class FeatureEngineer:
         TRADE_ELIGIBILITY_GATES, and BINARY_EXPIRY_RULES.
 
         These are computed AFTER all primary groups so they can
-        reference ATR_14, BB_WIDTH, ROC_5, MACD_HIST, etc.
+        reference ATR, BB_WIDTH, ROC_5, MACD_HIST, etc.
         """
 
         # ── ROC_5 Acceleration ───────────────────────────────────────────
@@ -975,14 +1003,14 @@ class FeatureEngineer:
         else:
             fe["ROC_5_ACCELERATION"] = 0.0
 
-        # ── ATR_14 Ratio Change ──────────────────────────────────────────
-        # Percentage change in ATR_14 over _ATR_PERIOD bars — detects
+        # ── ATR Ratio Change ──────────────────────────────────────────
+        # Percentage change in ATR over _ATR_PERIOD bars — detects
         # volatility regime shifts (expansion / contraction transitions).
-        if "ATR_14" in fe.columns:
-            atr_prev: pd.Series = fe["ATR_14"].shift(_ATR_PERIOD).replace(0, _EPS)
-            fe["ATR_14_RATIO_CHANGE"] = (fe["ATR_14"] - atr_prev) / atr_prev
+        if "ATR" in fe.columns:
+            atr_prev: pd.Series = fe["ATR"].shift(_ATR_PERIOD).replace(0, _EPS)
+            fe["ATR_RATIO_CHANGE"] = (fe["ATR"] - atr_prev) / atr_prev
         else:
-            fe["ATR_14_RATIO_CHANGE"] = 0.0
+            fe["ATR_RATIO_CHANGE"] = 0.0
 
         # ── MACD Histogram Slope ─────────────────────────────────────────
         # Change in MACD_HIST over 3 bars — used in 15-min expiry rules.
@@ -1002,15 +1030,15 @@ class FeatureEngineer:
 
         # BB_WIDTH moving average — baseline for volatility gate
         if "BB_WIDTH" in fe.columns:
-            fe["BB_WIDTH_MA_20"] = fe["BB_WIDTH"].rolling(_DERIVED_MA_PERIOD).mean()
+            fe["BB_WIDTH_MA"] = fe["BB_WIDTH"].rolling(_DERIVED_MA_PERIOD).mean()
         else:
-            fe["BB_WIDTH_MA_20"] = 0.0
+            fe["BB_WIDTH_MA"] = 0.0
 
-        # ATR_14 moving average — baseline for range gate
-        if "ATR_14" in fe.columns:
-            fe["ATR_14_MA_20"] = fe["ATR_14"].rolling(_DERIVED_MA_PERIOD).mean()
+        # ATR moving average — baseline for range gate
+        if "ATR" in fe.columns:
+            fe["ATR_MA"] = fe["ATR"].rolling(_DERIVED_MA_PERIOD).mean()
         else:
-            fe["ATR_14_MA_20"] = 0.0
+            fe["ATR_MA"] = 0.0
 
         # ── Session Context (aggregate flag for 15-min expiry) ───────────
         session_cols = [
@@ -1037,10 +1065,10 @@ class FeatureEngineer:
         Evaluate TRADE_ELIGIBILITY_GATES against the latest feature row.
 
         A trade is eligible only if ALL four gates pass:
-            1. BB_WIDTH > BB_WIDTH_MA_20          (volatility expanding)
-            2. ATR_14 > ATR_14_MA_20              (range expanding)
-            3. RVOL > 1.5                         (volume surge)
-            4. SPREAD_NORMALIZED < 0.0005          (tight spread)
+            1. BB_WIDTH > BB_WIDTH_MA          (volatility expanding)
+            2. ATR > ATR_MA                    (range expanding)
+            3. RVOL > 1.5                      (volume surge)
+            4. SPREAD_NORMALIZED < 0.0005      (tight spread)
 
         Args:
             fe: Feature DataFrame (output of transform()).
@@ -1062,17 +1090,17 @@ class FeatureEngineer:
 
         # Gate 1: BB_WIDTH expanding
         bb_val = float(row.get("BB_WIDTH", 0))
-        bb_ma = float(row.get("BB_WIDTH_MA_20", _EPS))
-        gate_results["BB_WIDTH > BB_WIDTH_MA_20"] = bb_val > bb_ma
+        bb_ma = float(row.get("BB_WIDTH_MA", _EPS))
+        gate_results["BB_WIDTH > BB_WIDTH_MA"] = bb_val > bb_ma
         gate_values["BB_WIDTH"] = bb_val
-        gate_values["BB_WIDTH_MA_20"] = bb_ma
+        gate_values["BB_WIDTH_MA"] = bb_ma
 
         # Gate 2: ATR expanding
-        atr_val = float(row.get("ATR_14", 0))
-        atr_ma = float(row.get("ATR_14_MA_20", _EPS))
-        gate_results["ATR_14 > ATR_14_MA_20"] = atr_val > atr_ma
-        gate_values["ATR_14"] = atr_val
-        gate_values["ATR_14_MA_20"] = atr_ma
+        atr_val = float(row.get("ATR", 0))
+        atr_ma = float(row.get("ATR_MA", _EPS))
+        gate_results["ATR > ATR_MA"] = atr_val > atr_ma
+        gate_values["ATR"] = atr_val
+        gate_values["ATR_MA"] = atr_ma
 
         # Gate 3: Volume surge
         rvol_val = float(row.get("RVOL", 0))
