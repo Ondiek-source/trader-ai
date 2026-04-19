@@ -285,7 +285,7 @@ class QuotexReader:
 
         - Polls balance every BALANCE_POLL_INTERVAL seconds.
         - At expiry + RESULT_BUFFER_SECONDS, attempts to match a result
-          to each pending signal.
+            to each pending signal.
         - Puts matched results onto _result_queue.
         """
         balance_task: asyncio.Task[None] | None = None
@@ -410,44 +410,14 @@ class QuotexReader:
         self, signal_id: str, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         """
-        Try all strategies to resolve a trade result for this signal.
+        Try to resolve trade result for this signal.
 
-        Order:
-            1. Balance delta (fast, no API calls)
-            2. get_history() scan (matches asset + profitAmount)
-            3. get_result(id) for specific operation from history
         """
         signal = data["signal"]
         pair = signal.get("pair", "")
         direction = signal.get("direction", "UP")
         expiry_time = data["expiry_time"]
-        balance_before = data["balance_before"]
 
-        # ── Strategy 1: Balance delta (fast, no API calls) ─────────────────
-        current = await self._safe_get_balance()
-        delta = current - balance_before
-        self._balance = current  # always update
-        if abs(delta) > 0.001:
-            outcome = "win" if delta > 0 else "loss"
-            logger.info(
-                {
-                    "event": "result_from_balance_delta",
-                    "signal_id": signal_id,
-                    "pair": pair,
-                    "delta": round(delta, 4),
-                    "outcome": outcome,
-                }
-            )
-            return self._make_result(
-                signal_id,
-                pair,
-                direction,
-                outcome,
-                payout=abs(delta) if outcome == "win" else 0.0,
-                stake=abs(delta) if outcome == "loss" else 0.0,
-            )
-
-        # ── Strategy 2: get_history() scan ─────────────────────────────────
         history_result = await self._match_from_history(pair, direction, expiry_time)
         if history_result:
             return {
@@ -456,23 +426,8 @@ class QuotexReader:
                 "detection": "api_history",
             }
 
-        # ── Strategy 3: near-zero delta fallback = draw ────────────────────
-        # If balance hasn't moved at all after expiry + buffer, and history
-        # also found nothing, the most likely outcome is no trade occured e.g.
-        # autosignal didn't place the trade or quotex rejected or even < 75% payout.
-        if abs(delta) < 0.001 and not history_result:
-            logger.info(
-                {
-                    "event": "result_from_zero_delta",
-                    "signal_id": signal_id,
-                    "pair": pair,
-                    "expiry_time": expiry_time.isoformat(),
-                    "delta": round(delta, 6),
-                    "reason": "No trade found near expiry and balance unchanged",
-                }
-            )
-            # Return None - signal is dead, do NOT create a result
-            return None
+        # Return None - signal is dead, do NOT create a result
+        return None
 
     # ── History-based matching ─────────────────────────────────────────────────
 
@@ -495,13 +450,28 @@ class QuotexReader:
                 return None
 
             # Remove timezone for comparison
-            target_time = expiry_time.replace(tzinfo=None)
+            target_time = expiry_time.astimezone(timezone.utc).replace(tzinfo=None)
 
             # Find trade with close_time closest to target_time
             closest_trade = None
             smallest_diff = float("inf")
 
             for trade in history:
+                # --- 1. Asset must match this signal ---
+                trade_asset = trade.get("symbol")
+                if trade_asset is None:
+                    continue
+
+                if not self._assets_match(pair, trade_asset):
+                    continue
+
+                # --- 2. Direction must match (call/put) ---
+                command = trade.get("command")
+                trade_direction = "call" if int(command) == 1 else "put"
+
+                if trade_direction and trade_direction != direction.lower():
+                    continue
+
                 close_time_str = trade.get("close_time", "")
                 if not close_time_str:
                     continue
@@ -515,25 +485,38 @@ class QuotexReader:
                 # Calculate time difference in seconds
                 time_diff = abs((trade_time - target_time).total_seconds())
 
-                # Only consider trades within 60 seconds of expiry
-                if time_diff < 66 and time_diff < smallest_diff:
+                # Only consider trades within 6 seconds of expiry
+                if time_diff < 6 and time_diff < smallest_diff:
                     smallest_diff = time_diff
                     closest_trade = trade
 
             if not closest_trade:
                 logger.warning(
                     {
-                        "event": "no_trade_near_expiry",
+                        "event": "NO_TRADE_NEAR_EXPIRY",
                         "pair": pair,
+                        "direction": direction,
                         "expiry_time": expiry_time.isoformat(),
                     }
                 )
                 return None
 
             # Get profit from the closest trade
-            profit = float(
-                closest_trade.get("profitAmount", closest_trade.get("profit", 0))
-            )
+            profit_raw = closest_trade.get("profitAmount", closest_trade.get("profit"))
+
+            # --- 4. Never treat a missing profit field as 0 (draw) ---
+            if profit_raw is None:
+                logger.warning(
+                    {
+                        "event": "TRADE_PROFIT_MISSING",
+                        "pair": pair,
+                        "msg": "Likely trade did not go through",
+                        "ticket": closest_trade.get("ticket"),
+                    }
+                )
+                return None  # ← unknown result
+
+            profit = float(profit_raw)
 
             if profit > 0:
                 outcome = "win"
@@ -550,7 +533,7 @@ class QuotexReader:
 
             logger.info(
                 {
-                    "event": "quotex_history_match",
+                    "event": "QUOTEX_HISTORY_MATCH",
                     "pair": pair,
                     "profit": profit,
                     "outcome": outcome,
@@ -564,11 +547,16 @@ class QuotexReader:
                 "", pair, direction, outcome, payout=payout, stake=stake
             )
         except asyncio.TimeoutError:
-            logger.warning({"event": "quotex_history_timeout", "pair": pair})
+            logger.warning(
+                {
+                    "event": "QUOTEX_HISTORY_TIMEOUT",
+                    "pair": pair,
+                }
+            )
         except Exception as exc:
             logger.error(
                 {
-                    "event": "quotex_history_error",
+                    "event": "QUOTEX_HISTORY_ERROR",
                     "pair": pair,
                     "error": str(exc),
                     "error_type": type(exc).__name__,
@@ -576,6 +564,15 @@ class QuotexReader:
             )
 
         return None
+
+    def _assets_match(self, signal_pair: str, trade_asset: str) -> bool:
+        """
+        Normalise both sides to uppercase and strip before comparing.
+        """
+        if not trade_asset:
+            return False
+        normalise = lambda s: s.upper().strip()
+        return normalise(signal_pair) == normalise(trade_asset)
 
     # ── Result construction ────────────────────────────────────────────────────
 

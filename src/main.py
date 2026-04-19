@@ -12,12 +12,17 @@ This file handles exactly three things:
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
 import sys
-from datetime import datetime, timezone
+import json
+import asyncio
+import logging
 import traceback
+
+
+from core.config import get_settings
+from datetime import datetime, timezone
+from core.exceptions import TraderAIError, ConfigError, FatalError
+
 
 # ── JSON structured logging ────────────────────────────────────────────────────
 
@@ -25,10 +30,26 @@ import traceback
 class _JSONFormatter(logging.Formatter):
     """Formats log records as single-line JSON for structured log ingestion."""
 
+    def __init__(self, verbose_events: set[str]):
+        super().__init__()
+        self._verbose_events = verbose_events
+        self._minimal_mode = len(self._verbose_events) == 0
+        # Always allow these critical events even in minimal mode
+        self._critical_events = {"BOOT", "SHUTDOWN", "FATAL_CRASH"}
+
     def format(self, record: logging.LogRecord) -> str:
         msg: str = record.getMessage()
         try:
             payload: dict = json.loads(msg) if msg.startswith("{") else {"message": msg}
+            event = payload.get("event")
+            if self._minimal_mode:
+                # Minimal mode: only log critical events
+                if event not in self._critical_events:
+                    return ""  # ← RETURN EMPTY STRING TO SKIP LOGGING
+            else:
+                # Verbose mode: only log events explicitly listed
+                if event and event not in self._verbose_events:
+                    return ""
         except (json.JSONDecodeError, ValueError):
             payload = {"message": msg}
 
@@ -43,13 +64,14 @@ class _JSONFormatter(logging.Formatter):
         return json.dumps(entry)
 
 
-def _configure_logging() -> None:
+def _configure_logging(verbose_events: set[str], log_level: str) -> None:
     """Set up root logger with JSON formatter and suppress noisy SDKs."""
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_JSONFormatter())
+    handler.setFormatter(_JSONFormatter(verbose_events))
 
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root.setLevel(level)
     root.handlers.clear()
     root.addHandler(handler)
 
@@ -60,8 +82,16 @@ def _configure_logging() -> None:
         "azure.storage.blob",
         "urllib3",
         "pyquotex.ws.client",
+        "websockets.client",
+        "websockets.server",
+        "asyncio",
+        "charset_normalizer",
+        "PIL",
+        "matplotlib",
+        "numexpr",
+        "numba",
     ):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        logging.getLogger(name).disabled = True
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -77,14 +107,59 @@ async def _run() -> None:
 
 def main() -> None:
     """CLI entry point. Configures logging, runs the async pipeline."""
-    _configure_logging()
+    try:
+        config = get_settings()
+
+        # Parse verbose events from config
+        verbose_events = set()
+        if config.log_verbose_events:
+            verbose_events = set(
+                e.strip() for e in config.log_verbose_events.split(",") if e.strip()
+            )
+
+        _configure_logging(verbose_events, config.log_level)
+
+    except ConfigError as e:
+        # Config errors are fatal at startup - always log them
+        print(
+            json.dumps(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "CRITICAL",
+                    "component": "main",
+                    "event": e.event,
+                    "error": e.message,
+                    "type": e.__class__.__name__,
+                }
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    except Exception as e:
+        # Unknown error during config load
+        print(
+            json.dumps(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": "CRITICAL",
+                    "component": "main",
+                    "event": "CONFIG_LOAD_FAILED",
+                    "error": str(e),
+                    "type": type(e).__name__,
+                }
+            ),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     logger = logging.getLogger("main")
 
     try:
-        logger.info({"event": "boot", "message": "Trader AI starting"})
+        logger.info({"event": "BOOT", "message": "Trader AI starting"})
         asyncio.run(_run())
     except KeyboardInterrupt:
-        logger.info({"event": "shutdown", "message": "KeyboardInterrupt"})
+        logger.info({"event": "SHUTDOWN", "message": "KeyboardInterrupt"})
     except SystemExit:
         # Force flush to stderr BEFORE exit
         traceback.print_exc(file=sys.stderr)
@@ -92,7 +167,7 @@ def main() -> None:
         raise
     except Exception as exc:
         logger.critical(
-            {"event": "fatal_crash", "error": str(exc), "type": type(exc).__name__},
+            {"event": "FATAL_CRASH", "error": str(exc), "type": type(exc).__name__},
             exc_info=True,
         )
         # Force flush to stderr BEFORE exit

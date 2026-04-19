@@ -58,11 +58,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from trading.reporter import Reporter
 from core.config import get_settings
+from core.exceptions import PipelineError, NotificationError
+from core.dashboard import status_store, run_dashboard
 from data.historian import Historian, HistorianError, get_historian
 from data.storage import Storage, StorageError, get_storage
+from engine.live import LiveEngine, LiveEngineError
 from ml_engine.features import FeatureEngineerError, get_feature_engineer
 from ml_engine.model_manager import ModelManager
+from ml_engine.labeler import Labeler
+
 from ml_engine.trainer import (
     DataShaper,
     XGBoostTrainer,
@@ -73,8 +79,7 @@ from ml_engine.trainer import (
     LightGBMTrainer,
     LSTMTrainer,
 )
-from ml_engine.labeler import Labeler
-from engine.live import LiveEngine, LiveEngineError
+
 
 # How many seconds before midnight (UTC) to fire the daily report.
 _DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
@@ -102,29 +107,6 @@ _EXPIRY_KEY_MAP: dict[str, int] = {
 
 # Inverse map: seconds -> expiry key. Derived once at module load.
 _SECONDS_TO_EXPIRY_KEY: dict[int, str] = {v: k for k, v in _EXPIRY_KEY_MAP.items()}
-
-
-# ── Custom Exception ──────────────────────────────────────────────────────────
-
-
-class PipelineError(Exception):
-    """
-    Raised when a critical stage of the boot sequence fails.
-
-    Propagates to main.py which logs it and exits. Detailed diagnostic
-    logging is always emitted by the stage method before raising so the
-    operator sees exactly which stage and component failed.
-
-    Attributes:
-        stage: The boot stage that failed, e.g. "storage", "historian_sync".
-    """
-
-    def __init__(self, message: str, stage: str = "") -> None:
-        super().__init__(message)
-        self.stage = stage
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"PipelineError(stage={self.stage!r}, message={str(self)!r})"
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -186,6 +168,12 @@ class Pipeline:
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
 
         try:
+            logger.info(
+                {
+                    "event": "PIPELINE_STARTUP_INITIATED",
+                    "message": "Pipeline has started",
+                }
+            )
             self._storage = await self._stage_storage()
             await self._stage_historian_sync(self._storage)
             await self._stage_feature_warmup(self._storage)
@@ -194,29 +182,16 @@ class Pipeline:
             await self._run_task_group()
 
         except PipelineError:
-            raise  # Detailed logging already emitted by the stage method.
-
-        except Exception as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"PIPELINE UNHANDLED CRASH\n"
-                f"Error: {exc}\n\n"
-                f"CONTEXT: An unexpected exception bypassed all stage-level\n"
-                f"guards. This is likely a bug in a module imported by the\n"
-                f"pipeline rather than in the boot sequence itself.\n"
-                f"\nFIX: Review the full stack trace above. Verify that all\n"
-                f"module imports resolve correctly and no __init__ methods\n"
-                f"raise outside the expected exception hierarchy.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            # Already has proper event - just propagate to main.py
             raise
 
+        except Exception as exc:
+            raise PipelineError(
+                message=f"An Unhandled pipeline crash occured: {exc}", stage="unknown"
+            ) from exc
+
         finally:
-            logger.info(
-                "[^] Pipeline.run() exiting — symbol=%s",
-                self._settings.pairs,
-            )
+            logger.info({"event": "PIPELINE_EXIT", "symbols": self._settings.pairs})
 
     async def stop(self) -> None:
         """
@@ -230,7 +205,12 @@ class Pipeline:
             return
 
         self._shutdown_requested = True
-        logger.info("[^] Pipeline.stop(): shutdown initiated.")
+        logger.info(
+            {
+                "event": "PIPELINE_SHUTDOWN_INITIATED",
+                "message": "Pipeline stopping gracefully",
+            }
+        )
 
         for engine in self._engines:
             engine.stop()
@@ -241,13 +221,17 @@ class Pipeline:
 
         # Push stopped state to dashboard
         try:
-            from core.dashboard import status_store
-
             snapshot = status_store.get()
             status_store.update(
                 {
                     "stopped": True,
                     "session": {**snapshot.get("session", {}), "is_active": False},
+                }
+            )
+            logger.info(
+                {
+                    "event": "DASHBOARD_UPDATED_SHUTDOWN",
+                    "message": "Status store updated with is active flag false and stopped true.",
                 }
             )
         except Exception:
@@ -260,7 +244,12 @@ class Pipeline:
             except Exception:
                 pass
 
-        logger.info("[^] Pipeline.stop(): all engines stopped, all tasks cancelled.")
+        logger.info(
+            {
+                "event": "SHUTDOWN_COMPLETE",
+                "message": "All engines stopped, all tasks cancelled",
+            }
+        )
 
     # ── Stage 1: Storage Link ─────────────────────────────────────────────────
 
@@ -281,32 +270,17 @@ class Pipeline:
         """
         try:
             storage = get_storage()
-            info_block = (
-                f"\n{'+' * 60}\n"
-                f"STAGE 1 COMPLETE: STORAGE LINKED\n"
-                f"Data mode : {self._settings.data_mode}\n"
-                f"Data dir  : {self._settings.data_dir}\n"
-                f"{'+' * 60}"
+            logger.info(
+                {
+                    "event": "STAGE_COMPLETE",
+                    "stage": "storage",
+                    "data_mode": self._settings.data_mode,
+                    "data_dir": self._settings.data_dir,
+                }
             )
-            logger.info(info_block)
             return storage
 
         except StorageError as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"PIPELINE STAGE 1 FAILURE: STORAGE LINK\n"
-                f"Error     : {exc}\n"
-                f"Data mode : {self._settings.data_mode}\n"
-                f"Data dir  : {self._settings.data_dir}\n\n"
-                f"CONTEXT: Storage is the foundation of every downstream component.\n"
-                f"Without it no bar data can be read, no features computed, and\n"
-                f"no model loaded. This failure is unrecoverable.\n"
-                f"\nFIX: Check disk permissions and available disk space.\n"
-                f"If DATA_MODE=CLOUD, verify AZURE_STORAGE_CONN in .env and\n"
-                f"confirm the container '{self._settings.container_name}' exists.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
             raise PipelineError(str(exc), stage="storage") from exc
 
     # ── Stage 2: Historian Sync ───────────────────────────────────────────────
@@ -343,39 +317,23 @@ class Pipeline:
                 count: int = await historian.backfill(symbol)
                 results[symbol] = count
                 logger.info(
-                    "[^] Stage 2 sync: symbol=%s bars_committed=%d",
-                    symbol,
-                    count,
+                    {
+                        "event": "HISTORIAN_SYNC",
+                        "symbol": symbol,
+                        "bars_committed": count,
+                    }
                 )
 
             except HistorianError as exc:
-                error_block = (
-                    f"\n{'!' * 60}\n"
-                    f"PIPELINE STAGE 2 FAILURE: HISTORIAN SYNC\n"
-                    f"Symbol : {symbol}\n"
-                    f"Error  : {exc}\n\n"
-                    f"CONTEXT: The gap backfill failed for this symbol. A time-gap\n"
-                    f"in M1 bars silently corrupts every rolling indicator (RSI 14,\n"
-                    f"MACD 26, ATR 14, BB 20) for the next 26 bars after the gap.\n"
-                    f"The model will generate confident but wrong signals with no\n"
-                    f"error raised. Aborting is safer than trading on corrupted\n"
-                    f"features.\n"
-                    f"\nFIX: Check TWELVEDATA_API_KEY in .env. Verify network\n"
-                    f"connectivity to api.twelvedata.com. If the provider is down,\n"
-                    f"restart the pipeline when connectivity is restored. Do NOT\n"
-                    f"set ALLOW_STALE_MODELS=True — that solves a different problem.\n"
-                    f"{'!' * 60}"
-                )
-                logger.critical(error_block)
                 raise PipelineError(str(exc), stage="historian_sync") from exc
 
-        info_block = (
-            f"\n{'+' * 60}\n"
-            f"STAGE 2 COMPLETE: HISTORIAN SYNC\n"
-            f"Results: {results}\n"
-            f"{'+' * 60}"
+        logger.info(
+            {
+                "event": "STAGE_COMPLETE",
+                "stage": "historian_sync",
+                "results": results,
+            }
         )
-        logger.info(info_block)
         return results
 
     # ── Stage 3: Feature Warmup ───────────────────────────────────────────────
@@ -407,27 +365,8 @@ class Pipeline:
             bar_count: int = len(bars_df) if bars_df is not None else 0
 
             if bar_count < 30:
-                error_block = (
-                    f"\n{'!' * 60}\n"
-                    f"PIPELINE STAGE 3 FAILURE: INSUFFICIENT BARS FOR WARMUP\n"
-                    f"Symbol    : {symbol}\n"
-                    f"Available : {bar_count}\n"
-                    f"Required  : 30\n\n"
-                    f"CONTEXT: The FeatureEngineer requires a minimum of 30 M1 bars\n"
-                    f"to compute rolling indicators (MACD slow span = 26 bars) without\n"
-                    f"producing NaN values. Starting the LiveEngine with fewer bars\n"
-                    f"causes FeatureEngineerErrors on every tick for the first 30\n"
-                    f"minutes of live data.\n"
-                    f"\nFIX: Stage 2 (historian sync) should have filled this gap.\n"
-                    f"If this error appears after a successful Stage 2, the bar data\n"
-                    f"for {symbol} may be corrupted. Delete the Parquet file at\n"
-                    f"data/processed/{symbol}_M1.parquet and restart to trigger a\n"
-                    f"full backfill.\n"
-                    f"{'!' * 60}"
-                )
-                logger.critical(error_block)
                 raise PipelineError(
-                    f"Insufficient bars for {symbol}: {bar_count}/30",
+                    f"Insufficient bars for {symbol}: {bar_count}/30 required",
                     stage="feature_warmup",
                 )
 
@@ -440,31 +379,15 @@ class Pipeline:
                 results[symbol] = bar_count
 
             except FeatureEngineerError as exc:
-                error_block = (
-                    f"\n{'!' * 60}\n"
-                    f"PIPELINE STAGE 3 FAILURE: FEATURE TRANSFORMATION ERROR\n"
-                    f"Symbol : {symbol}\n"
-                    f"Bars   : {bar_count}\n"
-                    f"Error  : {exc}\n\n"
-                    f"CONTEXT: The smoke-test transform() call failed on the warmup\n"
-                    f"bars. This indicates a schema mismatch between the stored bar\n"
-                    f"data and the FeatureEngineer's expected column layout, or a\n"
-                    f"feature flag configuration that produces an incomplete schema.\n"
-                    f"\nFIX: Verify that all FEAT_*_ENABLED flags in .env are True.\n"
-                    f"Check the bar data schema via storage.get_bars() in a REPL.\n"
-                    f"If the Parquet file is corrupted, delete and re-run backfill.\n"
-                    f"{'!' * 60}"
-                )
-                logger.critical(error_block)
                 raise PipelineError(str(exc), stage="feature_warmup") from exc
 
-        info_block = (
-            f"\n{'+' * 60}\n"
-            f"STAGE 3 COMPLETE: FEATURE WARMUP VERIFIED\n"
-            f"Results: {results}\n"
-            f"{'+' * 60}"
+        logger.info(
+            {
+                "event": "STAGE_COMPLETE",
+                "stage": "feature_warmup",
+                "results": results,
+            }
         )
-        logger.info(info_block)
         return results
 
     # ── Stage 4: Model Load ───────────────────────────────────────────────────
@@ -474,17 +397,14 @@ class Pipeline:
         Pull model artifacts from Blob and load them into memory.
 
         For each (symbol, expiry_key) pair: attempts a cold-start Blob pull,
-        queries the registry for the best current-version artifact, and loads
-        it. PyTorch artifacts are skipped with a warning — they require
-        architecture injection which pipeline.py defers to a future iteration.
-        Missing models put the engine in SKIP-only mode rather than aborting.
+        queries the registry for the best current-version artifact, and loads it.
 
         Returns:
             dict keyed by (symbol, expiry_key) -> (model_artifact, ModelRecord).
             Pairs with no available model are absent from the dict.
 
         Raises:
-            Nothing — Stage 4 never aborts. All failures degrade to SKIP mode.
+            PipelineError: If no model found for any symbol/expiry pair.
         """
         manager = ModelManager(storage_dir=self._settings.model_dir)
         model_map: dict[tuple[str, str], Any] = {}
@@ -498,50 +418,25 @@ class Pipeline:
                 )
                 if pulled:
                     logger.info(
-                        "[^] Stage 4 cold-start: restored %s %s -> %s",
-                        symbol,
-                        expiry_key,
-                        pulled,
+                        {
+                            "event": "MODEL_PULLED_TO_LOCAL_DISK",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "artifact": pulled,
+                        }
                     )
 
                 # 4b: Query registry for best artifact
                 record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
                 if record is None:
-                    warning_block = (
-                        f"\n{'%' * 60}\n"
-                        f"PIPELINE STAGE 4 WARNING: NO MODEL FOUND\n"
-                        f"Symbol     : {symbol}\n"
-                        f"Expiry key : {expiry_key}\n\n"
-                        f"CONTEXT: No trained model artifact was found for this\n"
-                        f"symbol/expiry combination. The LiveEngine for this pair\n"
-                        f"will boot in SKIP-only mode — all signals will be SKIP\n"
-                        f"until a model is trained and loaded via the retrain\n"
-                        f"scheduler or a manual training pass.\n"
-                        f"\nFIX: Run a training pass via the retrain scheduler or\n"
-                        f"manually trigger XGBoostTrainer for {symbol} {expiry_key}.\n"
-                        f"{'%' * 60}"
+                    raise PipelineError(
+                        f"No model found for {symbol} {expiry_key}",
+                        stage="model_load",
                     )
-                    logger.warning(warning_block)
-                    continue
 
                 # 4c: Skip PyTorch — requires architecture injection
                 if record.is_pytorch:
-                    warning_block = (
-                        f"\n{'%' * 60}\n"
-                        f"PIPELINE STAGE 4 WARNING: PYTORCH INJECTION DEFERRED\n"
-                        f"Symbol     : {symbol}\n"
-                        f"Expiry key : {expiry_key}\n"
-                        f"Model      : {record.model_name}\n\n"
-                        f"CONTEXT: PyTorch model artifacts require a pre-instantiated\n"
-                        f"nn.Module architecture to be provided at load time.\n"
-                        f"Pipeline-level PyTorch injection is not yet implemented.\n"
-                        f"The engine will use SignalGenerator.reload() which handles\n"
-                        f"Classical ML and SB3 models automatically.\n"
-                        f"\nFIX: Implement PyTorch architecture resolution in\n"
-                        f"pipeline._stage_model_load() when required.\n"
-                        f"{'%' * 60}"
-                    )
-                    logger.warning(warning_block)
+                    # TODO
                     continue
 
                 # 4d: Load artifact into memory
@@ -549,39 +444,28 @@ class Pipeline:
                     model = manager.load(record.artifact_path)
                     model_map[(symbol, expiry_key)] = (model, record)
                     logger.info(
-                        "[^] Stage 4 loaded: symbol=%s expiry=%s model=%s auc=%.4f",
-                        symbol,
-                        expiry_key,
-                        record.model_name,
-                        record.auc,
+                        {
+                            "event": "MODEL_LOADED",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "model_name": record.model_name,
+                            "auc": record.auc,
+                        }
                     )
 
                 except Exception as exc:
-                    warning_block = (
-                        f"\n{'%' * 60}\n"
-                        f"PIPELINE STAGE 4 WARNING: ARTIFACT LOAD FAILED\n"
-                        f"Symbol     : {symbol}\n"
-                        f"Expiry key : {expiry_key}\n"
-                        f"Artifact   : {record.artifact_path}\n"
-                        f"Error      : {exc}\n\n"
-                        f"CONTEXT: The artifact exists in the registry but could not\n"
-                        f"be deserialised. The engine will boot in SKIP-only mode\n"
-                        f"for this pair.\n"
-                        f"\nFIX: Verify the artifact file is not corrupted. Check\n"
-                        f"model_manager.validate_metadata() for the sidecar. Retrain\n"
-                        f"if the artifact is unrecoverable.\n"
-                        f"{'%' * 60}"
-                    )
-                    logger.warning(warning_block)
+                    raise PipelineError(
+                        f"Failed to load model artifact for {symbol} {expiry_key}: {exc}",
+                        stage="model_load",
+                    ) from exc
 
-        info_block = (
-            f"\n{'+' * 60}\n"
-            f"STAGE 4 COMPLETE: MODELS LOADED\n"
-            f"Loaded : {len(model_map)} artifact(s)\n"
-            f"Pairs  : {list(model_map.keys())}\n"
-            f"{'+' * 60}"
+        logger.info(
+            {
+                "event": "STAGE_COMPLETE",
+                "stage": "model_load",
+                "models_loaded": len(model_map),
+            }
         )
-        logger.info(info_block)
         return model_map
 
     # ── Stage 5: Ignition ─────────────────────────────────────────────────────
@@ -609,27 +493,15 @@ class Pipeline:
 
         Raises:
             PipelineError: If expiry_seconds does not map to a known key,
-                           or if any LiveEngine construction fails.
+                            or if any LiveEngine construction fails.
         """
         expiry_seconds: int = self._settings.expiry_seconds
         expiry_key: str | None = _SECONDS_TO_EXPIRY_KEY.get(expiry_seconds)
 
         if expiry_key is None:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"PIPELINE STAGE 5 FAILURE: INVALID EXPIRY SECONDS\n"
-                f"EXPIRY_SECONDS : {expiry_seconds}\n"
-                f"Valid values   : {sorted(_SECONDS_TO_EXPIRY_KEY.keys())}\n\n"
-                f"CONTEXT: The configured EXPIRY_SECONDS value does not map to a\n"
-                f"known expiry key. This should have been caught by config\n"
-                f"validation at boot. Check that VALID_EXPIRIES in config.py\n"
-                f"matches _EXPIRY_KEY_MAP in pipeline.py.\n"
-                f"\nFIX: Set EXPIRY_SECONDS to 60, 300, or 900 in .env.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
             raise PipelineError(
-                f"EXPIRY_SECONDS={expiry_seconds} has no expiry_key mapping.",
+                f"EXPIRY_SECONDS={expiry_seconds} has no expiry_key mapping. "
+                f"Valid values: {sorted(_SECONDS_TO_EXPIRY_KEY.keys())}",
                 stage="ignition",
             )
 
@@ -638,21 +510,6 @@ class Pipeline:
                 engine = await LiveEngine.create(symbol, expiry_key)
 
             except LiveEngineError as exc:
-                error_block = (
-                    f"\n{'!' * 60}\n"
-                    f"PIPELINE STAGE 5 FAILURE: ENGINE CONSTRUCTION\n"
-                    f"Symbol     : {symbol}\n"
-                    f"Expiry key : {expiry_key}\n"
-                    f"Error      : {exc}\n\n"
-                    f"CONTEXT: LiveEngine could not be constructed for this symbol.\n"
-                    f"The most likely cause is a stream construction failure —\n"
-                    f"either Quotex credentials are invalid or the TwelveData\n"
-                    f"API key is missing.\n"
-                    f"\nFIX: Verify QUOTEX_EMAIL, QUOTEX_PASSWORD, and\n"
-                    f"TWELVEDATA_API_KEY in .env. Check network connectivity.\n"
-                    f"{'!' * 60}"
-                )
-                logger.critical(error_block)
                 raise PipelineError(str(exc), stage="ignition") from exc
 
             # Inject the pipeline-resolved model if available.
@@ -662,24 +519,25 @@ class Pipeline:
                 model, record = model_map[(symbol, expiry_key)]
                 engine._signal_gen.inject_model(model, record)
                 logger.info(
-                    "[^] Stage 5 injected: symbol=%s expiry=%s model=%s",
-                    symbol,
-                    expiry_key,
-                    record.model_name,
+                    {
+                        "event": "MODEL_INJECTED",
+                        "symbol": symbol,
+                        "expiry_key": expiry_key,
+                        "model_name": record.model_name,
+                    }
                 )
 
             self._engines.append(engine)
 
-        info_block = (
-            f"\n{'+' * 60}\n"
-            f"STAGE 5 COMPLETE: ENGINES IGNITED\n"
-            f"Engines : {len(self._engines)}\n"
-            f"Symbols : {[e.symbol for e in self._engines]}\n"
-            f"Expiry  : {expiry_key}\n"
-            f"Streams : {[type(e._stream).__name__ for e in self._engines]}\n"
-            f"{'+' * 60}"
+        logger.info(
+            {
+                "event": "STAGE_COMPLETE",
+                "stage": "ignition",
+                "engines": len(self._engines),
+                "symbols": [e.symbol for e in self._engines],
+                "expiry": expiry_key,
+            }
         )
-        logger.info(info_block)
         return self._engines
 
     # ── Task Group ────────────────────────────────────────────────────────────
@@ -700,7 +558,6 @@ class Pipeline:
         # These never change at runtime so one push at task-group start is
         # sufficient. Dynamic fields (threshold, streak, session) are pushed
         # by live.py on each tick.
-        from core.dashboard import status_store
 
         status_store.update(
             {
@@ -721,13 +578,18 @@ class Pipeline:
         )
 
         # ── Dashboard HTTP server ──────────────────────────────────────────
-        from core.dashboard import run_dashboard
 
         self._tasks.append(
             asyncio.create_task(
                 run_dashboard(self._settings.dashboard_port),
                 name="dashboard",
             )
+        )
+        logger.info(
+            {
+                "event": "DASHBOARD_STARTED",
+                "port": self._settings.dashboard_port,
+            }
         )
 
         # Engine tasks
@@ -763,6 +625,7 @@ class Pipeline:
                     name="telegram_bot",
                 )
             )
+            logger.info({"event": "TELEGRAM_BOT_STARTED"})
 
         # ── Background notification tasks ──────────────────────────────────
         self._tasks.append(
@@ -779,8 +642,10 @@ class Pipeline:
         )
 
         logger.info(
-            "[^] Pipeline task group: %d tasks launched.",
-            len(self._tasks),
+            {
+                "event": "TASK_GROUP_STARTED",
+                "task_count": len(self._tasks),
+            }
         )
 
         # Boot notification — fire-and-forget before entering gather.
@@ -804,7 +669,6 @@ class Pipeline:
             Reporter instance, or None if both channels are unconfigured.
         """
         try:
-            from trading.reporter import Reporter
 
             # Thin adapter so Pipeline satisfies OrchestratorProtocol without
             # conflicting with the existing async Pipeline.stop() method.
@@ -812,8 +676,6 @@ class Pipeline:
 
             class _Orchestrator:
                 def get_status(self) -> dict[str, Any]:
-                    from core.dashboard import status_store
-
                     return status_store.get()
 
                 def stop(self) -> str:
@@ -834,10 +696,9 @@ class Pipeline:
             )
 
         except Exception as exc:
-            logger.warning(
-                "[%%] Pipeline: Reporter init failed — notifications disabled. %s", exc
-            )
-            return None
+            raise PipelineError(
+                f"Reporter initialization failed: {exc}", stage="reporter_init"
+            ) from exc
 
     # ── Boot notification ─────────────────────────────────────────────────────
 
@@ -846,41 +707,42 @@ class Pipeline:
         Send a 'system ready' alert to Discord and Telegram on every deploy.
 
         Called once after all tasks are created but before asyncio.gather()
-        blocks. Failure is silently swallowed — a missed boot alert must
-        never prevent the trading loop from starting.
+        blocks.
+
+        Raises:
+            NotificationError: If Telegram or Discord notification fails.
         """
         if self._reporter is None:
-            return
+            raise NotificationError(
+                "Reporter not available - cannot send boot notification"
+            )
 
         symbols = ", ".join(f"`{e.symbol}`" for e in self._engines)
-        mode = "PRACTICE" if self._settings.practice_mode else "LIVE"
-        mode_icon = "🟡" if self._settings.practice_mode else "🔴"
+        mode = "GAMING" if self._settings.practice_mode else "MONEY UP"
+        mode_icon = "🎮" if self._settings.practice_mode else "🔥"
         message = (
             f"🚀 <b>Trader AI — System Ready</b>\n"
             f"{mode_icon} Mode: <code>{mode}</code>\n"
-            f"📊 Symbols: {symbols}\n"
+            f"💢 Symbols: {symbols}\n"
             f"⏱ Expiry: <code>{self._settings.expiry_seconds}s</code>\n"
-            f"🎯 Base threshold: <code>{self._settings.confidence_threshold:.0%}</code>\n"
+            f"🌯 Base threshold: <code>{self._settings.confidence_threshold:.0%}</code>\n"
             f"🛡 Max streak: <code>{self._settings.martingale_max_streak}</code>\n"
             f"📡 Stream: <code>{'Quotex' if self._settings.use_quotex_streaming else 'TwelveData'}</code>"
         )
 
-        try:
-            # Telegram expects HTML; Discord gets a plain-text variant via
-            # send_alert_async which handles its own formatting.
-            if hasattr(self._reporter, "_telegram") and self._reporter._telegram:
-                await self._reporter._telegram.send_message(message, parse_mode="HTML")
-            if hasattr(self._reporter, "_discord") and self._reporter._discord:
-                plain = (
-                    message.replace("<b>", "**")
-                    .replace("</b>", "**")
-                    .replace("<code>", "`")
-                    .replace("</code>", "`")
-                    .replace("<br>", "\n")
-                )
-                await self._reporter._discord.send_alert_async(plain, level="info")
-        except Exception as exc:
-            logger.warning("[%%] Boot notification failed (non-fatal): %s", exc)
+        # Telegram expects HTML; Discord gets a plain-text variant via
+        # send_alert_async which handles its own formatting.
+        if hasattr(self._reporter, "_telegram") and self._reporter._telegram:
+            await self._reporter._telegram.send_message(message, parse_mode="HTML")
+        if hasattr(self._reporter, "_discord") and self._reporter._discord:
+            plain = (
+                message.replace("<b>", "**")
+                .replace("</b>", "**")
+                .replace("<code>", "`")
+                .replace("</code>", "`")
+                .replace("<br>", "\n")
+            )
+            await self._reporter._discord.send_alert_async(plain, level="info")
 
     # ── Quotex status polling loop ────────────────────────────────────────────
 
@@ -896,14 +758,15 @@ class Pipeline:
         has a connected QuotexReader stream. Silently skips non-Quotex
         streams and disconnected clients.
         """
-        from core.dashboard import status_store
+        connection_lost_logged: bool = False
+        connection_restored_logged: bool = False
 
         if not self._settings.use_quotex_streaming:
-            logger.info("[^] Quotex status loop: not using Quotex streaming — exiting.")
+            logger.info({"event": "QUOTEX_STATUS_DISABLED"})
             return
 
         # Give QuotexReader time to connect before first poll.
-        await asyncio.sleep(15)
+        await asyncio.sleep(30)
 
         while not self._shutdown_requested:
             try:
@@ -915,45 +778,40 @@ class Pipeline:
                     continue
 
                 connected: bool = bool(getattr(stream, "_connected", False))
+
+                # Log connection state changes to dashboard
+                if not connected and not connection_lost_logged:
+                    status_store.add_event("Quotex not connected", event_type="kill")
+                    connection_lost_logged = True
+                    connection_restored_logged = False
+                elif connected and not connection_restored_logged:
+                    status_store.add_event("Quotex connected", event_type="info")
+                    connection_restored_logged = True
+                    connection_lost_logged = False
+
                 balance: float = 0.0
-                wins: int = 0
-                losses: int = 0
-                draws: int = 0
-                net_profit: float = 0.0
-                pending: int = len(getattr(stream, "_pending", {}))
+                pending: int = 0
 
                 if connected:
-                    try:
-                        balance = await asyncio.wait_for(
-                            stream.get_balance(), timeout=5.0
-                        )
-                    except Exception:
-                        pass
+                    health = stream.health()
+                    balance = health.get("balance", 0.0)
+                    pending = health.get("pending_signals", 0)
 
-                    try:
-                        history = await asyncio.wait_for(
-                            stream.get_history(), timeout=8.0
-                        )
-                        for trade in history:
-                            profit = trade.get("profitAmount", 0)
-                            if profit > 0:
-                                wins += 1
-                            elif profit < 0:
-                                losses += 1
-                            else:
-                                draws += 1
-                            net_profit += profit
-                    except Exception:
-                        pass
-
-                # Compute elapsed minutes from the started_at stamp in StatusStore
                 snapshot = status_store.get()
                 try:
                     started_at = datetime.fromisoformat(snapshot["started_at"])
                     elapsed_minutes = (
                         datetime.now(timezone.utc) - started_at
                     ).total_seconds() / 60
-                except Exception:
+                except Exception as exc:
+                    logger.error(
+                        {
+                            "event": "ELAPSED_TIME_CALC_ERROR",
+                            "error": str(exc),
+                            "snapshot_keys": list(snapshot.keys()),
+                            "function": "_quotex_status_loop",
+                        }
+                    )
                     elapsed_minutes = 0
 
                 status_store.update(
@@ -962,17 +820,20 @@ class Pipeline:
                         "pending_signals": pending,
                         "session": {
                             **snapshot.get("session", {}),
-                            "wins": wins,
-                            "losses": losses,
-                            "draws": draws,
-                            "net_profit": net_profit,
                             "elapsed_minutes": round(elapsed_minutes, 1),
                         },
                     }
                 )
-
             except Exception as exc:
-                logger.warning({"event": "quotex_status_poll_error", "error": str(exc)})
+                logger.error(
+                    {
+                        "event": "QUOTEX_STATUS_POLL_ERROR",
+                        "error": str(exc),
+                    }
+                )
+                status_store.add_event(
+                    f"Quotex status poll error: {exc}", event_type="kill"
+                )
 
             await asyncio.sleep(30)
 
@@ -990,10 +851,13 @@ class Pipeline:
         report fires (default 600 = 23:50 UTC).
         """
         if self._reporter is None:
-            logger.info("[^] Daily report loop: no reporter configured — exiting.")
+            logger.info(
+                {
+                    "event": "DAILY_REPORT_DISABLED",
+                    "reason": "no reporter configured, exiting",
+                }
+            )
             return
-
-        from core.dashboard import status_store
 
         while not self._shutdown_requested:
             # ── Calculate seconds until next fire time (23:50 UTC) ────────
@@ -1006,8 +870,10 @@ class Pipeline:
                 sleep_for += 86400
 
             logger.info(
-                "[^] Daily report loop: next report in %.0f minutes.",
-                sleep_for / 60,
+                {
+                    "event": "DAILY_REPORT_SCHEDULED",
+                    "next_report_minutes": round(sleep_for / 60, 1),
+                }
             )
 
             # Sleep in 60-second chunks so shutdown is responsive.
@@ -1044,10 +910,12 @@ class Pipeline:
                     session_summary=session_summary,
                     status=snapshot,
                 )
-                logger.info({"event": "daily_report_sent"})
+                logger.info({"event": "DAILY_REPORT_SENT"})
+                status_store.add_event("Daily report sent", event_type="info")
 
             except Exception as exc:
-                logger.warning({"event": "daily_report_failed", "error": str(exc)})
+                logger.warning({"event": "DAILY_REPORT_FAILED", "error": str(exc)})
+                status_store.add_event(f"Daily report failed: {exc}", event_type="kill")
 
     async def _safe_engine_run(self, engine: LiveEngine) -> None:
         """
@@ -1064,36 +932,33 @@ class Pipeline:
             await engine.run()
 
         except LiveEngineError as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"ENGINE CRASHED: LIVE ENGINE ERROR\n"
-                f"Symbol     : {engine.symbol}\n"
-                f"Expiry key : {engine.expiry_key}\n"
-                f"Error      : {exc}\n\n"
-                f"CONTEXT: The LiveEngine for this symbol crashed after boot.\n"
-                f"Other engines continue running. This engine will not restart\n"
-                f"automatically — the session continues without this symbol.\n"
-                f"\nFIX: Review the engine log above. Restart the pipeline after\n"
-                f"resolving the root cause (stream disconnect, model failure, etc).\n"
-                f"{'!' * 60}"
+            status_store.add_event(
+                f"Engine crashed: {engine.symbol} - {exc}", event_type="kill"
             )
-            logger.critical(error_block)
+            logger.error(
+                {
+                    "event": "ENGINE_CRASHED",
+                    "symbol": engine.symbol,
+                    "expiry_key": engine.expiry_key,
+                    "error": str(exc),
+                    "error_type": "LiveEngineError",
+                }
+            )
 
         except Exception as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"ENGINE CRASHED: UNEXPECTED EXCEPTION\n"
-                f"Symbol     : {engine.symbol}\n"
-                f"Expiry key : {engine.expiry_key}\n"
-                f"Error      : {exc}\n\n"
-                f"CONTEXT: An unexpected exception crashed this engine. Other\n"
-                f"engines continue running. This is likely a bug in the inference\n"
-                f"pipeline or a stream-level failure not covered by LiveEngineError.\n"
-                f"\nFIX: Review the full stack trace. Restart the pipeline after\n"
-                f"resolving the root cause.\n"
-                f"{'!' * 60}"
+            status_store.add_event(
+                f"Engine crashed (unexpected): {engine.symbol} - {exc}",
+                event_type="kill",
             )
-            logger.critical(error_block)
+            logger.error(
+                {
+                    "event": "ENGINE_CRASHED_UNEXPECTED",
+                    "symbol": engine.symbol,
+                    "expiry_key": engine.expiry_key,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            )
 
     # ── Retrain Scheduler ─────────────────────────────────────────────────────
 
@@ -1116,9 +981,7 @@ class Pipeline:
         """
         manager = ModelManager(storage_dir=self._settings.model_dir)
         engineer = get_feature_engineer()
-
         inv_map: dict[int, str] = _SECONDS_TO_EXPIRY_KEY
-
         is_first_run: bool = True
 
         while not self._shutdown_requested:
@@ -1133,21 +996,32 @@ class Pipeline:
             if not is_first_run and elapsed < self._settings.model_retrain_interval:
                 continue
 
+            first_boot = is_first_run  # Snapshot before clearing
+
             if is_first_run:
-                logger.info("[^] FIRST BOOT: Training immediately!")
+                logger.info(
+                    {
+                        "event": "RETRAIN_FIRST_BOOT",
+                        "message": "Checking for missing models",
+                    }
+                )
                 is_first_run = False
             else:
                 logger.info(
-                    "[^] Retrain scheduler: interval elapsed (%.0fs). Starting cycle.",
-                    elapsed,
+                    {
+                        "event": "RETRAIN_CYCLE_STARTED",
+                        "elapsed_seconds": round(elapsed, 1),
+                    }
                 )
+                status_store.add_event("Retrain cycle started", event_type="info")
 
             expiry_key: str | None = inv_map.get(self._settings.expiry_seconds)
             if expiry_key is None:
                 logger.warning(
-                    "[%%] Retrain scheduler: expiry_seconds=%d has no key mapping. "
-                    "Skipping cycle.",
-                    self._settings.expiry_seconds,
+                    {
+                        "event": "RETRAIN_SKIPPED",
+                        "reason": f"expiry_seconds={self._settings.expiry_seconds} has no key mapping",
+                    }
                 )
                 self._last_retrain_time = now
                 continue
@@ -1164,17 +1038,13 @@ class Pipeline:
                         symbol, timeframe="M1", max_rows=max_rows
                     )
                     if bars_df is None or bars_df.empty:
-                        warning_block = (
-                            f"\n{'%' * 60}\n"
-                            f"RETRAIN SCHEDULER WARNING: NO BAR DATA\n"
-                            f"Symbol : {symbol}\n\n"
-                            f"CONTEXT: No bar data found in storage for this symbol.\n"
-                            f"Cannot train without data. Skipping this symbol.\n"
-                            f"\nFIX: Verify historian sync ran successfully for\n"
-                            f"{symbol}. Check storage for the Parquet file.\n"
-                            f"{'%' * 60}"
+                        logger.warning(
+                            {
+                                "event": "RETRAIN_NO_DATA",
+                                "symbol": symbol,
+                                "message": "No bar data found, skipping",
+                            }
                         )
-                        logger.warning(warning_block)
                         continue
 
                     # ── 2. Build feature matrix and labels ────────────────
@@ -1186,17 +1056,14 @@ class Pipeline:
                     shaper = DataShaper()
                     split = shaper.split(feature_matrix, labels, expiry_key)
 
-                    # Train multiple models and pick the best
-                    best_result = None
-                    best_auc = -1.0
-
                     # List all models you want to train
                     models_to_try = [
                         ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
                         ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),
                         ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
                         ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
-                        (
+                        # These need to be fixed to work with AUC
+                        """ (
                             "LSTM",
                             LSTMTrainer(expiry_key=expiry_key),
                         ),
@@ -1207,42 +1074,90 @@ class Pipeline:
                         (
                             "TCN",
                             TCNTrainer(expiry_key=expiry_key),
-                        ),
+                        ), """,
                     ]
 
                     for model_name, trainer in models_to_try:
                         try:
-                            logger.info(f"Training {model_name} for {symbol}...")
+                            # First boot only: skip this model if a blob artifact
+                            # already exists. Scheduled retrains always run all models.
+
+                            if first_boot:
+                                existing = await manager.pull_from_blob(
+                                    symbol=symbol,
+                                    expiry_key=expiry_key,
+                                    model_name=f"{model_name}Trainer",
+                                )
+                                if existing:
+                                    logger.info(
+                                        {
+                                            "event": "RETRAIN_MODEL_EXISTS",
+                                            "symbol": symbol,
+                                            "expiry_key": expiry_key,
+                                            "model_name": model_name,
+                                        }
+                                    )
+                                    continue
+
+                            logger.info(
+                                {
+                                    "event": "RETRAIN_TRAINING_START",
+                                    "symbol": symbol,
+                                    "model_name": model_name,
+                                }
+                            )
                             result = trainer.train(split)
                             auc = result.metrics.get("auc", 0)
-                            logger.info(f"{model_name} AUC: {auc:.4f}")
+                            logger.info(
+                                {
+                                    "event": "RETRAIN_TRAINING_COMPLETE",
+                                    "symbol": symbol,
+                                    "model_name": model_name,
+                                    "auc": round(auc, 4),
+                                }
+                            )
 
                             # ── 4. Save artifact and push to Blob ─────────────────
                             artifact_path = Path(manager.save(result))
                             metadata_path = artifact_path.with_suffix(".json")
                             storage.save_model(artifact_path, metadata_path)
 
-                            # Track best by AUC
-                            if auc > best_auc:
-                                best_auc = auc
-                                best_result = result
-
                         except Exception as e:
-                            logger.warning(f"{model_name} failed for {symbol}: {e}")
-                            logger.exception(f"Full traceback for {model_name}:")
+                            logger.warning(
+                                {
+                                    "event": "RETRAIN_MODEL_FAILED",
+                                    "symbol": symbol,
+                                    "model_name": model_name,
+                                    "error": str(e),
+                                }
+                            )
 
-                    if best_result:
-                        logger.info(f"Best model for {symbol}: AUC={best_auc:.4f}")
-                        result = best_result
-                    else:
-                        logger.warning(f"No model trained successfully for {symbol}")
+                    # ── 4. Delegate best model selection to registry ───────
+                    record = manager.get_best_model(
+                        symbol=symbol, expiry_key=expiry_key
+                    )
+                    if record is None:
+                        logger.warning(
+                            {
+                                "event": "RETRAIN_NO_BEST_MODEL",
+                                "symbol": symbol,
+                                "expiry_key": expiry_key,
+                            }
+                        )
                         continue
 
                     logger.info(
-                        "[^] Retrain complete: symbol=%s expiry=%s auc=%.4f",
-                        symbol,
-                        expiry_key,
-                        result.metrics.get("auc", 0.0),
+                        {
+                            "event": "RETRAIN_COMPLETE",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "best_model": record.model_name,
+                            "auc": round(record.auc, 4),
+                        }
+                    )
+                    status_store.add_event(
+                        f"Retrain complete: {symbol} - {record.model_name} (AUC: {record.auc:.4f})",
+                        event_type="info",
                     )
 
                     # ── 5. Hot-reload matching engines ────────────────────
@@ -1251,49 +1166,46 @@ class Pipeline:
                             reloaded = await engine.reload_model()
                             if reloaded:
                                 logger.info(
-                                    "[^] Engine reloaded: symbol=%s expiry=%s",
-                                    symbol,
-                                    expiry_key,
+                                    {
+                                        "event": "ENGINE_RELOADED",
+                                        "symbol": symbol,
+                                        "expiry_key": expiry_key,
+                                    }
+                                )
+                                status_store.add_event(
+                                    f"Engine reloaded: {symbol}", event_type="info"
                                 )
                             else:
-                                warning_block = (
-                                    f"\n{'%' * 60}\n"
-                                    f"RETRAIN SCHEDULER WARNING: ENGINE RELOAD FAILED\n"
-                                    f"Symbol     : {symbol}\n"
-                                    f"Expiry key : {expiry_key}\n\n"
-                                    f"CONTEXT: The retrain completed and the artifact was\n"
-                                    f"saved, but the engine could not load the new model.\n"
-                                    f"The engine continues with the previously loaded model.\n"
-                                    f"\nFIX: Check model_manager logs. The artifact may\n"
-                                    f"have been saved but the registry query returned None.\n"
-                                    f"{'%' * 60}"
+                                logger.warning(
+                                    {
+                                        "event": "ENGINE_RELOAD_FAILED",
+                                        "symbol": symbol,
+                                        "expiry_key": expiry_key,
+                                    }
                                 )
-                                logger.warning(warning_block)
+                                status_store.add_event(
+                                    f"Engine reload failed: {symbol}", event_type="kill"
+                                )
 
                 except Exception as exc:
-                    warning_block = (
-                        f"\n{'%' * 60}\n"
-                        f"RETRAIN SCHEDULER WARNING: RETRAIN FAILED\n"
-                        f"Symbol     : {symbol}\n"
-                        f"Expiry key : {expiry_key}\n"
-                        f"Error      : {exc}\n\n"
-                        f"CONTEXT: The scheduled retrain failed for this symbol.\n"
-                        f"The engine continues using the previously loaded model.\n"
-                        f"This is non-fatal — the scheduler will retry on the\n"
-                        f"next interval.\n"
-                        f"\nFIX: Check trainer logs and bar data quality in storage.\n"
-                        f"Verify model_dir permissions for artifact saving.\n"
-                        f"{'%' * 60}"
+                    logger.warning(
+                        {
+                            "event": "RETRAIN_SYMBOL_FAILED",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "error": str(exc),
+                        }
                     )
-                    logger.warning(warning_block)
+                    status_store.add_event(
+                        f"Retrain failed for {symbol}: {exc}", event_type="kill"
+                    )
 
             self._last_retrain_time = now
-            info_block = (
-                f"\n{'+' * 60}\n"
-                f"RETRAIN CYCLE COMPLETE\n"
-                f"Timestamp : {now.isoformat()}\n"
-                f"Symbols   : {self._settings.pairs}\n"
-                f"Next in   : {self._settings.model_retrain_interval}s\n"
-                f"{'+' * 60}"
+            logger.info(
+                {
+                    "event": "RETRAIN_CYCLE_COMPLETE",
+                    "timestamp": now.isoformat(),
+                    "symbols": self._settings.pairs,
+                    "next_interval_seconds": self._settings.model_retrain_interval,
+                }
             )
-            logger.info(info_block)

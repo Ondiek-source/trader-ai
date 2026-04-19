@@ -525,6 +525,7 @@ class StatusStore:
             # Activity
             "last_event": "",
             "recent_trades": [],
+            "recent_events": [],
             # Metadata
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -540,6 +541,28 @@ class StatusStore:
             snapshot = copy.deepcopy(self._data)
             snapshot["server_time"] = datetime.now(timezone.utc).isoformat()
             return snapshot
+
+    def add_event(self, message: str, event_type: str = "info") -> None:
+        """
+        Push an event to the dashboard activity log.
+
+        Args:
+            message: Human-readable event description
+            event_type: "info", "win", "loss", "signal", "kill"
+        """
+        with self._lock:
+            events = self._data.get("recent_events", [])
+            events.insert(
+                0,
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "message": message,
+                    "type": event_type,
+                },
+            )
+            # Keep last 100 events
+            self._data["recent_events"] = events[:100]
+            self._data["last_event"] = message
 
     @property
     def _lock_obj(self) -> threading.Lock:
@@ -671,7 +694,7 @@ async def run_dashboard(port: int = 8080) -> None:
 
     logger.info(
         {
-            "event": "dashboard_started",
+            "event": "DASHBOARD_STARTED",
             "port": port,
             "url": f"http://0.0.0.0:{port}",
             "journal_dir": journal_dir,
