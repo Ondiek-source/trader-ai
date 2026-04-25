@@ -1,0 +1,40 @@
+# Root-level agent-generated duplicates (src/ is the canonical source)
+*.py
+*.md
+
+# Secrets — never bake into image
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+session.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Model artifacts (mounted at runtime or pulled by entrypoint)
+models/
+data/
+
+# Dev tools and VCS
+.vscode/
+.idea/
+.git/
+.github/
+*.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

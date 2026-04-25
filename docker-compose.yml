@@ -1,0 +1,36 @@
+services:
+  trader-ai:
+    # NOTE: Resource limits for Azure Container Instances must be set in
+    # provision.sh (--cpu / --memory flags on `az container create`).
+    # The `deploy.resources` block is only honoured by Docker Swarm and
+    # is silently ignored by plain `docker compose up`.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trader-ai
+    restart: unless-stopped
+    stop_grace_period: 15s
+    env_file:
+      - .env
+    volumes:
+      # Persist local fallback data across container restarts
+      - fallback-data:/tmp/fallback
+      - ./data:/app/data:rw # Maps your local data folder for testing
+      - ./models:/app/models:rw # Allows you to see the models Azure creates
+    ports:
+      # Format: "HOST_PORT:CONTAINER_PORT"
+      - "${DASHBOARD_PORT}:${DASHBOARD_PORT}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://localhost:${DASHBOARD_PORT:-8080}/status" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  fallback-data:

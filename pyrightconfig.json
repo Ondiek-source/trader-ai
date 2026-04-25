@@ -1,0 +1,21 @@
+{
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "extraPaths": [
+    "src"
+  ],
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/node_modules",
+    "**/.*",
+    ".venv"
+  ],
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportUnknownMemberType": "none",
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true
+}

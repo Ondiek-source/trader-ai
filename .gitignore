@@ -1,0 +1,51 @@
+﻿# Secrets — never commit
+.env
+deploy/azure.env
+env.txt
+session.json
+.mcp.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Model artifacts (large binaries — use Azure Blob instead)
+models/
+*.pkl
+*.joblib
+*.parquet
+
+# Data directory (runtime generated)
+/data/
+
+# Deploy logs (runtime generated)
+deploy/logs/
+
+# Dev scripts (not needed in production)
+scripts/dev/
+create_test_structure.py
+trader-ai-logs.txt
+
+# Local fallback storage
+/tmp/
+
+# IDE and tool config
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.coverage
+htmlcov/
+.pytest_cache/
