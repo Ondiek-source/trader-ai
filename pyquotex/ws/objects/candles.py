@@ -1,4 +1,5 @@
 from pyquotex.ws.objects.base import Base
+from typing import Optional, List, Any
 
 
 class Candle(object):
@@ -16,7 +17,7 @@ class Candle(object):
 
         :returns: The candle time.
         """
-        return self.__candle_data[0]
+        return self.__candle_data[0] if self.__candle_data else None
 
     @property
     def candle_open(self):
@@ -24,7 +25,7 @@ class Candle(object):
 
         :returns: The candle open value.
         """
-        return self.__candle_data[1]
+        return self.__candle_data[1] if self.__candle_data else None
 
     @property
     def candle_close(self):
@@ -32,7 +33,7 @@ class Candle(object):
 
         :returns: The candle close value.
         """
-        return self.__candle_data[2]
+        return self.__candle_data[2] if self.__candle_data else None
 
     @property
     def candle_high(self):
@@ -40,7 +41,7 @@ class Candle(object):
 
         :returns: The candle high value.
         """
-        return self.__candle_data[3]
+        return self.__candle_data[3] if self.__candle_data else None
 
     @property
     def candle_low(self):
@@ -48,7 +49,7 @@ class Candle(object):
 
         :returns: The candle low value.
         """
-        return self.__candle_data[4]
+        return self.__candle_data[4] if self.__candle_data else None
 
     @property
     def candle_type(self):
@@ -56,10 +57,16 @@ class Candle(object):
 
         :returns: The candle type value.
         """
-        if self.candle_open < self.candle_close:
+        open_val = self.candle_open
+        close_val = self.candle_close
+
+        if open_val is None or close_val is None:
+            return None
+        if open_val < close_val:
             return "green"
-        elif self.candle_open > self.candle_close:
+        elif open_val > close_val:
             return "red"
+        return "neutral"
 
 
 class Candles(Base):
@@ -67,8 +74,7 @@ class Candles(Base):
 
     def __init__(self):
         super(Candles, self).__init__()
-        self.__name = "candles"
-        self.__candles_data = None
+        self.__candles_data: Optional[List[Any]] = None
 
     @property
     def candles_data(self):
@@ -90,7 +96,11 @@ class Candles(Base):
         :returns: The instance of :class:`Candle
             <pyquotex.ws.objects.candles.Candle>`.
         """
-        return Candle(self.candles_data[0])
+        if self.candles_data is None:
+            return None
+        if len(self.candles_data) > 0:
+            return Candle(self.candles_data[0])
+        return None
 
     @property
     def second_candle(self):
@@ -99,7 +109,11 @@ class Candles(Base):
         :returns: The instance of :class:`Candle
             <pyquotex.ws.objects.candles.Candle>`.
         """
-        return Candle(self.candles_data[1])
+        if self.candles_data is None:
+            return None
+        if len(self.candles_data) > 1:
+            return Candle(self.candles_data[1])
+        return None
 
     @property
     def current_candle(self):
@@ -108,4 +122,13 @@ class Candles(Base):
         :returns: The instance of :class:`Candle
             <pyquotex.ws.objects.candles.Candle>`.
         """
-        return Candle(self.candles_data[-1])
+        if self.candles_data is None:
+            return None
+        if len(self.candles_data) > 0:
+            return Candle(self.candles_data[-1])
+        return None
+
+    @property
+    def has_candles(self) -> bool:
+        """Check if candles data is available."""
+        return self.candles_data is not None and len(self.candles_data) > 0

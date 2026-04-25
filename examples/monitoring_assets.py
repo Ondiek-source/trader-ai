@@ -7,10 +7,7 @@ from pyquotex.config import credentials
 from pyquotex.stable_api import Quotex
 from pyquotex.utils.processor import process_candles, get_color
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s %(message)s'
-)
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(message)s")
 logging.disable()
 
 
@@ -54,7 +51,7 @@ async def main():
         password=password,
         lang="pt",  # Default pt -> Português.
     )
-    check_connect, message = await client.connect()
+    check_connect, _ = await client.connect()
     if check_connect:
         codes_asset = await client.get_all_assets()
         assets = list(codes_asset.keys())[:30]
@@ -63,7 +60,7 @@ async def main():
         end_time = time.time()
         print(f"Total time: {end_time - start_time}")
 
-    client.close()
+    await client.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 """Module for Quotex websocket."""
+
 import json
 import time
 import logging
@@ -34,7 +35,7 @@ class WebsocketClient:
             on_ping=self.on_ping,
             on_pong=self.on_pong,
             header=self.headers,
-            cookie=self.api.session_data.get("cookies")
+            cookie=self.api.session_data.get("cookies"),
         )
 
     def on_message(self, wss, msg):
@@ -53,17 +54,23 @@ class WebsocketClient:
             elif "instruments/list" in str(msg):
                 self.state.started_listen_instruments = True
 
-            msg_str = msg.decode("utf-8", errors="ignore") if isinstance(msg, bytes) else str(msg)
-            message = msg_str # Keep the full string as default if logic downstream expects it
-            
+            msg_str = (
+                msg.decode("utf-8", errors="ignore")
+                if isinstance(msg, bytes)
+                else str(msg)
+            )
+            message = msg_str  # Keep the full string as default if logic downstream expects it
+
             if len(msg_str) > 1:
                 msg_parsed_str = msg_str[1:]
                 logger.debug(msg_parsed_str)
                 try:
                     message_json = json.loads(msg_parsed_str)
-                    message = message_json # Overwrite with dict only if parsing succeeds
+                    message = (
+                        message_json  # Overwrite with dict only if parsing succeeds
+                    )
                     self.api.wss_message = message
-                    if "call" in str(message) or 'put' in str(message):
+                    if "call" in str(message) or "put" in str(message):
                         self.api.instruments = message
                 except (ValueError, TypeError):
                     pass
@@ -74,13 +81,19 @@ class WebsocketClient:
                             try:
                                 self.api.signal_data[i[0]] = {}
                                 self.api.signal_data[i[0]][i[2]] = {}
-                                self.api.signal_data[i[0]][i[2]]["dir"] = i[1][0]["signal"]
-                                self.api.signal_data[i[0]][i[2]]["duration"] = i[1][0]["timeFrame"]
+                                self.api.signal_data[i[0]][i[2]]["dir"] = i[1][0][
+                                    "signal"
+                                ]
+                                self.api.signal_data[i[0]][i[2]]["duration"] = i[1][0][
+                                    "timeFrame"
+                                ]
                             except (KeyError, IndexError, TypeError):
                                 self.api.signal_data[i[0]] = {}
                                 self.api.signal_data[i[0]][time_in] = {}
                                 self.api.signal_data[i[0]][time_in]["dir"] = i[1][0][1]
-                                self.api.signal_data[i[0]][time_in]["duration"] = i[1][0][0]
+                                self.api.signal_data[i[0]][time_in]["duration"] = i[1][
+                                    0
+                                ][0]
                     elif message.get("liveBalance") or message.get("demoBalance"):
                         self.api.account_balance = message
                     elif message.get("position"):
@@ -90,7 +103,9 @@ class WebsocketClient:
                     elif message.get("index"):
                         self.api.historical_candles = message
                         if message.get("closeTimestamp"):
-                            self.api.timesync.server_timestamp = message.get("closeTimestamp")
+                            self.api.timesync.server_timestamp = message.get(
+                                "closeTimestamp"
+                            )
                     if message.get("pending"):
                         self.api.pending_successful = message
                         self.api.pending_id = message["pending"]["ticket"]
@@ -98,7 +113,9 @@ class WebsocketClient:
                         self.api.buy_successful = message
                         self.api.buy_id = message["id"]
                         if message.get("closeTimestamp"):
-                            self.api.timesync.server_timestamp = message.get("closeTimestamp")
+                            self.api.timesync.server_timestamp = message.get(
+                                "closeTimestamp"
+                            )
                     elif message.get("ticket") and not message.get("id"):
                         self.api.sold_options_respond = message
                     elif message.get("deals"):
@@ -107,9 +124,7 @@ class WebsocketClient:
                             get_m["win"] = True if message["profit"] > 0 else False
                             get_m["game_state"] = 1
                             self.api.listinfodata.set(
-                                get_m["win"],
-                                get_m["game_state"],
-                                get_m["id"]
+                                get_m["win"], get_m["game_state"], get_m["id"]
                             )
                     elif message.get("isDemo") and message.get("balance"):
                         self.api.training_balance_edit_request = message
@@ -121,40 +136,64 @@ class WebsocketClient:
                     elif not message.get("list") == []:
                         self.api.wss_message = message
             if str(message) == "41":
-                logger.info("Disconnection event triggered by the platform, causing automatic reconnection.")
+                logger.info(
+                    "Disconnection event triggered by the platform, causing automatic reconnection."
+                )
                 self.state.check_websocket_if_connect = 0
             if "51-" in str(message):
                 self.api._temp_status = str(message)
-            elif self.api._temp_status == """451-["settings/list",{"_placeholder":true,"num":0}]""":
+            elif (
+                self.api._temp_status
+                == """451-["settings/list",{"_placeholder":true,"num":0}]"""
+            ):
                 self.api.settings_list = message
                 self.api._temp_status = ""
-            elif self.api._temp_status == """451-["history/list/v2",{"_placeholder":true,"num":0}]""":
+            elif (
+                self.api._temp_status
+                == """451-["history/list/v2",{"_placeholder":true,"num":0}]"""
+                or self.api._temp_status
+                == """451-["history/load",{"_placeholder":true,"num":0}]"""
+            ):
                 if message.get("asset") == self.api.current_asset:
-                    self.api.candles.candles_data = message["history"]
+                    self.api.candles.candles_data = message.get("history")
                     self.api.candle_v2_data[message["asset"]] = message
-                    self.api.candle_v2_data[message["asset"]]["candles"] = [{
-                        "time": candle[0],
-                        "open": candle[1],
-                        "close": candle[2],
-                        "high": candle[3],
-                        "low": candle[4],
-                        "ticks": candle[5]
-                    } for candle in message["candles"]]
-            elif isinstance(message, list) and len(message) > 0 and isinstance(message[0], list) and len(message[0]) == 4:
-                result = {
-                    "time": message[0][1],
-                    "price": message[0][2]
-                }
+
+                    if "data" in message and isinstance(message["data"], list):
+                        # history/load pagination structure
+                        self.api.candle_v2_data[message["asset"]]["candles"] = message[
+                            "data"
+                        ]
+                    else:
+                        # history/list/v2 structure
+                        self.api.candle_v2_data[message["asset"]]["candles"] = [
+                            {
+                                "time": candle[0],
+                                "open": candle[1],
+                                "close": candle[2],
+                                "high": candle[3],
+                                "low": candle[4],
+                                "ticks": candle[5],
+                            }
+                            for candle in message.get("candles", [])
+                        ]
+                self.api._temp_status = ""
+            elif (
+                isinstance(message, list)
+                and len(message) > 0
+                and isinstance(message[0], list)
+                and len(message[0]) == 4
+            ):
+                result = {"time": message[0][1], "price": message[0][2]}
                 self.api.realtime_price[message[0][0]].append(result)
                 self.api.realtime_candles[self.api.current_asset] = message[0]
-            elif isinstance(message, list) and len(message) > 0 and isinstance(message[0], list) and len(message[0]) == 2:
+            elif (
+                isinstance(message, list)
+                and len(message) > 0
+                and isinstance(message[0], list)
+                and len(message[0]) == 2
+            ):
                 for i in message:
-                    result = {
-                        "sentiment": {
-                            "sell": 100 - int(i[1]),
-                            "buy": int(i[1])
-                        }
-                    }
+                    result = {"sentiment": {"sell": 100 - int(i[1]), "buy": int(i[1])}}
                     self.api.realtime_sentiment[i[0]] = result
         except Exception as e:
             logger.error("Unhandled error in on_message: %s", e)
@@ -176,7 +215,9 @@ class WebsocketClient:
         self.wss.send('42["indicator/list"]')
         self.wss.send('42["drawing/load"]')
         self.wss.send('42["pending/list"]')
-        self.wss.send('42["instruments/update",{"asset":"%s","period":%d}]' % (asset_name, period))
+        self.wss.send(
+            '42["instruments/update",{"asset":"%s","period":%d}]' % (asset_name, period)
+        )
         self.wss.send('42["depth/follow","%s"]' % asset_name)
         self.wss.send('42["chart_notification/get"]')
         self.wss.send('42["tick"]')

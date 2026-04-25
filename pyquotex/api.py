@@ -1,4 +1,5 @@
 """Module for Quotex websocket."""
+
 import os
 import time
 import ssl
@@ -31,9 +32,9 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 cert_path = certifi.where()
-os.environ['SSL_CERT_FILE'] = cert_path
-os.environ['WEBSOCKET_CLIENT_CA_BUNDLE'] = cert_path
-cacert = os.environ.get('WEBSOCKET_CLIENT_CA_BUNDLE')
+os.environ["SSL_CERT_FILE"] = cert_path
+os.environ["WEBSOCKET_CLIENT_CA_BUNDLE"] = cert_path
+cacert = os.environ.get("WEBSOCKET_CLIENT_CA_BUNDLE")
 
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ssl_context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2
@@ -53,14 +54,14 @@ class QuotexAPI:
     """Class for communication with Quotex API."""
 
     def __init__(
-            self,
-            host,
-            username,
-            password,
-            lang,
-            proxies=None,
-            resource_path=None,
-            user_data_dir="."
+        self,
+        host,
+        username,
+        password,
+        lang,
+        proxies=None,
+        resource_path=None,
+        user_data_dir=".",
     ):
         """
         :param str host: The hostname or ip address of a Quotex server.
@@ -135,23 +136,19 @@ class QuotexAPI:
 
         :returns: The instance of :class:`WebSocket <websocket.WebSocket>`.
         """
+        if self.websocket_client is None:
+            return None
         return self.websocket_client.wss
 
     def subscribe_realtime_candle(self, asset, period):
         self.realtime_price[asset] = []
         self.realtime_candles[asset] = {}
-        payload = {
-            "asset": asset,
-            "period": period
-        }
+        payload = {"asset": asset, "period": period}
         data = f'42["instruments/update", {json.dumps(payload)}]'
         return self.send_websocket_request(data)
 
     def chart_notification(self, asset):
-        payload = {
-            "asset": asset,
-            "version": "1.0.0"
-        }
+        payload = {"asset": asset, "version": "1.0.0"}
         data = f'42["chart_notification/get", {json.dumps(payload)}]'
         return self.send_websocket_request(data)
 
@@ -164,14 +161,14 @@ class QuotexAPI:
         return self.send_websocket_request(data)
 
     def settings_apply(
-            self,
-            asset,
-            duration,
-            is_fast_option=False,
-            end_time=None,
-            deal=5,
-            percent_mode=False,
-            percent_deal=1
+        self,
+        asset,
+        duration,
+        is_fast_option=False,
+        end_time=None,
+        deal=5,
+        percent_mode=False,
+        percent_deal=1,
     ):
         payload = {
             "chartId": "graph",
@@ -216,10 +213,7 @@ class QuotexAPI:
 
     def change_account(self, account_type):
         self.account_type = account_type
-        payload = {
-            "demo": self.account_type,
-            "tournamentId": 0
-        }
+        payload = {"demo": self.account_type, "tournamentId": 0}
         data = f'42["account/change",{json.dumps(payload)}]'
         self.send_websocket_request(data)
 
@@ -246,14 +240,7 @@ class QuotexAPI:
         logger.debug(data)
         self.send_websocket_request(data)
 
-    def instruments_follow(
-            self,
-            amount,
-            asset,
-            direction,
-            duration,
-            open_time
-    ):
+    def instruments_follow(self, amount, asset, direction, duration, open_time):
         payload = {
             "amount": amount,
             "command": 0 if direction == "call" else 1,
@@ -327,12 +314,7 @@ class QuotexAPI:
         return GetHistory(self)
 
     def send_http_request_v1(
-            self,
-            resource,
-            method,
-            data=None,
-            params=None,
-            headers=None
+        self, resource, method, data=None, params=None, headers=None
     ):
         """Send http request to Quotex server.
 
@@ -373,11 +355,7 @@ class QuotexAPI:
         self.browser.headers["Sec-Fetch-Mode"] = "navigate"
         self.browser.headers["Dnt"] = "1"
         response = self.browser.send_request(
-            method=method,
-            url=url,
-            data=data,
-            params=params,
-            proxies=self.proxies
+            method=method, url=url, data=data, params=params, proxies=self.proxies
         )
         try:
             response.raise_for_status()
@@ -417,8 +395,9 @@ class QuotexAPI:
         :param str data: The websocket requests data.
         :param bool no_force_send: Default None.
         """
-        while (self.state.ssl_Mutual_exclusion
-               or self.state.ssl_Mutual_exclusion_write) and no_force_send:
+        while (
+            self.state.ssl_Mutual_exclusion or self.state.ssl_Mutual_exclusion_write
+        ) and no_force_send:
             pass
         self.state.ssl_Mutual_exclusion_write = True
         self.websocket.send(data)
@@ -429,11 +408,7 @@ class QuotexAPI:
         logger.info("Connecting User Account ...")
         logger.debug("Login Account User...")
         async with self.login as login:
-            status, msg = await login(
-                self.username,
-                self.password,
-                self.user_data_dir
-            )
+            status, msg = await login(self.username, self.password, self.user_data_dir)
             logger.info(msg)
 
         if status:
@@ -461,7 +436,7 @@ class QuotexAPI:
                 "cert_reqs": ssl.CERT_REQUIRED,
                 "ca_certs": cacert,
                 "context": ssl_context,
-            }
+            },
         }
         if platform.system() == "Linux":
             payload["sslopt"]["ssl_version"] = ssl.PROTOCOL_TLS
@@ -483,7 +458,7 @@ class QuotexAPI:
                 self.state.SSID = None
                 logger.debug("Websocket Token Rejected.")
                 return True, "Websocket Token Rejected."
-            
+
             await asyncio.sleep(0.1)
 
     async def send_ssid(self, timeout=10):
@@ -530,7 +505,7 @@ class QuotexAPI:
 
     async def close(self):
         if self.websocket_client:
-            self.websocket.close()
+            await self.websocket.close()
             await asyncio.sleep(1)
             self.websocket_thread.join()
         return True

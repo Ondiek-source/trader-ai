@@ -35,7 +35,7 @@ pkg update -y && pkg upgrade -y
 pkg autoclean -y && pkg clean -y
 
 msg "${CYAN}🔧 Instalando dependências necessárias...${RESET}" \
-    "${CYAN}🔧 Installing necessary dependencies...${RESET}"
+    "${CYAN}🔧 Installing necessary dependencies....${RESET}"
 pkg install -y \
   git \
   build-essential \

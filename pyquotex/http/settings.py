@@ -5,32 +5,39 @@ class Settings(Browser):
 
     def __init__(self, api):
         super().__init__()
-        self.set_headers()
         self.api = api
-        self.headers = self.get_headers()
 
     def get_settings(self):
-        self.headers["content-type"] = "application/json"
-        self.headers["referer"] = f"{self.api.https_url}/{self.api.lang}/trade"
-        self.headers["cookie"] = self.api.session_data["cookies"]
-        self.headers["user-agent"] = self.api.session_data["user_agent"]
-        response = self.send_request(
-            "GET",
-            f"{self.api.https_url}/api/v1/cabinets/digest"
+        """Fetch the cabinet digest (user settings/status)."""
+        self.headers.update(
+            {
+                "content-type": "application/json",
+                "referer": f"{self.api.https_url}/{self.api.lang}/trade",
+                "cookie": self.api.session_data.get("cookies", ""),
+                "user-agent": self.api.session_data.get("user_agent", ""),
+            }
         )
-        return response.json()
+        # We call send_request, which updates self.response internally
+        self.send_request("GET", f"{self.api.https_url}/api/v1/cabinets/digest")
 
-    def set_time_offset(self, time_offset):
-        payload = {
-            "time_offset": time_offset
-        }
-        self.headers["referer"] = f"{self.api.https_url}/{self.api.lang}/trade"
-        self.headers["cookie"] = self.api.session_data["cookies"]
-        self.headers["user-agent"] = self.api.session_data["user_agent"]
-        response = self.send_request(
+        # return the parsed JSON from the response
+        return self.get_json()
+
+    def set_time_offset(self, time_offset: int):
+        payload = {"time_offset": time_offset}
+        self.headers.update(
+            {
+                "referer": f"{self.api.https_url}/{self.api.lang}/trade",
+                "cookie": self.api.session_data.get("cookies", ""),
+                "user-agent": self.api.session_data.get("user_agent", ""),
+            }
+        )
+
+        self.send_request(
             method="POST",
             url=f"{self.api.https_url}/api/v1/user/profile/time_offset",
-            json=payload
+            json=payload,
         )
 
-        return response.json()
+        # return the result of the POST request
+        return self.get_json()

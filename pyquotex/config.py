@@ -7,13 +7,17 @@ import threading
 
 from fake_useragent import UserAgent
 
-USER_AGENT = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+)
 
-base_dir = Path.cwd()
+# previous was base_dir = Path.cwd()
+base_dir = Path(os.environ.get("QUOTEX_SESSION_DIR", str(Path(__file__).parent.parent)))
 config_path = Path(os.path.join(base_dir, "settings/config.ini"))
 config = configparser.ConfigParser(interpolation=None)
 
 session_lock = threading.Lock()
+
 
 def credentials():
 
@@ -42,7 +46,7 @@ def resource_path(relative_path: str | Path) -> Path:
     global base_dir
     """Get absolute path to resource, works for dev and for PyInstaller"""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base_dir = Path(sys._MEIPASS)
+        base_dir = Path(sys._MEIPASS)  # type: ignore[attr-defined]
     return base_dir / relative_path
 
 
@@ -62,10 +66,10 @@ def load_session(email: str, user_agent: str = UserAgent().random):
             all_sessions[email] = {
                 "cookies": None,
                 "token": None,
-                "user_agent": user_agent
+                "user_agent": user_agent,
             }
             output_file.write_text(json.dumps(all_sessions, indent=4))
-        
+
         return all_sessions.get(email)
 
 

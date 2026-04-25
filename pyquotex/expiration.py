@@ -59,7 +59,7 @@ def get_expiration_time_quotex(timestamp: int, duration: int) -> int:
     return int(expiration_time.timestamp())
 
 
-def get_next_timeframe(timestamp, time_zone, timeframe: int, open_time: str = None) -> str:
+def get_next_timeframe(timestamp, time_zone, timeframe: int, open_time: str = "") -> str:
     """
     Calculate the next timestamp based on the given timeframe in seconds.
     The timestamp will be rounded up to the nearest multiple of the timeframe.
@@ -94,7 +94,7 @@ def get_next_timeframe(timestamp, time_zone, timeframe: int, open_time: str = No
     return next_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
 
-def get_expiration_time(timestamp, duration):
+def get_expiration_time(duration):
     now = datetime.now()
     new_date = now.replace(second=0, microsecond=0)
     exp = new_date + timedelta(seconds=duration)

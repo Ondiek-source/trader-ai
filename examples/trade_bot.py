@@ -16,9 +16,11 @@ async def analise_sentiment(asset_name, duration):
     count = duration
     while count > 0:
         market_mood = await client.get_realtime_sentiment(asset_name)
-        sentiment = market_mood.get('sentiment')
+        sentiment = market_mood.get("sentiment")
         if sentiment:
-            print(f"\rSell: {sentiment.get('sell')} Buy: {sentiment.get('buy')}", end="")
+            print(
+                f"\rSell: {sentiment.get('sell')} Buy: {sentiment.get('buy')}", end=""
+            )
 
         await asyncio.sleep(0.5)
         count -= 1
@@ -36,13 +38,16 @@ async def calculate_profit(asset_name, amount, balance):
     Returns:
         tuple: The updated balance and the profit earned.
     """
+    await asyncio.sleep(0)
     payout = client.get_payout_by_asset(asset_name)
-    profit = ((payout / 100) * amount)
+    profit = (payout / 100) * amount
     balance += amount + profit
     return balance, profit
 
 
-async def martingale_apply(amount, asset_name, direction, duration, balance, martingale_quantity):
+async def martingale_apply(
+    amount, asset_name, direction, duration, balance, martingale_quantity
+):
     """
     Apply the Martingale strategy to the given trade, doubling the amount on each loss until the limit is reached.
 
@@ -59,7 +64,9 @@ async def martingale_apply(amount, asset_name, direction, duration, balance, mar
     """
     while martingale_quantity > 0:
         balance -= amount
-        print(f"Betting {amount} on asset {asset_name} in the {direction} direction for {duration}s")
+        print(
+            f"Betting {amount} on asset {asset_name} in the {direction} direction for {duration}s"
+        )
         status, buy_info = await client.buy(amount, asset_name, direction, duration)
 
         if not status:
@@ -97,29 +104,31 @@ async def check_result(buy_data, direction):
     Returns:
         str: The result of the trade ("Win", "Loss", or "Doji").
     """
-    open_price = buy_data.get('openPrice')
+    open_price = buy_data.get("openPrice")
 
     while True:
-        prices = await client.get_realtime_price(buy_data['asset'])
+        prices = await client.get_realtime_price(buy_data["asset"])
 
         if not prices:
             continue
 
-        current_price = prices[-1]['price']
+        current_price = prices[-1]["price"]
 
         print(f"\nCurrent Price: {current_price}, Open Price: {open_price}")
 
         if (direction == "call" and current_price > open_price) or (
-                direction == "put" and current_price < open_price):
+            direction == "put" and current_price < open_price
+        ):
             print("Result: WIN")
-            return 'Win'
+            return "Win"
         elif (direction == "call" and current_price <= open_price) or (
-                direction == "put" and current_price >= open_price):
+            direction == "put" and current_price >= open_price
+        ):
             print("Result: LOSS")
-            return 'Loss'
+            return "Loss"
         else:
             print("Result: DOJI")
-            return 'Doji'
+            return "Doji"
 
 
 async def trade_and_monitor():
@@ -140,7 +149,9 @@ async def trade_and_monitor():
         initial_balance = balance
         martingale_quantity = 2
         print("Initial Balance: ", balance)
-        asset_name, asset_data = await client.get_available_asset(asset, force_open=True)
+        asset_name, asset_data = await client.get_available_asset(
+            asset, force_open=True
+        )
 
         if asset_data[2]:
             print("OK: Asset is open.")
@@ -149,10 +160,14 @@ async def trade_and_monitor():
                 print(f"{100 * '='}")
                 check_connect = await client.check_connect()
                 if not check_connect:
-                    check_connect, message = await client.connect()
+                    check_connect, _ = await client.connect()
 
-                print(f"Betting {amount} on asset {asset_name} in the {direction} direction for {duration}s")
-                status, buy_info = await client.buy(amount, asset_name, direction, duration)
+                print(
+                    f"Betting {amount} on asset {asset_name} in the {direction} direction for {duration}s"
+                )
+                status, buy_info = await client.buy(
+                    amount, asset_name, direction, duration
+                )
                 print(status, buy_info)
                 if status:
                     balance -= amount
@@ -163,7 +178,9 @@ async def trade_and_monitor():
                     result = await check_result(buy_info, direction)
 
                     if result == "Win":
-                        balance, profit = await calculate_profit(asset_name, amount, balance)
+                        balance, profit = await calculate_profit(
+                            asset_name, amount, balance
+                        )
                         print(f"Profit: {profit}")
                         print(f"New Balance: {balance}")
                         continue
@@ -178,7 +195,7 @@ async def trade_and_monitor():
                         direction,
                         duration,
                         balance,
-                        martingale_quantity
+                        martingale_quantity,
                     )
 
                     if success:
@@ -200,7 +217,7 @@ async def trade_and_monitor():
         print("Could not connect to the client.")
 
     print("Exiting...")
-    client.close()
+    await client.close()
 
 
 async def main():
