@@ -99,7 +99,7 @@ class QuotexDataStream:
         practice_mode: ``True`` for demo account, ``False`` for real.
     """
 
-    RESULT_BUFFER_SECONDS = 2  # wait after signal expiry before checking
+    RESULT_BUFFER_SECONDS = 5  # wait after signal expiry before checking
     BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
     MAX_RECONNECT_DELAY = 120  # seconds
@@ -479,16 +479,17 @@ class QuotexDataStream:
         trade_asset = trade.get("symbol") or trade.get("asset", "")
         if not trade_asset or not self._assets_match(pair, trade_asset):
             return None
-        # Direction: Quotex history uses "directionType": "call"/"put" (primary)
-        # and "command": 0/1 (secondary). QUOTEX_TO_DIRECTION maps both to
-        # our internal "UP"/"DOWN". The loop tries fields in priority order and
-        # breaks on the first non-None hit; falls through if none exist.
+        # Normalize signal direction to Quotex format ("call"/"put").
+        # TradeSignal uses "CALL"/"PUT"; legacy paths may use "UP"/"DOWN".
+        # DIRECTION_TO_QUOTEX covers UP/DOWN; unknown values fall through to
+        # direction.lower() which handles CALL→"call", PUT→"put" directly.
+        signal_quotex = DIRECTION_TO_QUOTEX.get(direction.upper(), direction.lower())
+        # Check direction via multiple field names; map integer command 0/1.
         for field in ("directionType", "direction", "command"):
             raw = trade.get(field)
             if raw is not None:
-                raw_str = str(raw).lower()
-                mapped = QUOTEX_TO_DIRECTION.get(raw_str, raw_str).upper()
-                if mapped != direction.upper():
+                trade_dir = {"0": "call", "1": "put"}.get(str(raw).lower(), str(raw).lower())
+                if trade_dir != signal_quotex:
                     return None
                 break
         # Prefer Unix epoch timestamp — available in all Quotex history records
