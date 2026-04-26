@@ -99,7 +99,8 @@ class QuotexDataStream:
         practice_mode: ``True`` for demo account, ``False`` for real.
     """
 
-    RESULT_BUFFER_SECONDS = 5  # wait after signal expiry before checking
+    RESULT_BUFFER_SECONDS = 5   # wait after signal expiry before first check
+    HISTORY_RETRY_INTERVAL = 15 # seconds between each subsequent retry
     BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
     MAX_RECONNECT_DELAY = 120  # seconds
@@ -301,6 +302,7 @@ class QuotexDataStream:
             "balance_before": balance_snapshot,
             "attempts": 0,
             "resolved": False,
+            "next_attempt_at": expiry_time + timedelta(seconds=self.RESULT_BUFFER_SECONDS),
         }
         logger.info(
             {
@@ -335,13 +337,13 @@ class QuotexDataStream:
         return balance_task
 
     async def _process_due_signals(self, now: datetime) -> None:
-        """Resolve all pending signals whose expiry window has passed."""
+        """Resolve all pending signals whose next retry window has arrived."""
+        default_first = timedelta(seconds=self.RESULT_BUFFER_SECONDS)
         due = {
             sid: data
             for sid, data in self._pending.items()
             if not data["resolved"]
-            and now
-            >= data["expiry_time"] + timedelta(seconds=self.RESULT_BUFFER_SECONDS)
+            and now >= data.get("next_attempt_at", data["expiry_time"] + default_first)
             and data["attempts"] < self.MAX_HISTORY_ATTEMPTS
         }
         for signal_id, data in due.items():
@@ -357,11 +359,18 @@ class QuotexDataStream:
                         "event": "result_unresolved",
                         "signal_id": signal_id,
                         "pair": data["signal"].get("pair"),
+                        "attempts": data["attempts"],
                         "message": (
                             f"No matching trade found after "
                             f"{self.MAX_HISTORY_ATTEMPTS} attempts."
                         ),
                     }
+                )
+            else:
+                # Space out next retry: expiry + buffer + attempt_number * interval
+                data["next_attempt_at"] = data["expiry_time"] + timedelta(
+                    seconds=self.RESULT_BUFFER_SECONDS
+                    + data["attempts"] * self.HISTORY_RETRY_INTERVAL
                 )
 
     def _cleanup_resolved(self, now: datetime) -> None:
@@ -562,12 +571,25 @@ class QuotexDataStream:
             )
 
             if not closest_trade:
+                sample = [
+                    {
+                        "asset": t.get("symbol") or t.get("asset", "?"),
+                        "cmd": t.get("command") or t.get("direction") or t.get("directionType", "?"),
+                        "close_ts": t.get("close_time_timestamp"),
+                        "close_time": (str(t.get("close_time") or ""))[:19],
+                        "profit": t.get("profitAmount"),
+                    }
+                    for t in history[:5]
+                ]
                 logger.warning(
                     {
                         "event": "NO_TRADE_NEAR_EXPIRY",
                         "pair": pair,
                         "direction": direction,
+                        "target_time_utc": target_time.strftime("%Y-%m-%d %H:%M:%S"),
                         "expiry_time": expiry_time.isoformat(),
+                        "history_count": len(history),
+                        "history_sample": sample,
                     }
                 )
                 return None
