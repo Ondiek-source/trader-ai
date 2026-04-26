@@ -57,7 +57,6 @@ import logging
 
 
 from typing import Any
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from trading.reporter import Reporter
 from core.config import get_settings
@@ -1249,8 +1248,7 @@ class Pipeline:
                     "auc": round(auc, 4),
                 }
             )
-            artifact_path = Path(manager.save(result))
-            storage.save_model(artifact_path, artifact_path.with_suffix(".json"))
+            manager.save(result)
 
         except Exception as e:
             logger.warning(
