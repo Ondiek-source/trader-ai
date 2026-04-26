@@ -32,9 +32,6 @@ from core.dashboard import status_store
 
 logger = logging.getLogger(__name__)
 
-_CODE_TAG = "<code>"
-_CODE_TAG_CLOSE = "</code>"
-
 
 # ── Orchestrator protocol ─────────────────────────────────────────────────────
 
@@ -255,6 +252,7 @@ class DiscordReporter:
         "warning": 0xFF8800,
         "error": 0xFF4444,
     }
+    MESSAGE_TTL_SECONDS: int = 20 * 3600  # auto-delete after 20 hours
 
     def __init__(self, webhook_url: str) -> None:
         self._url: str = webhook_url
@@ -272,6 +270,16 @@ class DiscordReporter:
                 )
             )
         return self._session
+
+    async def _delete_after(self, message_id: str, delay: int) -> None:
+        """Delete a webhook message after *delay* seconds."""
+        await asyncio.sleep(delay)
+        try:
+            session = await self._get_session()
+            async with session.delete(f"{self._url}/messages/{message_id}"):
+                pass
+        except Exception as exc:
+            logger.debug({"event": "discord_delete_failed", "message_id": message_id, "error": str(exc)})
 
     async def send_report_async(
         self, session_summary: dict[str, Any], status: dict[str, Any]
@@ -296,8 +304,11 @@ class DiscordReporter:
 
         try:
             session = await self._get_session()
-            async with session.post(self._url, json=payload) as resp:
-                await resp.text()
+            async with session.post(f"{self._url}?wait=true", json=payload) as resp:
+                data = await resp.json()
+            message_id = str(data.get("id", "")) if isinstance(data, dict) else ""
+            if message_id:
+                asyncio.create_task(self._delete_after(message_id, self.MESSAGE_TTL_SECONDS))
             logger.info({"event": "discord_report_sent"})
         except Exception as exc:
             logger.warning({"event": "discord_report_failed", "error": str(exc)})
@@ -319,8 +330,11 @@ class DiscordReporter:
 
         try:
             session = await self._get_session()
-            async with session.post(self._url, json=payload) as resp:
-                await resp.text()
+            async with session.post(f"{self._url}?wait=true", json=payload) as resp:
+                data = await resp.json()
+            message_id = str(data.get("id", "")) if isinstance(data, dict) else ""
+            if message_id:
+                asyncio.create_task(self._delete_after(message_id, self.MESSAGE_TTL_SECONDS))
         except Exception as exc:
             logger.warning({"event": "discord_alert_failed", "error": str(exc)})
 
@@ -350,6 +364,7 @@ class TelegramBot:
     BASE_URL: str = "https://api.telegram.org/bot{token}/{method}"
     MAX_RETRIES: int = 5
     RETRY_DELAY: float = 6.0
+    MESSAGE_TTL_SECONDS: int = 20 * 3600  # auto-delete after 20 hours
 
     def __init__(
         self,
@@ -465,6 +480,18 @@ class TelegramBot:
 
         return None
 
+    # ── Auto-delete helper ─────────────────────────────────────────────────
+
+    async def _delete_after(self, message_id: int, delay: int) -> None:
+        """Delete a message after *delay* seconds."""
+        await asyncio.sleep(delay)
+        await self._api_async(
+            "deleteMessage",
+            max_retries=1,
+            chat_id=self._chat_id,
+            message_id=message_id,
+        )
+
     # ── Public interface ───────────────────────────────────────────────────
 
     async def send_message(self, text: str, parse_mode: str = "HTML") -> None:
@@ -472,12 +499,16 @@ class TelegramBot:
         if not text:
             logger.warning({"event": "send_message_empty_text"})
             return
-        await self._api_async(
+        data = await self._api_async(
             "sendMessage",
             chat_id=self._chat_id,
             text=text,
             parse_mode=parse_mode,
         )
+        if data and data.get("ok"):
+            message_id: int | None = data.get("result", {}).get("message_id")
+            if message_id:
+                asyncio.create_task(self._delete_after(message_id, self.MESSAGE_TTL_SECONDS))
 
     async def send_report(
         self,
@@ -865,36 +896,90 @@ class Reporter:
             signal: TradeSignal with .symbol, .direction, .confidence,
                     .expiry_key, .model_name, .timestamp fields.
         """
-        message: str = (
-            f"⚡ *Trade Executed*\n"
-            f"Symbol: `{getattr(signal, 'symbol', '?')}`\n"
-            f"Direction: `{getattr(signal, 'direction', '?')}`\n"
-            f"Confidence: `{getattr(signal, 'confidence', 0):.2%}`\n"
-            f"Expiry: `{getattr(signal, 'expiry_key', '?')}`\n"
-            f"Model: `{getattr(signal, 'model_name', '?')}`"
-        )
+        symbol = getattr(signal, "symbol", "?")
+        direction = getattr(signal, "direction", "?")
+        confidence = getattr(signal, "confidence", 0)
+        expiry_key = getattr(signal, "expiry_key", "?")
+        model_name = getattr(signal, "model_name", "?")
 
         if self._discord:
+            discord_msg = (
+                f"⚡ **Trade Placed**\n"
+                f"Symbol: `{symbol}`\n"
+                f"Direction: `{direction}`\n"
+                f"Confidence: `{confidence:.2%}`\n"
+                f"Expiry: `{expiry_key}`\n"
+                f"Model: `{model_name}`"
+            )
             try:
-                await self._discord.send_alert_async(message, level="info")
+                await self._discord.send_alert_async(discord_msg, level="info")
             except Exception as exc:
                 logger.warning(
                     {"event": "reporter_discord_notify_failed", "error": str(exc)}
                 )
 
         if self._telegram:
+            telegram_msg = (
+                f"⚡ <b>Trade Placed</b>\n"
+                f"Symbol: <code>{symbol}</code>\n"
+                f"Direction: <code>{direction}</code>\n"
+                f"Confidence: <code>{confidence:.2%}</code>\n"
+                f"Expiry: <code>{expiry_key}</code>\n"
+                f"Model: <code>{model_name}</code>"
+            )
             try:
-                await self._telegram.send_message(
-                    message.replace("*", "<b>")
-                    .replace("`", _CODE_TAG)
-                    .replace("</b>\n", "</b>\n")
-                    .replace(_CODE_TAG, _CODE_TAG)
-                    .replace(_CODE_TAG_CLOSE + "\n", _CODE_TAG_CLOSE + "\n"),
-                    parse_mode="HTML",
-                )
+                await self._telegram.send_message(telegram_msg, parse_mode="HTML")
             except Exception as exc:
                 logger.warning(
                     {"event": "reporter_telegram_notify_failed", "error": str(exc)}
+                )
+
+    async def notify_result(self, result: dict[str, Any]) -> None:
+        """
+        Send a trade result notification to all configured channels.
+
+        Called by live.py._consume_results() after every resolved trade.
+
+        Args:
+            result: Dict with keys result, pair, direction, payout, stake.
+        """
+        outcome: str = result.get("result", "?")
+        pair: str = result.get("pair", "?")
+        direction: str = result.get("direction", "?")
+        payout: float = float(result.get("payout", 0))
+        stake: float = float(result.get("stake", 0))
+        pnl: float = payout if outcome == "win" else (-stake if outcome == "loss" else 0.0)
+
+        icon = "✅" if outcome == "win" else "❌" if outcome == "loss" else "➖"
+        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        level = "info" if outcome == "win" else "warning"
+
+        if self._discord:
+            discord_msg = (
+                f"{icon} **Trade Result: {outcome.upper()}**\n"
+                f"Pair: `{pair}`\n"
+                f"Direction: `{direction}`\n"
+                f"P&L: `{pnl_str}`"
+            )
+            try:
+                await self._discord.send_alert_async(discord_msg, level=level)
+            except Exception as exc:
+                logger.warning(
+                    {"event": "reporter_discord_result_failed", "error": str(exc)}
+                )
+
+        if self._telegram:
+            telegram_msg = (
+                f"{icon} <b>Trade Result: {outcome.upper()}</b>\n"
+                f"Pair: <code>{pair}</code>\n"
+                f"Direction: <code>{direction}</code>\n"
+                f"P&amp;L: <code>{pnl_str}</code>"
+            )
+            try:
+                await self._telegram.send_message(telegram_msg, parse_mode="HTML")
+            except Exception as exc:
+                logger.warning(
+                    {"event": "reporter_telegram_result_failed", "error": str(exc)}
                 )
 
     async def send_session_report(

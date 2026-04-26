@@ -1073,6 +1073,7 @@ class LiveEngine:
                     result = None
                 if result:
                     self._process_result(result)
+                    await self._reporter.notify_result(result)
             except Exception as exc:
                 logger.debug({"event": "RESULT_CONSUMER_ERROR", "error": str(exc)})
 
