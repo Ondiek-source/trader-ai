@@ -86,7 +86,10 @@ from ml_engine.trainer import (
 # How many seconds before midnight (UTC) to fire the daily report.
 _DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
 
-_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M5", "15_MIN": "M15"}
+# All expiry keys train on M1 bars — the Labeler's lookahead_bars is always
+# measured in M1 minutes (expiry_seconds // 60), so M5/M15 bars would give
+# wrong labels (5 M5 bars = 25 min, not 5 min for a 5_MIN trade).
+_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M1", "15_MIN": "M1"}
 
 
 logger = logging.getLogger(__name__)
@@ -1319,6 +1322,8 @@ class Pipeline:
                     {
                         "event": "RETRAIN_NO_DATA",
                         "symbol": symbol,
+                        "expiry_key": expiry_key,
+                        "timeframe": _TIMEFRAME_MAP.get(expiry_key, "M1"),
                         "message": "No bar data found, skipping",
                     }
                 )
