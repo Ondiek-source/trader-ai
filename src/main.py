@@ -61,7 +61,7 @@ class _JSONFormatter(logging.Formatter):
                 return ""
 
         entry: dict = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
             "level": record.levelname,
             "component": record.name,
             **payload,
@@ -150,7 +150,7 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
                     "level": "CRITICAL",
                     "component": "main",
                     "event": e.event,
@@ -167,7 +167,7 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
                     "level": "CRITICAL",
                     "component": "main",
                     "event": "CONFIG_LOAD_FAILED",
