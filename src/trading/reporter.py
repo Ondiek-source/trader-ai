@@ -802,7 +802,7 @@ class Reporter:
             self._session = session
 
             # Recent trades from journal (field names match dashboard HTML)
-            if self._journal is not None:
+            if self._journal is not None and event_type in ("result", "session_reset"):
                 try:
                     trades_df = self._journal.get_trade_history(limit=10)
                     if trades_df is not None and not trades_df.empty:

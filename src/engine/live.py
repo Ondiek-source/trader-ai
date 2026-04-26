@@ -635,11 +635,7 @@ class LiveEngine:
         Args:
             tick: Tick object from the stream. Type varies by stream.
         """
-        # ── Push tick counter to dashboard immediately, before any early returns ──
-        # This ensures elapsed_minutes and ticks always update even when bars
-        # are missing, warmup is incomplete, or feature engineering fails.
         self._ticks_processed += 1
-        self._reporter.push_dashboard(self._build_context("tick"))
 
         # ── Accumulate tick into the live bar builder ─────────────────────
         # Every tick updates the in-progress M1 OHLCV bar so that when the
@@ -657,6 +653,7 @@ class LiveEngine:
         if _now_minute == self._last_processed_minute:
             return
         self._last_processed_minute = _now_minute
+        self._reporter.push_dashboard(self._build_context("tick"))
 
         # ── 1. Load recent bars (capped at _BAR_WINDOW - 1) ──────────────
         # We reserve one slot for the live bar built from this minute's ticks.
@@ -773,9 +770,7 @@ class LiveEngine:
         self._consecutive_errors = 0
         if signal.direction != "SKIP":
             self._signals_fired += 1
-
-            # ── Push signal event to dashboard ────────────────────────────────
-        self._reporter.push_dashboard(self._build_context("signal", signal=signal))
+            self._reporter.push_dashboard(self._build_context("signal", signal=signal))
 
         # ── 5. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)
@@ -796,7 +791,7 @@ class LiveEngine:
                 and (now - self._last_execution_time).total_seconds()
                 < self._min_trade_gap_seconds
             ):
-                logger.info(
+                logger.debug(
                     {
                         "event": "TRADE_COOLDOWN_ACTIVE",
                         "symbol": self.symbol,
