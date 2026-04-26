@@ -632,7 +632,7 @@ class Reporter:
 
         if discord_webhook_url:
             self._discord = DiscordReporter(webhook_url=discord_webhook_url)
-            logger.info("[^] Reporter: Discord channel enabled.")
+            logger.info({"event": "REPORTER_DISCORD_ENABLED"})
 
         if telegram_token and telegram_chat_id and orchestrator:
             self._telegram = TelegramBot(
@@ -641,10 +641,10 @@ class Reporter:
                 orchestrator=orchestrator,
                 discord_reporter=self._discord,
             )
-            logger.info("[^] Reporter: Telegram bot enabled.")
+            logger.info({"event": "REPORTER_TELEGRAM_ENABLED"})
 
         if not self._discord and not self._telegram:
-            logger.info("[^] Reporter: no channels configured — all outputs disabled.")
+            logger.info({"event": "REPORTER_NO_CHANNELS"})
 
     def set_journal(self, journal: Any) -> None:
         """Inject the Journal instance for Recent Trades queries."""
@@ -937,7 +937,7 @@ class Reporter:
         if self._telegram is None:
             return
         self._telegram_task = asyncio.create_task(self._telegram.poll_loop())
-        logger.info("[^] Reporter: Telegram polling started.")
+        logger.info({"event": "REPORTER_TELEGRAM_POLLING_STARTED"})
 
     async def close(self) -> None:
         """Shut down all channels and release resources."""
@@ -948,7 +948,7 @@ class Reporter:
             await asyncio.gather(self._telegram_task, return_exceptions=True)
         if self._discord:
             await self._discord.close()
-        logger.info("[^] Reporter: all channels closed.")
+        logger.info({"event": "REPORTER_CLOSED"})
 
     def __repr__(self) -> str:
         channels: list[str] = []

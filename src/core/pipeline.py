@@ -86,6 +86,9 @@ from ml_engine.trainer import (
 # How many seconds before midnight (UTC) to fire the daily report.
 _DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
 
+_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M5", "15_MIN": "M15"}
+
+
 logger = logging.getLogger(__name__)
 
 # ── Module Constants ──────────────────────────────────────────────────────────
@@ -663,15 +666,6 @@ class Pipeline:
             return None
         try:
             model = manager.load(record.artifact_path)
-            logger.info(
-                {
-                    "event": "MODEL_LOADED",
-                    "symbol": symbol,
-                    "expiry_key": expiry_key,
-                    "model_name": record.model_name,
-                    "auc": record.auc,
-                }
-            )
             return model, record
         except Exception as exc:
             logger.warning(
@@ -1315,7 +1309,11 @@ class Pipeline:
                 if (first_boot and self._settings.train_on_full_history)
                 else self._settings.max_rf_rows
             )
-            bars_df = storage.get_bars(symbol, timeframe="M1", max_rows=max_rows)
+            bars_df = storage.get_bars(
+                symbol,
+                timeframe=_TIMEFRAME_MAP.get(expiry_key, "M1"),
+                max_rows=max_rows,
+            )
             if bars_df is None or bars_df.empty:
                 logger.warning(
                     {
@@ -1326,7 +1324,9 @@ class Pipeline:
                 )
                 return
 
-            feature_matrix = engineer.build_matrix(bars_df, symbol)
+            feature_matrix = engineer.build_matrix(
+                bars_df, symbol, timeframe=_TIMEFRAME_MAP.get(expiry_key, "M1")
+            )
             labels = Labeler(expiry_key=expiry_key).compute_labels(bars_df)
             split = DataShaper().split(feature_matrix, labels, expiry_key)
 
@@ -1456,10 +1456,11 @@ class Pipeline:
                 self._last_retrain_time = now
                 continue
 
-            for symbol in self._settings.pairs:
-                await self._retrain_symbol(
-                    symbol, expiry_key, storage, manager, engineer, first_boot
-                )
+            for expiry_key in _EXPIRY_KEY_MAP:
+                for symbol in self._settings.pairs:
+                    await self._retrain_symbol(
+                        symbol, expiry_key, storage, manager, engineer, first_boot
+                    )
 
             self._last_retrain_time = now
             logger.info(

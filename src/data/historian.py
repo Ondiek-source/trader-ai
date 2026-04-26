@@ -319,8 +319,8 @@ class Historian:
             {
                 "event": "TWELVE_DATA_BACKFILL_START",
                 "symbol": symbol,
-                "start_date": start_dt.isoformat(),
-                "end_date": now_utc.isoformat(),
+                "start_date": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "end_date": now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
                 "gap_days": round(gap_days, 1),
             }
         )
@@ -582,7 +582,7 @@ class Historian:
 
             start = last_dt + timedelta(minutes=1)
 
-            logger.info({"event": "DATA_EXISTING_FORWARD", "symbol": symbol, "last_bar": last_dt.isoformat()})
+            logger.info({"event": "DATA_EXISTING_FORWARD", "symbol": symbol, "last_bar": last_dt.strftime("%Y-%m-%dT%H:%M:%S")})
             return start
         # QUOTEX - backward fetch
         else:

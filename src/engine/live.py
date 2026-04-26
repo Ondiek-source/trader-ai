@@ -142,6 +142,8 @@ _BAR_WINDOW: int = 100
 # that are actually a symptom of a deeper unrecoverable failure.
 _MAX_CONSECUTIVE_ERRORS: int = 20
 
+_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M5", "15_MIN": "M15"}
+
 
 class LiveEngine:
     """
@@ -660,7 +662,7 @@ class LiveEngine:
         # StorageError propagates to run() as a fatal failure.
         bars_df: pd.DataFrame | None = self._storage.get_bars(
             symbol=self.symbol,
-            timeframe="M1",
+            timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
             max_rows=_BAR_WINDOW - 1,
         )
 
@@ -733,8 +735,17 @@ class LiveEngine:
         # being zero-filled.
         live_ticks: pd.DataFrame | None = ticks_df if not ticks_df.empty else None
         try:
-            fe_df: pd.DataFrame = self._engineer.transform(hist_bars, live_ticks)
-            fv = self._engineer.get_latest(hist_bars, live_ticks)
+            fe_df: pd.DataFrame = self._engineer.transform(
+                hist_bars,
+                live_ticks,
+                timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
+            )
+
+            fv = self._engineer.get_latest(
+                hist_bars,
+                live_ticks,
+                timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
+            )
         except FeatureEngineerError as exc:
             logger.warning(
                 {
@@ -994,6 +1005,8 @@ class LiveEngine:
         try:
             entry_price = float(result.get("open_price", 0) or 0)
             exit_price = float(result.get("close_price", 0) or 0)
+            if entry_price == 0 or exit_price == 0:
+                return
             outcome = result.get("result", "")
             pnl = (
                 result.get("payout", 0.0)
