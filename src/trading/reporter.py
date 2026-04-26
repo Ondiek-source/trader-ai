@@ -923,22 +923,6 @@ class Reporter:
                     {"event": "reporter_discord_notify_failed", "error": str(exc)}
                 )
 
-        if self._telegram:
-            telegram_msg = (
-                f"⚡ <b>Trade Placed</b>\n"
-                f"Symbol: <code>{symbol}</code>\n"
-                f"Direction: <code>{direction}</code>\n"
-                f"Confidence: <code>{confidence:.2%}</code>\n"
-                f"Expiry: <code>{expiry_key}</code>\n"
-                f"Model: <code>{model_name}</code>"
-            )
-            try:
-                await self._telegram.send_message(telegram_msg, parse_mode="HTML")
-            except Exception as exc:
-                logger.warning(
-                    {"event": "reporter_telegram_notify_failed", "error": str(exc)}
-                )
-
     async def notify_result(self, result: dict[str, Any]) -> None:
         """
         Send a trade result notification to all configured channels.
@@ -973,19 +957,62 @@ class Reporter:
                     {"event": "reporter_discord_result_failed", "error": str(exc)}
                 )
 
-        if self._telegram:
-            telegram_msg = (
-                f"{icon} <b>Trade Result: {outcome.upper()}</b>\n"
-                f"Pair: <code>{pair}</code>\n"
-                f"Direction: <code>{direction}</code>\n"
-                f"P&amp;L: <code>{pnl_str}</code>"
-            )
-            try:
-                await self._telegram.send_message(telegram_msg, parse_mode="HTML")
-            except Exception as exc:
-                logger.warning(
-                    {"event": "reporter_telegram_result_failed", "error": str(exc)}
-                )
+    async def send_daily_target_summary(
+        self,
+        session: dict[str, Any],
+        threshold_state: dict[str, Any],
+        practice_mode: bool = True,
+    ) -> None:
+        """
+        Send a daily-target-reached summary to Telegram only.
+
+        Called by LiveEngine._check_daily_targets() when either the win-count
+        or profit target is hit. Discord receives per-trade alerts; Telegram
+        receives this one summary per day instead.
+
+        Args:
+            session:         Reporter._session dict (wins, losses, draws,
+                             net_profit, signals_fired, elapsed_minutes).
+            threshold_state: ThresholdManager.get_state() snapshot.
+            practice_mode:   True when running in practice/demo mode.
+        """
+        if not self._telegram:
+            return
+
+        wins: int = session.get("wins", 0)
+        losses: int = session.get("losses", 0)
+        draws: int = session.get("draws", 0)
+        net: float = session.get("net_profit", 0.0)
+        signals: int = session.get("signals_fired", 0)
+        elapsed: float = session.get("elapsed_minutes", 0.0)
+        streak: int = threshold_state.get("streak", 0)
+        effective: float = threshold_state.get("effective_threshold", 0.0)
+        base: float = threshold_state.get("base_threshold", 0.0)
+
+        win_rate: float = round(wins / max(wins + losses, 1) * 100, 1)
+        profit_icon: str = "🟢" if net >= 0 else "🔴"
+        mode_label: str = "PRACTICE" if practice_mode else "⚠️ LIVE"
+
+        msg: str = (
+            f"🏁 <b>Daily Target Reached</b>\n"
+            f"🕐 Elapsed: <code>{elapsed:.0f} min</code>\n\n"
+            f"✅ Wins: <code>{wins}</code>\n"
+            f"❌ Losses: <code>{losses}</code>\n"
+            f"➖ Draws: <code>{draws}</code>\n"
+            f"📈 Win Rate: <code>{win_rate}%</code>\n"
+            f"⚡ Signals: <code>{signals}</code>\n"
+            f"{profit_icon} Net Profit: <code>${net:.2f}</code>\n"
+            f"📉 Streak: <code>{streak}</code> consecutive losses\n"
+            f"🎯 Threshold: <code>{effective:.0%}</code>"
+            + (f" (base <code>{base:.0%}</code>)" if effective != base else "")
+            + f"\n🔬 Mode: <code>{mode_label}</code>"
+        )
+
+        try:
+            await self._telegram.send_message(msg, parse_mode="HTML")
+            logger.info({"event": "TELEGRAM_DAILY_SUMMARY_SENT"})
+        except Exception as exc:
+            logger.warning({"event": "TELEGRAM_DAILY_SUMMARY_FAILED", "error": str(exc)})
 
     async def send_session_report(
         self,

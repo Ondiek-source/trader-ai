@@ -974,7 +974,7 @@ class LiveEngine:
                 "symbol": self.symbol,
                 "streak": self._threshold_mgr.streak,
                 "max_streak": self._threshold_mgr.max_streak,
-                "effective_threshold": self._threshold_mgr.get_threshold(),
+                "effective_threshold": round(self._threshold_mgr.get_threshold(), 2),
             }
         )
         self._reporter.push_dashboard(self._build_context("kill_switch"))
@@ -1079,7 +1079,7 @@ class LiveEngine:
                 "payout": result.get("payout"),
                 "stake": result.get("stake"),
                 "streak": self._threshold_mgr.streak,
-                "threshold": self._threshold_mgr.get_threshold(),
+                "threshold": round(self._threshold_mgr.get_threshold(), 2),
             }
         )
 
@@ -1123,6 +1123,13 @@ class LiveEngine:
             self._halted_until_tomorrow = True
             status_store.add_event(
                 f"{self.symbol} paused until tomorrow — {reason}", event_type="info"
+            )
+            asyncio.create_task(
+                self._reporter.send_daily_target_summary(
+                    session=self._reporter._session,
+                    threshold_state=self._threshold_mgr.get_state(),
+                    practice_mode=self._settings.practice_mode,
+                )
             )
 
     async def _midnight_reset_loop(self) -> None:
