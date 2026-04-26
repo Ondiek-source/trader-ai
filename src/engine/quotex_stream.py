@@ -61,7 +61,10 @@ PAIR_TO_ASSETS: dict[str, list[str]] = {
 
 # Direction: our internal → Quotex API
 DIRECTION_TO_QUOTEX: dict[str, str] = {"UP": "call", "DOWN": "put"}
-QUOTEX_TO_DIRECTION: dict[str, str] = {"call": "UP", "put": "DOWN"}
+QUOTEX_TO_DIRECTION: dict[str, str] = {
+    "call": "UP", "put": "DOWN",
+    "0": "UP", "1": "DOWN",  # command field: 0=call, 1=put
+}
 
 # ── Library import ─────────────────────────────────────────────────────────────
 _QuotexClient: Any = None
@@ -476,10 +479,10 @@ class QuotexDataStream:
         trade_asset = trade.get("symbol") or trade.get("asset", "")
         if not trade_asset or not self._assets_match(pair, trade_asset):
             return None
-        # Check direction using multiple possible field names from pyquotex.
-        # Maps "call"→"UP" and "put"→"DOWN" via QUOTEX_TO_DIRECTION. If no
-        # direction field is present at all, skip the filter and rely on the
-        # time window — a 30-second window on a specific asset is unique enough.
+        # Direction: Quotex history uses "directionType": "call"/"put" (primary)
+        # and "command": 0/1 (secondary). QUOTEX_TO_DIRECTION maps both to
+        # our internal "UP"/"DOWN". The loop tries fields in priority order and
+        # breaks on the first non-None hit; falls through if none exist.
         for field in ("directionType", "direction", "command"):
             raw = trade.get(field)
             if raw is not None:
@@ -488,6 +491,12 @@ class QuotexDataStream:
                 if mapped != direction.upper():
                     return None
                 break
+        # Prefer Unix epoch timestamp — available in all Quotex history records
+        # as close_time_timestamp. Fall back to string parsing if absent.
+        close_ts = trade.get("close_time_timestamp")
+        if close_ts is not None:
+            trade_time = datetime.fromtimestamp(float(close_ts), tz=timezone.utc).replace(tzinfo=None)
+            return abs((trade_time - target_time).total_seconds())
         close_time_str = trade.get("close_time") or trade.get("closeTime", "")
         if not close_time_str:
             return None
@@ -513,7 +522,7 @@ class QuotexDataStream:
 
         for trade in history:
             diff = self._trade_time_diff(trade, pair, direction, target_time)
-            if diff is not None and diff < 30 and diff < smallest_diff:
+            if diff is not None and diff < 10 and diff < smallest_diff:
                 smallest_diff = diff
                 closest_trade = trade
 
