@@ -586,6 +586,8 @@ class QuotexDataStream:
 
             profit = float(profit_raw)
             outcome, payout, stake = self._outcome_from_profit(profit)
+            open_price = float(closest_trade.get("open_price") or 0)
+            close_price = float(closest_trade.get("close_price") or 0)
 
             logger.info(
                 {
@@ -603,7 +605,8 @@ class QuotexDataStream:
             )
 
             return self._make_result(
-                "", pair, direction, outcome, payout=payout, stake=stake
+                "", pair, direction, outcome, payout=payout, stake=stake,
+                open_price=open_price, close_price=close_price,
             )
 
         except TimeoutError:
@@ -648,6 +651,8 @@ class QuotexDataStream:
         outcome: str,
         payout: float,
         stake: float = 0.0,
+        open_price: float = 0.0,
+        close_price: float = 0.0,
     ) -> dict[str, Any]:
         """Build a standardised result dict for SignalOrchestrator.on_result."""
         logger.info(
@@ -673,6 +678,8 @@ class QuotexDataStream:
             # the absolute delta (the money lost). For history results, stake
             # equals the absolute profit amount when outcome is loss.
             "stake": round(abs(stake), 4),
+            "open_price": open_price,
+            "close_price": close_price,
             "received_at": datetime.now(timezone.utc).isoformat(),
         }
 
