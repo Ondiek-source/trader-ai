@@ -181,11 +181,16 @@ DASHBOARD_HTML: str = """\
   .conn-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
 
   .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .trades-scroll { max-height: 256px; overflow-y: auto; }
+  .trades-scroll::-webkit-scrollbar { width: 4px; }
+  .trades-scroll::-webkit-scrollbar-track { background: transparent; }
+  .trades-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
   table { width: 100%; border-collapse: collapse; }
   thead th {
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
     color: var(--muted); font-weight: 400; padding: 12px 16px;
     text-align: left; background: var(--surface2); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 1;
   }
   tbody td { padding: 10px 16px; border-bottom: 1px solid var(--border); font-size: 12px; font-family: var(--font-mono); }
   tbody tr:last-child td { border-bottom: none; }
@@ -321,14 +326,16 @@ DASHBOARD_HTML: str = """\
 
 <div class="section-header">Recent Trades</div>
 <div class="table-card">
-  <table>
-    <thead>
-      <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Result</th><th>P&amp;L</th><th>Duration</th></tr>
-    </thead>
-    <tbody id="trades-body">
-      <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px;font-size:11px">No trades yet</td></tr>
-    </tbody>
-  </table>
+  <div class="trades-scroll">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Result</th><th>P&amp;L</th><th>Duration</th></tr>
+      </thead>
+      <tbody id="trades-body">
+        <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px;font-size:11px">No trades yet</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <div class="section-header">Activity Log</div>
@@ -348,6 +355,13 @@ DASHBOARD_HTML: str = """\
 
   function esc(t) {
     return (t||'').replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]||m));
+  }
+
+  function fmtTicks(n) {
+    if (!n && n !== 0) return '—';
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
   }
 
   function evtType(t) {
@@ -457,7 +471,7 @@ DASHBOARD_HTML: str = """\
       const stream = d.stream || {};
       document.getElementById('stream-status').textContent = stream.connected ? 'Online' : 'Offline';
       document.getElementById('stream-status').style.color = stream.connected ? 'var(--accent2)' : 'var(--red)';
-      document.getElementById('ticks').textContent = stream.ticks_received ? Number(stream.ticks_received).toLocaleString() : '—';
+      document.getElementById('ticks').textContent = fmtTicks(stream.ticks_received);
 
       const quotex = d.quotex || {};
       document.getElementById('quotex-status').textContent = quotex.connected ? 'Online' : 'Offline';

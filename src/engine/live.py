@@ -237,6 +237,10 @@ class LiveEngine:
         self._min_trade_gap_seconds: int = 80
         self._last_execution_time: datetime | None = None
 
+        # Set True when a daily target is reached. Clears at midnight so the
+        # engine resumes trading the next day without needing a restart.
+        self._halted_until_tomorrow: bool = False
+
         # ── 1. Storage (fail-hard) ────────────────────────────────────────
         # StorageError propagates immediately — no engine without storage.
         self._storage: Storage = get_storage()
@@ -572,6 +576,9 @@ class LiveEngine:
                 }
             )
 
+        # Midnight reset: clears daily counters and resumes trading after target halt
+        midnight_task = asyncio.create_task(self._midnight_reset_loop())
+
         try:
             async for tick in self._stream.subscribe():
                 if not self.is_running:
@@ -609,13 +616,15 @@ class LiveEngine:
             raise  # Propagate fatal errors to pipeline.py
 
         finally:
-            # Clean up result consumer
+            # Clean up background tasks
             if result_task:
                 result_task.cancel()
                 await result_task
             if result_producer_task:
                 result_producer_task.cancel()
                 await result_producer_task
+            midnight_task.cancel()
+            await midnight_task
             logger.info(
                 {
                     "event": "LIVE_ENGINE_STOPPED",
@@ -645,6 +654,10 @@ class LiveEngine:
             tick: Tick object from the stream. Type varies by stream.
         """
         self._ticks_processed += 1
+
+        # Daily target reached — skip inference until midnight reset
+        if self._halted_until_tomorrow:
+            return
 
         # ── Accumulate tick into the live bar builder ─────────────────────
         # Every tick updates the in-progress M1 OHLCV bar so that when the
@@ -1071,12 +1084,22 @@ class LiveEngine:
         )
 
     def _check_daily_targets(self) -> None:
-        """Stop the engine if a daily win-count or profit target has been reached."""
+        """Pause trading for the day when a daily win-count or profit target is hit.
+
+        Sets _halted_until_tomorrow=True so inference is skipped until the
+        midnight reset loop clears the flag and starts a fresh session.
+        The engine loop itself keeps running so the stream stays connected.
+        """
+        if self._halted_until_tomorrow:
+            return  # Already paused
+
         session = self._reporter._session
         wins = session.get("wins", 0)
         net_profit = session.get("net_profit", 0.0)
 
+        reason: str = ""
         if wins >= self._settings.daily_trade_target:
+            reason = f"{wins} wins — daily trade target reached"
             logger.info(
                 {
                     "event": "DAILY_TRADE_TARGET_REACHED",
@@ -1084,26 +1107,57 @@ class LiveEngine:
                     "target": self._settings.daily_trade_target,
                 }
             )
-            status_store.add_event(
-                f"Daily trade target reached: {wins} wins — stopping", event_type="info"
-            )
-            self.stop()
-            return
+        else:
+            profit_target = self._settings.daily_net_profit_target
+            if profit_target is not None and net_profit >= profit_target:
+                reason = f"${net_profit:.2f} profit — daily profit target reached"
+                logger.info(
+                    {
+                        "event": "DAILY_PROFIT_TARGET_REACHED",
+                        "net_profit": round(net_profit, 2),
+                        "target": profit_target,
+                    }
+                )
 
-        profit_target = self._settings.daily_net_profit_target
-        if profit_target is not None and net_profit >= profit_target:
+        if reason:
+            self._halted_until_tomorrow = True
+            status_store.add_event(
+                f"{self.symbol} paused until tomorrow — {reason}", event_type="info"
+            )
+
+    async def _midnight_reset_loop(self) -> None:
+        """Reset 24-hour rolling counters at UTC midnight every day.
+
+        Also clears _halted_until_tomorrow so trading resumes automatically
+        without a container restart. Runs as a background task inside run().
+        """
+        while self.is_running:
+            now = datetime.now(timezone.utc)
+            # Sleep until 00:01 UTC to avoid races at the exact boundary
+            tomorrow = (now + timedelta(days=1)).replace(
+                hour=0, minute=1, second=0, microsecond=0
+            )
+            await asyncio.sleep((tomorrow - now).total_seconds())
+
+            self._ticks_processed = 0
+            self._signals_fired = 0
+            was_halted = self._halted_until_tomorrow
+            self._halted_until_tomorrow = False
+
+            self._reporter.push_dashboard(self._build_context("session_reset"))
             logger.info(
                 {
-                    "event": "DAILY_PROFIT_TARGET_REACHED",
-                    "net_profit": round(net_profit, 2),
-                    "target": profit_target,
+                    "event": "DAILY_RESET",
+                    "symbol": self.symbol,
+                    "expiry_key": self.expiry_key,
+                    "resumed_from_halt": was_halted,
                 }
             )
             status_store.add_event(
-                f"Daily profit target reached: ${net_profit:.2f} — stopping",
+                f"New day — {self.symbol} session reset"
+                + (" (trading resumed)" if was_halted else ""),
                 event_type="info",
             )
-            self.stop()
 
     async def _consume_results(self) -> None:
         """Background task to consume trade results from QuotexDataStream."""
