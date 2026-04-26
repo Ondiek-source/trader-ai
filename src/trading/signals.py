@@ -252,6 +252,7 @@ class SignalGenerator:
         self,
         symbol: str,
         expiry_key: str,
+        model_manager: ModelManager | None = None,
     ) -> None:
         """
         Initialise the SignalGenerator and attempt to load the best model.
@@ -262,8 +263,11 @@ class SignalGenerator:
         run has not completed yet.
 
         Args:
-            symbol:     Currency pair to generate signals for.
-            expiry_key: Expiry window key. Must be in BINARY_EXPIRY_RULES.
+            symbol:        Currency pair to generate signals for.
+            expiry_key:    Expiry window key. Must be in BINARY_EXPIRY_RULES.
+            model_manager: Shared ModelManager instance. If None, a new one
+                           is created. Pass the pipeline-owned instance to
+                           avoid multiple managers pointing at the same dir.
 
         Raises:
             ValueError: If expiry_key is not in BINARY_EXPIRY_RULES.
@@ -280,7 +284,7 @@ class SignalGenerator:
         self.expiry_seconds: int = _EXPIRY_SECONDS[expiry_key]
         self.threshold: float = self._settings.confidence_threshold
 
-        self._manager: ModelManager = ModelManager(storage_dir=self._settings.model_dir)
+        self._manager: ModelManager = model_manager or ModelManager(storage_dir=self._settings.model_dir)
 
         # Model artifact and its registry record. Both None until a
         # trained artifact exists. generate() returns SKIP when None.

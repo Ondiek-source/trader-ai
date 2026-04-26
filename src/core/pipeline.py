@@ -157,6 +157,7 @@ class Pipeline:
         """
         self._settings = get_settings()
         self._storage: Storage | None = None
+        self._manager: ModelManager | None = None
         self._engines: list[LiveEngine] = []
         self._tasks: list[asyncio.Task] = []
         self._shutdown_requested: bool = False
@@ -195,8 +196,9 @@ class Pipeline:
             self._storage = await self._stage_storage()
             await self._stage_historian_sync()
             self._stage_feature_warmup(self._storage)
-            model_map = await self._stage_model_load()
-            await self._stage_ignition(model_map)
+            self._manager = ModelManager(storage_dir=self._settings.model_dir)
+            model_map = await self._stage_model_load(self._manager)
+            await self._stage_ignition(model_map, self._manager)
             await self._run_task_group()
 
         except PipelineError:
@@ -673,7 +675,7 @@ class Pipeline:
             )
             return None
 
-    async def _stage_model_load(self) -> dict[tuple[str, str], Any]:
+    async def _stage_model_load(self, manager: ModelManager) -> dict[tuple[str, str], Any]:
         """
         Pull model artifacts from Blob and load them into memory.
 
@@ -683,11 +685,13 @@ class Pipeline:
         Load failures are demoted to warnings — the retrain scheduler recovers
         on first boot.
 
+        Args:
+            manager: Shared ModelManager instance owned by the pipeline.
+
         Returns:
             dict keyed by (symbol, expiry_key) -> (model_artifact, ModelRecord).
             Pairs with no available model are absent from the dict.
         """
-        manager = ModelManager(storage_dir=self._settings.model_dir)
         model_map: dict[tuple[str, str], Any] = {}
 
         for symbol in self._settings.pairs:
@@ -711,6 +715,7 @@ class Pipeline:
     async def _stage_ignition(
         self,
         model_map: dict[tuple[str, str], Any],
+        manager: ModelManager,
     ) -> list[LiveEngine]:
         """
         Construct LiveEngines and inject pre-loaded model artifacts.
@@ -745,7 +750,7 @@ class Pipeline:
 
         for symbol in self._settings.pairs:
             try:
-                engine = await LiveEngine.create(symbol, expiry_key)
+                engine = await LiveEngine.create(symbol, expiry_key, model_manager=manager)
 
             except LiveEngineError as exc:
                 raise PipelineError(str(exc), stage="ignition") from exc
@@ -839,14 +844,18 @@ class Pipeline:
                 )
             )
 
-        # Retrain scheduler — receives the shared Storage instance
+        # Retrain scheduler — receives the shared Storage and ModelManager instances
         assert self._storage is not None, (
             "Pipeline._storage must be initialised before _run_task_group(). "
             "Ensure _stage_storage() completed successfully."
         )
+        assert self._manager is not None, (
+            "Pipeline._manager must be initialised before _run_task_group(). "
+            "Ensure _stage_model_load() completed successfully."
+        )
         self._tasks.append(
             asyncio.create_task(
-                self._retrain_scheduler(self._storage),
+                self._retrain_scheduler(self._storage, self._manager),
                 name="retrain_scheduler",
             )
         )
@@ -1215,6 +1224,22 @@ class Pipeline:
     ) -> None:
         try:
             if first_boot:
+                # Check local registry first — works in both LOCAL and CLOUD mode.
+                # pull_from_blob() returns None in LOCAL mode so would always
+                # fall through and trigger an unnecessary retrain.
+                if manager.get_best_model(symbol=symbol, expiry_key=expiry_key) is not None:
+                    logger.info(
+                        {
+                            "event": "RETRAIN_MODEL_EXISTS",
+                            "symbol": symbol,
+                            "expiry_key": expiry_key,
+                            "model_name": model_name,
+                            "source": "local",
+                        }
+                    )
+                    return
+                # In CLOUD mode also check blob — local registry may be empty
+                # on a fresh container that hasn't pulled artifacts yet.
                 existing = await manager.pull_from_blob(
                     symbol=symbol,
                     expiry_key=expiry_key,
@@ -1227,6 +1252,7 @@ class Pipeline:
                             "symbol": symbol,
                             "expiry_key": expiry_key,
                             "model_name": model_name,
+                            "source": "blob",
                         }
                     )
                     return
@@ -1238,7 +1264,7 @@ class Pipeline:
                     "model_name": model_name,
                 }
             )
-            result = result = trainer.train(split, is_incremental=not first_boot)
+            result = trainer.train(split, is_incremental=not first_boot)
             auc = result.metrics.get("auc", 0)
             logger.info(
                 {
@@ -1384,7 +1410,7 @@ class Pipeline:
                 f"Retrain failed for {symbol}: {exc}", event_type="kill"
             )
 
-    async def _retrain_scheduler(self, storage: Storage) -> None:
+    async def _retrain_scheduler(self, storage: Storage, manager: ModelManager) -> None:
         """
         Background loop that triggers periodic model retraining.
 
@@ -1393,15 +1419,16 @@ class Pipeline:
         runs a full training cycle for each symbol, saves the
         artifact, and hot-reloads each matching LiveEngine.
 
-        Uses the Stage 1 Storage instance — does not construct a second one.
+        Uses the shared Stage 1 Storage and pipeline ModelManager — does not
+        construct additional instances.
 
         Individual symbol failures are caught and logged as warnings. The
         scheduler continues to the next symbol and does not abort.
 
         Args:
             storage: Stage 1 Storage instance shared from run().
+            manager: Shared ModelManager instance owned by the pipeline.
         """
-        manager = ModelManager(storage_dir=self._settings.model_dir)
         engineer = get_feature_engineer()
         inv_map: dict[int, str] = _SECONDS_TO_EXPIRY_KEY
         is_first_run: bool = True

@@ -161,6 +161,7 @@ class LiveEngine:
         self,
         symbol: str,
         expiry_key: str = "1_MIN",
+        model_manager: ModelManager | None = None,
     ) -> None:
         """
         Initialise the LiveEngine and all downstream components.
@@ -182,9 +183,12 @@ class LiveEngine:
             9. Reporter             (warning-only — degrade gracefully)
 
         Args:
-            symbol:     Currency pair to trade, e.g. "EUR_USD".
-            expiry_key: Expiry window. Must be one of the keys in
-                        BINARY_EXPIRY_RULES from features.py.
+            symbol:        Currency pair to trade, e.g. "EUR_USD".
+            expiry_key:    Expiry window. Must be one of the keys in
+                           BINARY_EXPIRY_RULES from features.py.
+            model_manager: Shared ModelManager instance. If None, a new one
+                           is created. Pass the pipeline-owned instance so
+                           the entire stack shares one registry handle.
 
         Raises:
             ValueError:      If symbol is empty or expiry_key is invalid.
@@ -245,8 +249,9 @@ class LiveEngine:
         self._stream: Any = self._init_stream()
 
         # ── 4. Model Manager + cold-start ─────────────────────────────────
-        # Instantiated once here and reused.
-        self._model_manager: ModelManager = ModelManager(
+        # Use injected instance when available so the whole pipeline shares
+        # one ModelManager pointing at the same registry directory.
+        self._model_manager: ModelManager = model_manager or ModelManager(
             storage_dir=self._settings.model_dir
         )
 
@@ -254,6 +259,7 @@ class LiveEngine:
         self._signal_gen: SignalGenerator = SignalGenerator(
             symbol=self.symbol,
             expiry_key=self.expiry_key,
+            model_manager=self._model_manager,
         )
 
         # ── 5a. Threshold Manager ─────────────────────────────────────────
@@ -300,6 +306,7 @@ class LiveEngine:
         cls,
         symbol: str,
         expiry_key: str = "1_MIN",
+        model_manager: ModelManager | None = None,
     ) -> "LiveEngine":
         """
         Async factory method to create and initialize a LiveEngine.
@@ -308,14 +315,15 @@ class LiveEngine:
         properly awaits the async _cold_start() method.
 
         Args:
-            symbol: Currency pair to trade, e.g. "EUR_USD".
-            expiry_key: Expiry window, e.g. "1_MIN".
+            symbol:        Currency pair to trade, e.g. "EUR_USD".
+            expiry_key:    Expiry window, e.g. "1_MIN".
+            model_manager: Shared ModelManager instance forwarded to __init__.
 
         Returns:
             LiveEngine: Fully initialized and ready to run.
         """
         # Create instance (__init__ does NOT call _cold_start)
-        engine = cls(symbol, expiry_key)
+        engine = cls(symbol, expiry_key, model_manager=model_manager)
 
         # Connect the stream if it's QuotexDataStream
         if hasattr(engine._stream, "connect"):

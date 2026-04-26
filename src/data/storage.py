@@ -86,6 +86,9 @@ class Storage:
         Timestamp('2024-01-15 10:30:00')
     """
 
+    # Suppress repeated LOCAL-mode upload warnings — log once per process lifetime.
+    _local_mode_warned: bool = False
+
     def __init__(self) -> None:
         """
         Initialise the Storage custodian.
@@ -628,7 +631,9 @@ class Storage:
             True
         """
         if self._container_client is None:
-            logger.warning({"event": "STORAGE_SAVE_MODEL_DISABLED", "mode": "LOCAL"})
+            if not Storage._local_mode_warned:
+                logger.warning({"event": "STORAGE_SAVE_MODEL_DISABLED", "mode": "LOCAL", "message": "Running in LOCAL mode — model uploads disabled for this session"})
+                Storage._local_mode_warned = True
             return False
 
         for local_path in (artifact_path, metadata_path):
