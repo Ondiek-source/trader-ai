@@ -23,12 +23,12 @@ Both channels send at end of session window (or on demand via /report).
 
 from __future__ import annotations
 
+import aiohttp
 import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
-
-import aiohttp
+from core.dashboard import status_store
 
 logger = logging.getLogger(__name__)
 
@@ -626,6 +626,9 @@ class Reporter:
         self._discord: DiscordReporter | None = None
         self._telegram: TelegramBot | None = None
         self._telegram_task: asyncio.Task[None] | None = None
+        self._journal: Any = None
+        self._session: dict[str, Any] = {}
+        self._started_at: str | None = None
 
         if discord_webhook_url:
             self._discord = DiscordReporter(webhook_url=discord_webhook_url)
@@ -642,6 +645,196 @@ class Reporter:
 
         if not self._discord and not self._telegram:
             logger.info("[^] Reporter: no channels configured — all outputs disabled.")
+
+    def set_journal(self, journal: Any) -> None:
+        """Inject the Journal instance for Recent Trades queries."""
+        self._journal = journal
+
+    def push_dashboard(self, context: dict[str, Any]) -> None:
+        """
+        Build and push a complete dashboard snapshot.
+
+        Called by LiveEngine after every pipeline event. Fetches all
+        metrics (threshold, session, journal, connection) and pushes
+        a single atomic update to status_store. No 10-second polling
+        needed — every event triggers an immediate full refresh.
+
+        Args:
+            context: Dict from LiveEngine._build_context() containing
+                event_type, symbol, is_running, ticks, signals, connected,
+                balance, threshold_state, signal, result, session, started_at.
+        """
+        try:
+            event_type = context.get("event_type", "tick")
+            symbol = context.get("symbol", "")
+            expiry_key = context.get("expiry_key", "")
+            connected = context.get("connected", True)
+            balance = context.get("balance", 0.0)
+            is_running = context.get("is_running", False)
+            ticks = context.get("ticks_processed", 0)
+            signals = context.get("signals_fired", 0)
+            threshold_state = context.get("threshold_state", {})
+            signal = context.get("signal")
+            result = context.get("result")
+            # Elapsed time — uses reporter-owned _started_at
+            elapsed_minutes: float = 0.0
+            if self._started_at:
+                started_at = datetime.fromisoformat(self._started_at)
+                elapsed_minutes = (
+                    datetime.now(timezone.utc) - started_at
+                ).total_seconds() / 60.0
+
+            # Session — uses reporter-owned _session
+            session = dict(self._session)
+
+            # Base update — always pushed regardless of event type
+            update: dict[str, Any] = {
+                "stream": {
+                    "connected": connected,
+                    "ticks_received": ticks,
+                },
+                "quotex": {
+                    "connected": connected,
+                    "balance": balance,
+                },
+                "martingale_streak": threshold_state.get("streak", 0),
+                "martingale_max_streak": threshold_state.get("max_streak", 4),
+                "confidence_threshold": threshold_state.get(
+                    "effective_threshold", 0.58
+                ),
+                "base_confidence_threshold": threshold_state.get(
+                    "base_threshold", 0.58
+                ),
+                "kill_switch_active": threshold_state.get("halted", False),
+                "pending_signals": context.get("pending_signals", 0),
+                "practice_mode": context.get("practice_mode", True),
+            }
+
+            # Session base
+            session["elapsed_minutes"] = round(elapsed_minutes, 1)
+            session["is_active"] = is_running
+            session["signals_fired"] = signals
+
+            # Event-specific updates
+            last_event: str = ""
+
+            if event_type == "signal" and signal is not None:
+                if signal.direction != "SKIP":
+                    last_event = (
+                        f"{symbol} {signal.direction} @ "
+                        f"{signal.confidence:.1%} [{expiry_key}]"
+                    )
+                else:
+                    last_event = f"{symbol} SKIP ({signal.confidence:.1%})"
+
+            elif event_type == "cooldown" and signal is not None:
+                last_event = (
+                    f"{symbol} COOLDOWN ({signal.direction} "
+                    f"{signal.confidence:.1%})"
+                )
+
+            elif event_type == "result" and result is not None:
+                outcome = result.get("result", "")
+                if outcome == "win":
+                    session["wins"] = session.get("wins", 0) + 1
+                    session["net_profit"] = session.get("net_profit", 0.0) + result.get(
+                        "payout", 0.0
+                    )
+                elif outcome == "loss":
+                    session["losses"] = session.get("losses", 0) + 1
+                    session["net_profit"] = session.get("net_profit", 0.0) - result.get(
+                        "stake", 0.0
+                    )
+                elif outcome == "draw":
+                    session["draws"] = session.get("draws", 0) + 1
+                pnl = result.get("payout", 0) or -result.get("stake", 0)
+                last_event = f"{symbol} {outcome.upper()} ${pnl:+.2f}"
+
+            elif event_type == "kill_switch":
+                session["is_active"] = False
+                streak = threshold_state.get("streak", 0)
+                last_event = f"Kill switch: {symbol} — {streak} consecutive losses"
+
+            elif event_type == "session_reset":
+                session = {
+                    "is_active": True,
+                    "wins": 0,
+                    "losses": 0,
+                    "draws": 0,
+                    "net_profit": 0.0,
+                    "signals_fired": 0,
+                    "elapsed_minutes": 0.0,
+                }
+
+                self._session = session
+
+                self._started_at = datetime.now(timezone.utc).isoformat()
+                update["started_at"] = self._started_at
+                last_event = f"Session started for {symbol}"
+
+            elif event_type == "fatal_error":
+                errors = context.get("consecutive_errors", 0)
+                session["is_active"] = False
+                last_event = f"Engine fatal: {errors} consecutive errors — terminating"
+
+            elif event_type == "engine_crash":
+                session["is_active"] = False
+                last_event = f"Engine crashed: {symbol}"
+
+            elif event_type == "webhook_failed":
+                session["is_active"] = False
+                sig = context.get("signal")
+                last_event = (
+                    f"Webhook failed: {getattr(sig, 'symbol', '?')} — shutting down"
+                )
+
+            elif event_type == "journal_failed":
+                session["is_active"] = False
+                sig = context.get("signal")
+                last_event = (
+                    f"Journal failed: {getattr(sig, 'symbol', '?')} — shutting down"
+                )
+
+            if last_event:
+                update["last_event"] = last_event
+
+            update["session"] = session
+            self._session = session
+
+            # Recent trades from journal (field names match dashboard HTML)
+            if self._journal is not None:
+                try:
+                    trades_df = self._journal.get_trade_history(limit=10)
+                    if trades_df is not None and not trades_df.empty:
+                        recent: list[dict[str, Any]] = []
+                        for _, row in trades_df.iterrows():
+                            pnl = float(row.get("result", 0))
+                            if pnl > 0:
+                                result_label = "win"
+                            elif pnl < 0:
+                                result_label = "loss"
+                            else:
+                                result_label = "draw"
+                            recent.append(
+                                {
+                                    "time": str(row.get("timestamp", ""))[:19],
+                                    "symbol": str(row.get("symbol", "")),
+                                    "side": str(row.get("side", "")),
+                                    "result": result_label,
+                                    "pnl": pnl,
+                                    "duration": (
+                                        str(int(row.get("duration_seconds", 0))) + "s"
+                                    ),
+                                }
+                            )
+                        update["recent_trades"] = recent
+                except Exception:
+                    pass
+
+            status_store.update(update)
+
+        except Exception as exc:
+            logger.warning({"event": "DASHBOARD_PUSH_FAILED", "error": str(exc)})
 
     # ── The interface live.py calls ────────────────────────────────────────
 

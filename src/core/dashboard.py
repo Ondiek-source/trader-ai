@@ -7,8 +7,7 @@ Exposes three endpoints:
     GET /health   → Structured health check for Docker / load balancers
 
 Data sources:
-    StatusStore  — push-based live state from pipeline.py / live.py
-    Journal      — pull-based trade history and session stats on /status
+    StatusStore  — push-based; recent_trades pushed by Reporter
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import logging
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from threading import Thread
 from typing import Any
 
@@ -579,59 +577,6 @@ class StatusStore:
 status_store: StatusStore = StatusStore()
 
 
-# ── Journal reader ─────────────────────────────────────────────────────────────
-
-
-def _load_recent_trades(journal_dir: str, limit: int = 10) -> list[dict[str, Any]]:
-    """
-    Read the most recent trade entries from the journal Parquet file.
-
-    Returns an empty list if the journal doesn't exist yet or is unreadable.
-    The dashboard calls this on every /status request so the trade table
-    stays current without push-based updates from live.py.
-
-    Args:
-        journal_dir: Path to the journal data directory.
-        limit: Maximum number of recent trades to return.
-
-    Returns:
-        List of dicts with keys: time, symbol, side, result, pnl.
-    """
-    try:
-        import pandas as pd
-
-        trades_path = Path(journal_dir) / "trades.parquet"
-        if not trades_path.exists():
-            return []
-
-        df = pd.read_parquet(trades_path)
-        if df.empty:
-            return []
-
-        df = df.tail(limit).iloc[::-1]  # most recent first
-
-        trades: list[dict[str, Any]] = []
-        for _, row in df.iterrows():
-            result_val = float(row.get("result", 0))
-            if result_val > 0:
-                result_label = "win"
-            elif result_val < 0:
-                result_label = "loss"
-            else:
-                result_label = "draw"
-            trades.append(
-                {
-                    "time": str(row.get("timestamp", ""))[:19],
-                    "symbol": str(row.get("symbol", "")),
-                    "side": str(row.get("side", "")),
-                    "result": result_label,
-                    "pnl": result_val,
-                }
-            )
-        return trades
-
-    except Exception:
-        return []
 
 
 # ── HTTP Handler ───────────────────────────────────────────────────────────────
@@ -640,16 +585,12 @@ def _load_recent_trades(journal_dir: str, limit: int = 10) -> list[dict[str, Any
 class _Handler(BaseHTTPRequestHandler):
     """Serves the dashboard HTML, JSON status, and health check."""
 
-    # Class-level config — set once before first request.
-    _journal_dir: str = ""
-
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/", "/index.html"):
             self._respond(200, "text/html", DASHBOARD_HTML.encode())
         elif self.path == "/status":
             snapshot = status_store.get()
-            # Enrich with journal trade history
-            snapshot["recent_trades"] = _load_recent_trades(self._journal_dir, limit=10)
+            # recent_trades is now pushed by Reporter.push_dashboard()
             payload: bytes = json.dumps(snapshot, default=str).encode()
             self._respond(200, "application/json", payload)
         elif self.path == "/health":
@@ -692,8 +633,6 @@ async def run_dashboard(port: int = 8080) -> None:
 
     # Resolve journal directory — journal.py writes trades.parquet
     # alongside storage data. Use the same data_dir root.
-    journal_dir: str = str(Path(settings.data_dir).resolve())
-    _Handler._journal_dir = journal_dir
 
     server: HTTPServer = HTTPServer(("0.0.0.0", port), _Handler)
     thread: Thread = Thread(target=server.serve_forever, daemon=True, name="dashboard")
@@ -704,7 +643,6 @@ async def run_dashboard(port: int = 8080) -> None:
             "event": "DASHBOARD_STARTED",
             "port": port,
             "url": f"http://0.0.0.0:{port}",
-            "journal_dir": journal_dir,
         }
     )
 

@@ -94,9 +94,9 @@ import pandas as pd
 
 
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from core.config import get_settings
-from data.journal import Journal, SignalEntry
+from data.journal import Journal, SignalEntry, TradeEntry
 from data.storage import (
     Storage,
     get_storage,
@@ -114,7 +114,6 @@ from ml_engine.model_manager import ModelManager
 from engine.twelveticks_stream import TwelveDataStream
 from engine.quotex_stream import QuotexDataStream
 from datetime import datetime, timezone as _tz
-from core.dashboard import status_store
 from trading.signals import SignalGenerator, SignalGeneratorError, TradeSignal
 from trading.threshold_manager import ThresholdManager
 from core.exceptions import (
@@ -228,6 +227,10 @@ class LiveEngine:
         # state while _process_tick() is mid-inference. Both the asyncio
         # event loop and any pipeline.py coroutine use this.
         self._reload_lock: asyncio.Lock = asyncio.Lock()
+        # Inter-trade cooldown: minimum seconds between executed signals.
+        # Prevents firing a second trade before the previous one settles.
+        self._min_trade_gap_seconds: int = 80
+        self._last_execution_time: datetime | None = None
 
         # ── 1. Storage (fail-hard) ────────────────────────────────────────
         # StorageError propagates immediately — no engine without storage.
@@ -274,6 +277,7 @@ class LiveEngine:
 
         # ── 8. Reporter ───────────────────────────────────────────────────
         self._reporter: Reporter = self._init_reporter()
+        self._reporter.set_journal(self._journal_client)
 
         logger.info(
             {
@@ -538,25 +542,7 @@ class LiveEngine:
         # started_at is seeded at StatusStore.__init__ (module import time).
         # Resetting it here means elapsed_minutes counts from when the engine
         # actually begins trading, not from container boot / backfill time.
-        try:
-            status_store.update(
-                {
-                    "started_at": datetime.now(_tz.utc).isoformat(),
-                    "session": {
-                        "is_active": True,
-                        "wins": 0,
-                        "losses": 0,
-                        "draws": 0,
-                        "net_profit": 0.0,
-                        "signals_fired": 0,
-                        "elapsed_minutes": 0.0,
-                    },
-                }
-            )
-        except Exception as exc:
-            raise LiveEngineError(
-                f"Failed to initialize dashboard status: {exc}", stage="dashboard_init"
-            ) from exc
+        self._reporter.push_dashboard(self._build_context("session_reset"))
 
         # Start result consumer task (only for Quotex)
         result_task = None
@@ -567,6 +553,16 @@ class LiveEngine:
                     "event": "LIVE_ENGINE_CONSUMER_STARTED",
                 }
             )
+        # Start result producer task (only for Quotex) — resolves pending signals
+        result_producer_task = None
+        if hasattr(self._stream, "poll_results"):
+            result_producer_task = asyncio.create_task(self._stream.poll_results())
+            logger.info(
+                {
+                    "event": "LIVE_ENGINE_RESULT_PRODUCER_STARTED",
+                }
+            )
+
         try:
             async for tick in self._stream.subscribe():
                 if not self.is_running:
@@ -577,10 +573,7 @@ class LiveEngine:
                 # Self-termination guard: if too many consecutive errors
                 # have accumulated, something is structurally wrong.
                 if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
-                    status_store.add_event(
-                        f"Engine fatal: {self._consecutive_errors} consecutive errors - terminating",
-                        event_type="kill",
-                    )
+                    self._reporter.push_dashboard(self._build_context("fatal_error"))
                     self.is_running = False
                     raise LiveEngineError(
                         f"Consecutive error limit ({_MAX_CONSECUTIVE_ERRORS}) "
@@ -602,9 +595,7 @@ class LiveEngine:
                     "error_type": type(exc).__name__,
                 }
             )
-            status_store.add_event(
-                f"Engine crashed: {self.symbol} - {exc}", event_type="kill"
-            )
+            self._reporter.push_dashboard(self._build_context("engine_crash"))
             self.is_running = False
             raise  # Propagate fatal errors to pipeline.py
 
@@ -613,6 +604,9 @@ class LiveEngine:
             if result_task:
                 result_task.cancel()
                 await result_task
+            if result_producer_task:
+                result_producer_task.cancel()
+                await result_producer_task
             logger.info(
                 {
                     "event": "LIVE_ENGINE_STOPPED",
@@ -645,7 +639,7 @@ class LiveEngine:
         # This ensures elapsed_minutes and ticks always update even when bars
         # are missing, warmup is incomplete, or feature engineering fails.
         self._ticks_processed += 1
-        self._push_stream_status_tick_only()
+        self._reporter.push_dashboard(self._build_context("tick"))
 
         # ── Accumulate tick into the live bar builder ─────────────────────
         # Every tick updates the in-progress M1 OHLCV bar so that when the
@@ -780,8 +774,8 @@ class LiveEngine:
         if signal.direction != "SKIP":
             self._signals_fired += 1
 
-        # ── Push stream + session counters to dashboard ───────────────────
-        self._push_stream_status(signal)
+            # ── Push signal event to dashboard ────────────────────────────────
+        self._reporter.push_dashboard(self._build_context("signal", signal=signal))
 
         # ── 5. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)
@@ -794,20 +788,32 @@ class LiveEngine:
         # ── 7. Execute only if signal is actionable ───────────────────────
         # is_executable() checks direction != SKIP only — the model's
         # confidence threshold is the sole filter; no redundant gate check.
+        # Inter-trade cooldown prevents firing before the previous trade settles.
         if signal.is_executable():
-            await self._execute(signal)
-        else:
-            logger.debug(
-                {
-                    "event": "SIGNAL_NOT_EXECUTABLE",
-                    "symbol": signal.symbol,
-                    "direction": signal.direction,
-                    "message": f"Signal not executable for {signal.symbol} - journaled only",
-                }
-            )
-
-        # ── 8. Push updated threshold state to dashboard ──────────────────
-        self._push_threshold_to_dashboard()
+            now = datetime.now(timezone.utc)
+            if (
+                self._last_execution_time is not None
+                and (now - self._last_execution_time).total_seconds()
+                < self._min_trade_gap_seconds
+            ):
+                logger.info(
+                    {
+                        "event": "TRADE_COOLDOWN_ACTIVE",
+                        "symbol": self.symbol,
+                        "direction": signal.direction,
+                        "confidence": signal.confidence,
+                        "seconds_since_last": round(
+                            (now - self._last_execution_time).total_seconds(), 1
+                        ),
+                        "cooldown_required": self._min_trade_gap_seconds,
+                    }
+                )
+                self._reporter.push_dashboard(
+                    self._build_context("cooldown", signal=signal)
+                )
+            else:
+                await self._execute(signal)
+                self._last_execution_time = datetime.now(timezone.utc)
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
@@ -852,14 +858,29 @@ class LiveEngine:
                     "error": str(exc),
                 }
             )
-            status_store.add_event(
-                f"Webhook failed for {signal.symbol} - system shutting down",
-                event_type="kill",
+            self._reporter.push_dashboard(
+                self._build_context("webhook_failed", signal=signal)
             )
             raise LiveEngineError(
                 f"Webhook fire failed for {signal.symbol} {signal.direction}: {exc}",
                 stage="webhook_fire",
             ) from exc
+
+        # Register signal for result tracking via Quotex history matching
+        if hasattr(self._stream, "register_pending"):
+            _EXPIRY_SECONDS_MAP = {"1_MIN": 60, "5_MIN": 300, "15_MIN": 900}
+            expiry_seconds = _EXPIRY_SECONDS_MAP.get(signal.expiry_key, 60)
+            expiry_time = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
+            self._stream.register_pending(
+                signal_id=f"{signal.symbol}_{int(datetime.now(timezone.utc).timestamp())}",
+                signal={
+                    "pair": signal.symbol,
+                    "direction": signal.direction,
+                    "confidence": signal.confidence,
+                    "expiry_key": signal.expiry_key,
+                },
+                expiry_time=expiry_time,
+            )
 
         try:
             await self._reporter.notify(signal)
@@ -903,9 +924,8 @@ class LiveEngine:
                     "error": str(exc),
                 }
             )
-            status_store.add_event(
-                f"Journal write failed for {signal.symbol} - system shutting down",
-                event_type="kill",
+            self._reporter.push_dashboard(
+                self._build_context("journal_failed", signal=signal)
             )
             raise LiveEngineError(
                 f"Journal write failed for {signal.symbol}: {exc}",
@@ -929,153 +949,77 @@ class LiveEngine:
                 "effective_threshold": self._threshold_mgr.get_threshold(),
             }
         )
-        status_store.add_event(
-            f"Kill switch activated for {self.symbol} - {self._threshold_mgr.streak} consecutive losses",
-            event_type="kill",
-        )
+        self._reporter.push_dashboard(self._build_context("kill_switch"))
 
-        # Push kill-switch state to dashboard — session is no longer active
+    def _build_context(
+        self,
+        event_type: str = "tick",
+        signal: TradeSignal | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Build a complete context dict for Reporter.push_dashboard().
+
+        Gathers all metrics in one place so Reporter doesn't need to
+        reach back into LiveEngine state.
+
+        Args:
+            event_type: "tick", "signal", "cooldown", "result", "kill_switch".
+            signal:     TradeSignal when event_type is signal/cooldown.
+            result:     Result dict when event_type is result.
+
+        Returns:
+            Flat dict with all fields Reporter.push_dashboard() needs.
+        """
+        connected = bool(getattr(self._stream, "_connected", True))
+        balance = float(getattr(self._stream, "_balance", 0.0))
+
+        pending_count = len(getattr(self._stream, "_pending", {}))
+
+        return {
+            "event_type": event_type,
+            "symbol": self.symbol,
+            "expiry_key": self.expiry_key,
+            "is_running": self.is_running,
+            "ticks_processed": self._ticks_processed,
+            "signals_fired": self._signals_fired,
+            "connected": connected,
+            "balance": balance,
+            "threshold_state": self._threshold_mgr.get_state(),
+            "signal": signal,
+            "result": result,
+            "session": {},
+            "started_at": None,
+            "pending_signals": pending_count,
+            "practice_mode": self._settings.practice_mode,
+        }
+
+    def _write_trade_entry(self, result: dict[str, Any]) -> None:
+        """Write a TradeEntry to the journal for Recent Trades display."""
         try:
-            snapshot = status_store.get()
-            status_store.update(
-                {
-                    "kill_switch_active": True,
-                    "session": {**snapshot.get("session", {}), "is_active": False},
-                }
+            entry_price = float(result.get("open_price", 0) or 0)
+            exit_price = float(result.get("close_price", 0) or 0)
+            if entry_price <= 0 or exit_price <= 0:
+                return
+            outcome = result.get("result", "")
+            pnl = (
+                result.get("payout", 0.0)
+                if outcome == "win"
+                else -result.get("stake", 0.0)
             )
-        except Exception as exc:
-            raise LiveEngineError(
-                f"Failed to update dashboard kill switch state: {exc}",
-                stage="kill_switch_dashboard",
-            ) from exc
-
-    def _push_stream_status(self, signal: TradeSignal) -> None:
-        """
-        Push stream connection status, tick count, signals fired, and the
-        most recent signal event to the dashboard StatusStore.
-
-        Called on every successful inference pass. Failure is fatal.
-        """
-        try:
-
-            # Get Quotex balance if available
-            quotex_balance = 0.0
-
-            # Detect stream type and read its live properties.
-            # QuotexDataStream exposes ._connected (bool).
-            # TwelveDataStream exposes ._thread (threading.Thread).
-            # Fallback: a tick was just received, so treat as connected.
-            if hasattr(self._stream, "_connected"):
-                connected: bool = bool(self._stream._connected)
-                quotex_balance = self._stream._balance
-            elif hasattr(self._stream, "_thread") and self._stream._thread is not None:
-                connected = self._stream._thread.is_alive()
-            else:
-                connected = True  # tick received — stream must be up
-
-            ticks_received: int = self._ticks_processed
-
-            # For TwelveDataStream expose the stream-level counter if available.
-            if hasattr(self._stream, "ticks_received"):
-                ticks_received = int(self._stream.ticks_received)
-
-            direction = signal.direction
-            if direction != "SKIP":
-                event_text = f"{self.symbol} {direction} @ {signal.confidence:.1%} [{signal.expiry_key}]"
-            else:
-                event_text = f"{self.symbol} SKIP ({signal.confidence:.1%})"
-
-            snapshot = status_store.get()
-
-            # Compute elapsed minutes from the started_at stamp seeded at boot.
-            # This keeps the dashboard accurate for both Quotex and TwelveData users.
-            elapsed_minutes: float = 0.0
-            started_at_raw = snapshot.get("started_at")
-            if started_at_raw:
-                started_at = datetime.fromisoformat(started_at_raw)
-                elapsed_minutes = (
-                    datetime.now(_tz.utc) - started_at
-                ).total_seconds() / 60.0
-
-            status_store.update(
-                {
-                    "stream": {
-                        "connected": connected,
-                        "ticks_received": ticks_received,
-                    },
-                    "quotex": {
-                        "connected": connected,
-                        "balance": quotex_balance,
-                    },
-                    "last_event": event_text,
-                    "session": {
-                        **snapshot.get("session", {}),
-                        "signals_fired": self._signals_fired,
-                        "elapsed_minutes": round(elapsed_minutes, 1),
-                    },
-                }
+            entry = TradeEntry(
+                timestamp=datetime.now(timezone.utc),
+                symbol=result.get("pair", self.symbol),
+                side=result.get("direction", "CALL"),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                result=float(pnl),
+                duration_seconds=int(result.get("duration_seconds", 60)),
+                signal_id=result.get("signal_id", ""),
             )
+            self._journal_client.record_trade(entry)
         except Exception as exc:
-            raise LiveEngineError(
-                f"Dashboard update failed: {exc}", stage="dashboard_update"
-            ) from exc
-
-    def _push_stream_status_tick_only(self) -> None:
-        """
-        Minimal dashboard push on every tick — updates elapsed time, tick
-        count, and connection state regardless of whether inference succeeded.
-        Called before any early returns in _process_tick().
-        """
-        try:
-            connected = bool(getattr(self._stream, "_connected", True))
-            balance = float(getattr(self._stream, "_balance", 0.0))
-            snapshot = status_store.get()
-            elapsed_minutes = 0.0
-            started_at_raw = snapshot.get("started_at")
-            if started_at_raw:
-                started_at = datetime.fromisoformat(started_at_raw)
-                elapsed_minutes = (
-                    datetime.now(_tz.utc) - started_at
-                ).total_seconds() / 60.0
-
-            status_store.update(
-                {
-                    "stream": {
-                        "connected": connected,
-                        "ticks_received": self._ticks_processed,
-                    },
-                    "quotex": {"connected": connected, "balance": balance},
-                    "session": {
-                        **snapshot.get("session", {}),
-                        "elapsed_minutes": round(elapsed_minutes, 1),
-                        "is_active": self.is_running,
-                    },
-                }
-            )
-        except Exception as exc:
-            raise LiveEngineError(
-                f"Dashboard update failed: {exc}", stage="dashboard_update"
-            ) from exc
-
-    def _push_threshold_to_dashboard(self) -> None:
-        """
-        Push the current ThresholdManager state to the StatusStore.
-
-        Failure is silently swallowed
-        """
-        try:
-            state = self._threshold_mgr.get_state()
-            status_store.update(
-                {
-                    "martingale_streak": state["streak"],
-                    "confidence_threshold": state["effective_threshold"],
-                    "kill_switch_active": state["halted"],
-                }
-            )
-        except Exception as exc:
-            raise LiveEngineError(
-                f"Dashboard update failed: {exc}", stage="dashboard_update"
-            ) from exc
+            logger.warning({"event": "TRADE_ENTRY_WRITE_FAILED", "error": str(exc)})
 
     def _process_result(self, result: dict[str, Any]) -> None:
         """Apply a resolved trade result: update thresholds, check kill switch, log."""
@@ -1085,9 +1029,17 @@ class LiveEngine:
         elif outcome == "loss":
             self._threshold_mgr.on_loss()
         # draw: streak and threshold unchanged
+
+        # Write TradeEntry for Recent Trades
+        self._write_trade_entry(result)
+
+        # Push result event to dashboard (includes session counters, recent trades)
+        self._reporter.push_dashboard(self._build_context("result", result=result))
+
+        # Kill switch after dashboard push so "result" appears first
         if self._threshold_mgr.is_halted():
             self._on_kill_switch_activated()
-        self._push_threshold_to_dashboard()
+
         logger.info(
             {
                 "event": "TRADE_RESULT_PROCESSED",

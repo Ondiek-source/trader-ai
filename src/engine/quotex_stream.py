@@ -299,12 +299,15 @@ class QuotexDataStream:
             "attempts": 0,
             "resolved": False,
         }
-        logger.debug(
+        logger.info(
             {
                 "event": "pending_registered",
                 "signal_id": signal_id,
                 "pair": signal.get("pair"),
-                "expiry_at": expiry_time.isoformat(),
+                "direction": signal.get("direction"),
+                "confidence": signal.get("confidence"),
+                "fired_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "expiry_at": expiry_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "balance_snapshot": balance_snapshot,
             }
         )
@@ -476,8 +479,8 @@ class QuotexDataStream:
         command = trade.get("command")
         if command is None:
             return None
-        trade_direction = "call" if int(command) == 1 else "put"
-        if trade_direction != direction.lower():
+        trade_direction = trade.get("directionType", "").lower()
+        if not trade_direction or trade_direction != direction.lower():
             return None
         close_time_str = trade.get("close_time", "")
         if not close_time_str:
@@ -504,7 +507,7 @@ class QuotexDataStream:
 
         for trade in history:
             diff = self._trade_time_diff(trade, pair, direction, target_time)
-            if diff is not None and diff < 6 and diff < smallest_diff:
+            if diff is not None and diff < 10 and diff < smallest_diff:
                 smallest_diff = diff
                 closest_trade = trade
 
@@ -572,13 +575,17 @@ class QuotexDataStream:
                 {
                     "event": "QUOTEX_HISTORY_MATCH",
                     "pair": pair,
+                    "direction": direction,
                     "profit": profit,
                     "outcome": outcome,
                     "ticket": closest_trade.get("ticket"),
+                    "open_time": closest_trade.get("open_time"),
                     "close_time": closest_trade.get("close_time"),
+                    "expected_expiry": expiry_time.strftime("%Y-%m-%d %H:%M:%S"),
                     "time_diff_seconds": round(smallest_diff, 2),
                 }
             )
+
             return self._make_result(
                 "", pair, direction, outcome, payout=payout, stake=stake
             )
@@ -603,11 +610,17 @@ class QuotexDataStream:
 
     def _assets_match(self, signal_pair: str, trade_asset: str) -> bool:
         """
-        Normalise both sides to uppercase and strip before comparing.
+        Check if a signal pair matches a Quotex trade asset using PAIR_TO_ASSETS.
+
+        Direct comparison fails because signal pairs use underscore format
+        (e.g. "EUR_USD") while Quotex trades use concatenated format
+        (e.g. "EURUSD_otc"). The PAIR_TO_ASSETS mapping bridges this.
         """
         if not trade_asset:
             return False
-        return signal_pair.upper().strip() == trade_asset.upper().strip()
+        trade_upper = trade_asset.upper().strip()
+        valid_assets = PAIR_TO_ASSETS.get(signal_pair, [])
+        return trade_upper in [a.upper() for a in valid_assets]
 
     # ── Result construction ────────────────────────────────────────────────────
 
@@ -731,11 +744,15 @@ class QuotexDataStream:
                 logger.error(f"[STREAM ERROR] {otc_asset}: {type(e).__name__}: {e},")
                 state = "degraded"
             if not self._connected:
-                logger.info({"event": "quotex_stream_reconnecting", "symbol": otc_asset})
+                logger.info(
+                    {"event": "quotex_stream_reconnecting", "symbol": otc_asset}
+                )
                 await self._reconnect()
                 if self._connected:
                     state = "ok"
-                    logger.info({"event": "quotex_stream_reconnected", "symbol": otc_asset})
+                    logger.info(
+                        {"event": "quotex_stream_reconnected", "symbol": otc_asset}
+                    )
             await asyncio.sleep(1)
             return state, []
 
