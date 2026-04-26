@@ -344,7 +344,7 @@ class WebhookSender:
                 "symbol": signal.symbol,
                 "quotex_symbol": quotex_symbol,
                 "side": side,
-                "confidence": round(signal.confidence, 4),
+                "confidence": round(signal.confidence, 2),
                 "expiry": signal.expiry_key,
                 "model": signal.model_name,
             }

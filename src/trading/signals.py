@@ -294,7 +294,7 @@ class SignalGenerator:
         # Attempt initial load — no error if no artifact found.
         self.reload()
 
-        logger.info({"event": "SIGNAL_GENERATOR_INIT", "symbol": self.symbol, "expiry_key": self.expiry_key, "threshold": self.threshold, "model": self._record.model_name if self._record else "NONE"})
+        logger.info({"event": "SIGNAL_GENERATOR_INIT", "symbol": self.symbol, "expiry_key": self.expiry_key, "threshold": round(self.threshold, 2), "model": self._record.model_name if self._record else "NONE"})
 
     # ── Model Loading ─────────────────────────────────────────────────────────
 
@@ -355,7 +355,7 @@ class SignalGenerator:
             mgr: ThresholdManager instance (typed Any to avoid circular import).
         """
         self._threshold_mgr = mgr
-        logger.info({"event": "SIGNAL_THRESHOLD_MANAGER_SET", "base_threshold": mgr.base_threshold, "step": mgr.step, "max_streak": mgr.max_streak})
+        logger.info({"event": "SIGNAL_THRESHOLD_MANAGER_SET", "base_threshold": round(mgr.base_threshold, 2), "step": round(mgr.step, 2), "max_streak": mgr.max_streak})
 
     def inject_model(self, model: Any, record: ModelRecord) -> None:
         """
@@ -455,7 +455,7 @@ class SignalGenerator:
             feature_version=fv.version,
         )
 
-        logger.info({"event": "SIGNAL_GENERATED", "symbol": self.symbol, "direction": signal.direction, "confidence": round(signal.confidence, 4), "model": signal.model_name, "expiry": signal.expiry_key, "threshold": round(effective_threshold, 3)})
+        logger.info({"event": "SIGNAL_GENERATED", "symbol": self.symbol, "direction": signal.direction, "confidence": round(signal.confidence, 2), "model": signal.model_name, "expiry": signal.expiry_key, "threshold": round(effective_threshold, 2)})
 
         return signal
 

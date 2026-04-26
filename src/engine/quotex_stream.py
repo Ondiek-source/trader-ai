@@ -310,7 +310,7 @@ class QuotexDataStream:
                 "signal_id": signal_id,
                 "pair": signal.get("pair"),
                 "direction": signal.get("direction"),
-                "confidence": signal.get("confidence"),
+                "confidence": round(signal.get("confidence") or 0, 2),
                 "fired_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "expiry_at": expiry_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "balance_snapshot": balance_snapshot,

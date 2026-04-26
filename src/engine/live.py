@@ -807,7 +807,7 @@ class LiveEngine:
                         "event": "TRADE_COOLDOWN_ACTIVE",
                         "symbol": self.symbol,
                         "direction": signal.direction,
-                        "confidence": signal.confidence,
+                        "confidence": round(signal.confidence, 2),
                         "seconds_since_last": round(
                             (now - self._last_execution_time).total_seconds(), 1
                         ),
@@ -840,7 +840,7 @@ class LiveEngine:
                 "event": "ATTEMPTING_TO_EXECUTE_SIGNAL",
                 "symbol": signal.symbol,
                 "direction": signal.direction,
-                "confidence": signal.confidence,
+                "confidence": round(signal.confidence, 2),
                 "expiry_key": signal.expiry_key,
                 "model_name": signal.model_name,
             }
@@ -860,7 +860,7 @@ class LiveEngine:
                     "event": "WEBHOOK_FIRE_FAILED",
                     "symbol": signal.symbol,
                     "direction": signal.direction,
-                    "confidence": signal.confidence,
+                    "confidence": round(signal.confidence, 2),
                     "error": str(exc),
                 }
             )
@@ -882,7 +882,7 @@ class LiveEngine:
                 signal={
                     "pair": signal.symbol,
                     "direction": signal.direction,
-                    "confidence": signal.confidence,
+                    "confidence": round(signal.confidence, 2),
                     "expiry_key": signal.expiry_key,
                 },
                 expiry_time=expiry_time,

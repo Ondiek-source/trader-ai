@@ -587,7 +587,7 @@ class Journal:
                 "event": "SIGNAL_ENTRY_COMMITTED",
                 "symbol": symbol,
                 "direction": direction,
-                "confidence": confidence,
+                "confidence": round(float(confidence), 2),
                 "model_version": model_version,
             }
         )
