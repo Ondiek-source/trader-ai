@@ -994,8 +994,6 @@ class LiveEngine:
         try:
             entry_price = float(result.get("open_price", 0) or 0)
             exit_price = float(result.get("close_price", 0) or 0)
-            if entry_price <= 0 or exit_price <= 0:
-                return
             outcome = result.get("result", "")
             pnl = (
                 result.get("payout", 0.0)

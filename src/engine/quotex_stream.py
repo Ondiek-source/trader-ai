@@ -473,20 +473,26 @@ class QuotexDataStream:
         target_time: datetime,
     ) -> float | None:
         """Return seconds between trade close time and target_time if trade matches, else None."""
-        trade_asset = trade.get("symbol")
+        trade_asset = trade.get("symbol") or trade.get("asset", "")
         if not trade_asset or not self._assets_match(pair, trade_asset):
             return None
-        command = trade.get("command")
-        if command is None:
-            return None
-        trade_direction = trade.get("directionType", "").lower()
-        if not trade_direction or trade_direction != direction.lower():
-            return None
-        close_time_str = trade.get("close_time", "")
+        # Check direction using multiple possible field names from pyquotex.
+        # Maps "call"→"UP" and "put"→"DOWN" via QUOTEX_TO_DIRECTION. If no
+        # direction field is present at all, skip the filter and rely on the
+        # time window — a 30-second window on a specific asset is unique enough.
+        for field in ("directionType", "direction", "command"):
+            raw = trade.get(field)
+            if raw is not None:
+                raw_str = str(raw).lower()
+                mapped = QUOTEX_TO_DIRECTION.get(raw_str, raw_str).upper()
+                if mapped != direction.upper():
+                    return None
+                break
+        close_time_str = trade.get("close_time") or trade.get("closeTime", "")
         if not close_time_str:
             return None
         try:
-            trade_time = datetime.strptime(close_time_str, "%Y-%m-%d %H:%M:%S")
+            trade_time = datetime.strptime(str(close_time_str)[:19], "%Y-%m-%d %H:%M:%S")
         except ValueError:
             return None
         return abs((trade_time - target_time).total_seconds())
@@ -507,7 +513,7 @@ class QuotexDataStream:
 
         for trade in history:
             diff = self._trade_time_diff(trade, pair, direction, target_time)
-            if diff is not None and diff < 10 and diff < smallest_diff:
+            if diff is not None and diff < 30 and diff < smallest_diff:
                 smallest_diff = diff
                 closest_trade = trade
 
