@@ -338,7 +338,6 @@ DASHBOARD_HTML: str = """\
 </div>
 
 <div class="footer">
-  <span>Trader AI · Auto-refresh 10s</span>
   <span id="ts">—</span>
 </div>
 
@@ -577,8 +576,6 @@ class StatusStore:
 status_store: StatusStore = StatusStore()
 
 
-
-
 # ── HTTP Handler ───────────────────────────────────────────────────────────────
 
 
@@ -604,12 +601,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(404, "text/plain", b"not found")
 
     def _respond(self, code: int, content_type: str, body: bytes) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, fmt: str, *args: Any) -> None:
         """Suppress default HTTP server log output."""

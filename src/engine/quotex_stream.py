@@ -706,9 +706,7 @@ class QuotexDataStream:
     def _check_realtime_capability(self, otc_asset: str, state: str) -> str:
         """Log a one-time error if start_realtime_price is unavailable. Returns new state."""
         if state != "degraded":
-            logger.error(
-                f"[STREAM ERROR] start_realtime_price() not available for {otc_asset}"
-            )
+            logger.error({"event": "STREAM_REALTIME_UNAVAILABLE", "symbol": otc_asset})
         return "degraded"
 
     def _extract_price_points(self, result: Any, otc_asset: str) -> list | None:
@@ -720,7 +718,7 @@ class QuotexDataStream:
     def _handle_price_points(self, otc_asset: str, state: str) -> str:
         """Log stream-up transition. Returns updated state."""
         if state == "degraded":
-            logger.info(f"[STREAM IS UP] Real-time data available for {otc_asset}")
+            logger.info({"event": "STREAM_UP", "symbol": otc_asset})
             state = "ok"
         return state
 
@@ -746,9 +744,7 @@ class QuotexDataStream:
                 return state, ticks
 
             if state != "degraded":
-                logger.warning(
-                    f"[STREAM OFFLINE] No real-time data for {otc_asset}. Symbol may be offline. Will retry every 1s."
-                )
+                logger.warning({"event": "STREAM_OFFLINE", "symbol": otc_asset})
                 state = "degraded"
             await asyncio.sleep(4)
             return state, []
@@ -757,7 +753,7 @@ class QuotexDataStream:
             raise
         except Exception as e:
             if state != "degraded":
-                logger.error(f"[STREAM ERROR] {otc_asset}: {type(e).__name__}: {e},")
+                logger.error({"event": "STREAM_ERROR", "symbol": otc_asset, "error_type": type(e).__name__, "error": str(e)})
                 state = "degraded"
             if not self._connected:
                 logger.info(

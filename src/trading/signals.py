@@ -294,13 +294,7 @@ class SignalGenerator:
         # Attempt initial load — no error if no artifact found.
         self.reload()
 
-        logger.info(
-            "[^] SignalGenerator initialised: symbol=%s expiry=%s threshold=%.2f model=%s",
-            self.symbol,
-            self.expiry_key,
-            self.threshold,
-            self._record.model_name if self._record else "NONE",
-        )
+        logger.info({"event": "SIGNAL_GENERATOR_INIT", "symbol": self.symbol, "expiry_key": self.expiry_key, "threshold": self.threshold, "model": self._record.model_name if self._record else "NONE"})
 
     # ── Model Loading ─────────────────────────────────────────────────────────
 
@@ -322,19 +316,7 @@ class SignalGenerator:
         )
 
         if record is None:
-            warning_block = (
-                f"\n{'%' * 60}\n"
-                f"SIGNAL GENERATOR WARNING: NO MODEL AVAILABLE\n"
-                f"Symbol     : {self.symbol}\n"
-                f"Expiry key : {self.expiry_key}\n\n"
-                f"CONTEXT: No trained model artifact was found for this\n"
-                f"symbol/expiry combination. All generate() calls will\n"
-                f"return SKIP until a model is trained and loaded.\n"
-                f"\nFIX: Run a training pass for symbol={self.symbol}\n"
-                f"expiry={self.expiry_key} then call reload().\n"
-                f"{'%' * 60}"
-            )
-            logger.warning(warning_block)
+            logger.warning({"event": "SIGNAL_NO_MODEL", "symbol": self.symbol, "expiry_key": self.expiry_key})
             self._model = None
             self._record = None
             return False
@@ -352,29 +334,11 @@ class SignalGenerator:
             self._model = self._manager.load(record.artifact_path)
             self._record = record
 
-            logger.info(
-                "[^] SignalGenerator.reload(): loaded model=%s auc=%.4f",
-                record.model_name,
-                record.auc,
-            )
+            logger.info({"event": "SIGNAL_MODEL_LOADED", "model": record.model_name, "auc": round(record.auc, 4)})
             return True
 
         except Exception as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"SIGNAL GENERATOR LOAD FAILURE\n"
-                f"Symbol     : {self.symbol}\n"
-                f"Expiry key : {self.expiry_key}\n"
-                f"Artifact   : {record.artifact_path}\n"
-                f"Error      : {exc}\n\n"
-                f"CONTEXT: The model artifact exists but could not be\n"
-                f"deserialised. All generate() calls will return SKIP\n"
-                f"until this is resolved.\n"
-                f"\nFIX: For PyTorch models use inject_model() instead of\n"
-                f"reload(). For other failures check the artifact file.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "SIGNAL_MODEL_LOAD_FAILED", "symbol": self.symbol, "expiry_key": self.expiry_key, "artifact": str(record.artifact_path), "error": str(exc)})
             self._model = None
             self._record = None
             return False
@@ -391,12 +355,7 @@ class SignalGenerator:
             mgr: ThresholdManager instance (typed Any to avoid circular import).
         """
         self._threshold_mgr = mgr
-        logger.info(
-            "[^] SignalGenerator.set_threshold_manager(): dynamic threshold active base=%.2f step=%.3f max_streak=%d",
-            mgr.base_threshold,
-            mgr.step,
-            mgr.max_streak,
-        )
+        logger.info({"event": "SIGNAL_THRESHOLD_MANAGER_SET", "base_threshold": mgr.base_threshold, "step": mgr.step, "max_streak": mgr.max_streak})
 
     def inject_model(self, model: Any, record: ModelRecord) -> None:
         """
@@ -416,10 +375,7 @@ class SignalGenerator:
         """
         self._model = model
         self._record = record
-        logger.info(
-            "[^] SignalGenerator.inject_model(): injected model=%s",
-            record.model_name,
-        )
+        logger.info({"event": "SIGNAL_MODEL_INJECTED", "model": record.model_name})
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -467,23 +423,7 @@ class SignalGenerator:
         try:
             prob: float = self._infer(fv)
         except Exception as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"SIGNAL GENERATOR INFERENCE FAILURE\n"
-                f"Symbol     : {self.symbol}\n"
-                f"Expiry key : {self.expiry_key}\n"
-                f"Model      : {self._record.model_name}\n"
-                f"Error      : {exc}\n\n"
-                f"CONTEXT: The model artifact failed during the forward pass.\n"
-                f"This may indicate a corrupted artifact, a shape mismatch\n"
-                f"between the FeatureVector and the model's expected input,\n"
-                f"or a PyTorch model that requires a sequence tensor.\n"
-                f"\nFIX: Verify the artifact with model_manager.validate_metadata().\n"
-                f"For PyTorch sequence models ensure inject_model() was used\n"
-                f"with the correct architecture rather than reload().\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "SIGNAL_INFERENCE_FAILED", "symbol": self.symbol, "expiry_key": self.expiry_key, "model": self._record.model_name, "error": str(exc)})
             raise SignalGeneratorError(
                 f"Model inference failed for {self._record.model_name}: {exc}",
                 stage="infer",
@@ -515,15 +455,7 @@ class SignalGenerator:
             feature_version=fv.version,
         )
 
-        logger.info(
-            "[^] Signal: symbol=%s direction=%s confidence=%.4f model=%s expiry=%s threshold=%.3f",
-            self.symbol,
-            signal.direction,
-            signal.confidence,
-            signal.model_name,
-            signal.expiry_key,
-            effective_threshold,
-        )
+        logger.info({"event": "SIGNAL_GENERATED", "symbol": self.symbol, "direction": signal.direction, "confidence": round(signal.confidence, 4), "model": signal.model_name, "expiry": signal.expiry_key, "threshold": round(effective_threshold, 3)})
 
         return signal
 
@@ -592,22 +524,7 @@ class SignalGenerator:
             prob = float(proba_output[0, 1])
 
         if not np.isfinite(prob):
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"SIGNAL GENERATOR INFERENCE FAILURE: NON-FINITE OUTPUT\n"
-                f"Symbol     : {self.symbol}\n"
-                f"Model      : {self._record.model_name}\n"
-                f"Probability: {prob}\n\n"
-                f"CONTEXT: The model returned NaN or Inf instead of a valid\n"
-                f"probability. This usually means the model received a feature\n"
-                f"vector containing NaN or Inf values, or the model artifact\n"
-                f"is corrupted (weights contain NaN from a failed training run).\n"
-                f"\nFIX: Check FeatureEngineer.get_latest() logs for non-finite\n"
-                f"feature warnings. If the artifact is corrupt, retrain and\n"
-                f"re-upload via model_manager.save().\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "SIGNAL_INFERENCE_NON_FINITE", "symbol": self.symbol, "model": self._record.model_name, "probability": prob})
             raise SignalGeneratorError(
                 f"Model {self._record.model_name} returned non-finite "
                 f"probability: {prob}.",
