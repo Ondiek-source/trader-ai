@@ -95,6 +95,7 @@ import pandas as pd
 from typing import Any
 from datetime import datetime, timedelta, timezone
 from core.config import get_settings
+from core.dashboard import status_store
 from data.journal import Journal, SignalEntry, TradeEntry
 from data.storage import (
     Storage,
@@ -786,7 +787,6 @@ class LiveEngine:
         # Reset consecutive error counter on a successful inference.
         self._consecutive_errors = 0
         if signal.direction != "SKIP":
-            self._signals_fired += 1
             self._reporter.push_dashboard(self._build_context("signal", signal=signal))
         else:
             self._reporter.push_dashboard(self._build_context("skip", signal=signal))
@@ -826,6 +826,7 @@ class LiveEngine:
                     self._build_context("cooldown", signal=signal)
                 )
             else:
+                self._signals_fired += 1
                 await self._execute(signal)
                 self._last_execution_time = datetime.now(timezone.utc)
 
@@ -1054,6 +1055,9 @@ class LiveEngine:
         if self._threshold_mgr.is_halted():
             self._on_kill_switch_activated()
 
+        # Daily target check — stop after kill switch so both checks fire cleanly
+        self._check_daily_targets()
+
         logger.info(
             {
                 "event": "TRADE_RESULT_PROCESSED",
@@ -1065,6 +1069,41 @@ class LiveEngine:
                 "threshold": self._threshold_mgr.get_threshold(),
             }
         )
+
+    def _check_daily_targets(self) -> None:
+        """Stop the engine if a daily win-count or profit target has been reached."""
+        session = self._reporter._session
+        wins = session.get("wins", 0)
+        net_profit = session.get("net_profit", 0.0)
+
+        if wins >= self._settings.daily_trade_target:
+            logger.info(
+                {
+                    "event": "DAILY_TRADE_TARGET_REACHED",
+                    "wins": wins,
+                    "target": self._settings.daily_trade_target,
+                }
+            )
+            status_store.add_event(
+                f"Daily trade target reached: {wins} wins — stopping", event_type="info"
+            )
+            self.stop()
+            return
+
+        profit_target = self._settings.daily_net_profit_target
+        if profit_target is not None and net_profit >= profit_target:
+            logger.info(
+                {
+                    "event": "DAILY_PROFIT_TARGET_REACHED",
+                    "net_profit": round(net_profit, 2),
+                    "target": profit_target,
+                }
+            )
+            status_store.add_event(
+                f"Daily profit target reached: ${net_profit:.2f} — stopping",
+                event_type="info",
+            )
+            self.stop()
 
     async def _consume_results(self) -> None:
         """Background task to consume trade results from QuotexDataStream."""

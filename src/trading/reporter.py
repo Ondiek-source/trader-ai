@@ -861,7 +861,7 @@ class Reporter:
                                     ),
                                 }
                             )
-                        update["recent_trades"] = recent
+                        update["recent_trades"] = list(reversed(recent))
                 except Exception:
                     pass
 

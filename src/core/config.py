@@ -13,6 +13,7 @@ import os
 import sys
 import logging
 
+from datetime import datetime, timezone, timedelta
 from typing import overload
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
@@ -365,6 +366,7 @@ class Config:
 
     # ── Dashboard ─────────────────────────────────────────────────────────
     dashboard_port: int
+    display_tz: int  # UTC offset in hours applied to all display timestamps
 
     # ── ML / Training ──────────────────────────────────────────────────────────
     backfill_source: str  # "TWELVE" or "QUOTEX"
@@ -587,6 +589,7 @@ def load_config() -> Config:
         container_name=_optional("CONTAINER_NAME", "traderai"),
         # Dashboard
         dashboard_port=_int("DASHBOARD_PORT", 8080),
+        display_tz=_int("DISPLAY_TZ", 0),
         # Data source routing
         otc_pairs=_parse_otc_pairs(_optional("OTC_PAIRS", "")),
         poll_interval=_parse_float("POLL_INTERVAL", default=1.0),
@@ -667,3 +670,15 @@ def get_settings() -> Config:
     if _settings is None:
         _settings = load_config()
     return _settings
+
+
+def local_now() -> datetime:
+    """
+    Return current time shifted by DISPLAY_TZ hours for display purposes.
+
+    All log timestamps, dashboard activity entries, and reporter timestamps
+    use this function so the operator sees local time rather than UTC.
+    Structured log records show local clock time; no timezone suffix is
+    appended so the output stays compact.
+    """
+    return datetime.now(timezone.utc) + timedelta(hours=get_settings().display_tz)

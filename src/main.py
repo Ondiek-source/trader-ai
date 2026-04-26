@@ -19,7 +19,7 @@ import logging
 import traceback
 
 
-from core.config import get_settings
+from core.config import get_settings, local_now
 from datetime import datetime, timezone
 from core.exceptions import TraderAIError, ConfigError, FatalError
 
@@ -61,7 +61,7 @@ class _JSONFormatter(logging.Formatter):
                 return ""
 
         entry: dict = {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": local_now().strftime("%Y-%m-%dT%H:%M:%S"),
             "level": record.levelname,
             "component": record.name,
             **payload,

@@ -18,6 +18,7 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
+from core.config import local_now
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import Any
@@ -265,7 +266,7 @@ DASHBOARD_HTML: str = """\
     <div class="bar-track"><div class="bar-fill green" id="winrate-bar" style="width:0%"></div></div>
   </div>
   <div class="card">
-    <div class="card-label">Signals / Trades</div>
+    <div class="card-label">Trades Executed</div>
     <div class="card-value" id="signals">—</div>
     <div class="card-sub" id="signal-rate">—</div>
   </div>
@@ -529,7 +530,7 @@ class StatusStore:
             "recent_trades": [],
             "recent_events": [],
             # Metadata
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": local_now().isoformat(),
         }
 
     def update(self, data: dict[str, Any]) -> None:
@@ -541,7 +542,7 @@ class StatusStore:
         """Return a deep-copy snapshot with server timestamp."""
         with self._lock:
             snapshot = copy.deepcopy(self._data)
-            snapshot["server_time"] = datetime.now(timezone.utc).isoformat()
+            snapshot["server_time"] = local_now().isoformat()
             return snapshot
 
     def add_event(self, message: str, event_type: str = "info") -> None:
@@ -557,7 +558,7 @@ class StatusStore:
             events.insert(
                 0,
                 {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": local_now().isoformat(),
                     "message": message,
                     "type": event_type,
                 },
@@ -594,7 +595,7 @@ class _Handler(BaseHTTPRequestHandler):
             health = {
                 "status": "ok",
                 "kill_switch": status_store.get().get("kill_switch_active", False),
-                "server_time": datetime.now(timezone.utc).isoformat(),
+                "server_time": local_now().isoformat(),
             }
             self._respond(200, "application/json", json.dumps(health).encode())
         else:
