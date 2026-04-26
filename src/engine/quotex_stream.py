@@ -532,7 +532,7 @@ class QuotexDataStream:
 
         for trade in history:
             diff = self._trade_time_diff(trade, pair, direction, target_time)
-            if diff is not None and diff < 10 and diff < smallest_diff:
+            if diff is not None and diff < 30 and diff < smallest_diff:
                 smallest_diff = diff
                 closest_trade = trade
 

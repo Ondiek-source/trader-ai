@@ -89,7 +89,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import traceback
 import pandas as pd
 
 
@@ -113,7 +112,6 @@ from ml_engine.model import Bar, Tick as ModelTick
 from ml_engine.model_manager import ModelManager
 from engine.twelveticks_stream import TwelveDataStream
 from engine.quotex_stream import QuotexDataStream
-from datetime import datetime, timezone as _tz
 from trading.signals import SignalGenerator, SignalGeneratorError, TradeSignal
 from trading.threshold_manager import ThresholdManager
 from core.exceptions import (
@@ -782,6 +780,8 @@ class LiveEngine:
         if signal.direction != "SKIP":
             self._signals_fired += 1
             self._reporter.push_dashboard(self._build_context("signal", signal=signal))
+        else:
+            self._reporter.push_dashboard(self._build_context("skip", signal=signal))
 
         # ── 5. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)

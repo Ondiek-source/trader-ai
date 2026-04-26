@@ -750,13 +750,16 @@ class Reporter:
             last_event: str = ""
 
             if event_type == "signal" and signal is not None:
-                if signal.direction != "SKIP":
-                    last_event = (
-                        f"{symbol} {signal.direction} @ "
-                        f"{signal.confidence:.1%} [{expiry_key}]"
-                    )
-                else:
-                    last_event = f"{symbol} SKIP ({signal.confidence:.1%})"
+                last_event = (
+                    f"{symbol} {signal.direction} @ "
+                    f"{signal.confidence:.1%} [{expiry_key}]"
+                )
+
+            elif event_type == "skip" and signal is not None:
+                threshold = threshold_state.get("effective_threshold", 0.58)
+                last_event = (
+                    f"{symbol} SKIP — {signal.confidence:.1%} < {threshold:.1%} threshold"
+                )
 
             elif event_type == "cooldown" and signal is not None:
                 last_event = (
@@ -873,6 +876,8 @@ class Reporter:
                     _css = "win" if _outcome == "win" else "loss" if _outcome == "loss" else "info"
                 elif event_type == "signal":
                     _css = "signal"
+                elif event_type == "skip":
+                    _css = "info"
                 elif event_type in ("kill_switch", "fatal_error", "engine_crash", "webhook_failed", "journal_failed"):
                     _css = "kill"
                 else:
