@@ -833,6 +833,21 @@ class Reporter:
 
             status_store.update(update)
 
+            # Route last_event into the activity log's recent_events list so the
+            # dashboard shows signals, results, and kill events — not just the
+            # infrastructure events that pipeline.py adds via add_event() directly.
+            if last_event:
+                if event_type == "result" and result is not None:
+                    _outcome = result.get("result", "")
+                    _css = "win" if _outcome == "win" else "loss" if _outcome == "loss" else "info"
+                elif event_type == "signal":
+                    _css = "signal"
+                elif event_type in ("kill_switch", "fatal_error", "engine_crash", "webhook_failed", "journal_failed"):
+                    _css = "kill"
+                else:
+                    _css = "info"
+                status_store.add_event(last_event, _css)
+
         except Exception as exc:
             logger.warning({"event": "DASHBOARD_PUSH_FAILED", "error": str(exc)})
 
