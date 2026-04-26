@@ -658,14 +658,6 @@ class Pipeline:
     ) -> tuple[Any, Any] | None:
         record = manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
         if record is None:
-            logger.warning(
-                {
-                    "event": "MODEL_NOT_FOUND",
-                    "symbol": symbol,
-                    "expiry_key": expiry_key,
-                    "message": "No model found - retrain scheduler will train on first boot",
-                }
-            )
             return None
         try:
             model = manager.load(record.artifact_path)
