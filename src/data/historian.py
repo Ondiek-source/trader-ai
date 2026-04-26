@@ -353,13 +353,7 @@ class Historian:
         start_dt: datetime = self._determine_start(symbol, now_utc)
 
         if start_dt >= now_utc:
-            logger.info(
-                "quotex_up_to_date",
-                extra={
-                    "event": "QUOTEX_UP_TO_DATE",
-                    "symbol": symbol,
-                },
-            )
+            logger.info({"event": "QUOTEX_UP_TO_DATE", "symbol": symbol})
             return 0
 
         gap_days: float = (now_utc - start_dt).total_seconds() / 86400
@@ -370,17 +364,7 @@ class Historian:
         duration_seconds: int = end_ts - start_ts
         timeframe_sec = 60  # M1 only
 
-        logger.info(
-            "quotex_backfill_start",
-            extra={
-                "event": "QUOTEX_BACKFILL_START",
-                "symbol": symbol,
-                "otc_symbol": otc_symbol,
-                "start_date": start_dt.isoformat(),
-                "end_date": now_utc.isoformat(),
-                "gap_days": round(gap_days, 1),
-            },
-        )
+        logger.info({"event": "QUOTEX_BACKFILL_START", "symbol": symbol, "otc_symbol": otc_symbol, "gap_days": round(gap_days, 1)})
 
         client = Quotex(
             email=self._settings.quotex_email,
@@ -581,16 +565,7 @@ class Historian:
                     second=0,
                     microsecond=0,
                 )
-            logger.info(
-                "no existing data?",
-                extra={
-                    "event": "NO_EXISTING_DATA",
-                    "symbol": symbol,
-                    "start_date": start.isoformat(),
-                    "years": years,
-                    "source": source,
-                },
-            )
+            logger.info({"event": "NO_EXISTING_DATA", "symbol": symbol, "years": years, "source": source})
             return start
 
         # Data exists - behavior depends on source
@@ -607,16 +582,7 @@ class Historian:
 
             start = last_dt + timedelta(minutes=1)
 
-            logger.info(
-                "data_existing_forward",
-                extra={
-                    "event": "DATA_EXISTING_FORWARD",
-                    "symbol": symbol,
-                    "last_bar": last_dt.isoformat(),
-                    "start_date": start.isoformat(),
-                    "source": source,
-                },
-            )
+            logger.info({"event": "DATA_EXISTING_FORWARD", "symbol": symbol, "last_bar": last_dt.isoformat()})
             return start
         # QUOTEX - backward fetch
         else:
@@ -652,30 +618,12 @@ class Historian:
             # If oldest bar is older than target, we're done
             if oldest_dt <= target_oldest:
                 # Already have data back to target, return now (no backfill needed)
-                logger.info(
-                    "quotex_backfill_complete_already",
-                    extra={
-                        "event": "QUOTEX_BACKFILL_ALREADY_COMPLETE",
-                        "symbol": symbol,
-                        "oldest_bar": oldest_dt.isoformat(),
-                        "target_oldest": target_oldest.isoformat(),
-                    },
-                )
+                logger.info({"event": "QUOTEX_BACKFILL_ALREADY_COMPLETE", "symbol": symbol, "oldest_bar": oldest_dt.isoformat()})
                 return now_utc  # Returns >= now_utc so backfill skips
 
             # Start from oldest bar - 1 minute to get earlier data
             start = oldest_dt - timedelta(minutes=1)
-            logger.info(
-                "data_existing_backward",
-                extra={
-                    "event": "DATA_EXISTING_BACKWARD",
-                    "symbol": symbol,
-                    "oldest_bar": oldest_dt.isoformat(),
-                    "start_date": start.isoformat(),
-                    "target_oldest": target_oldest.isoformat(),
-                    "source": source,
-                },
-            )
+            logger.info({"event": "DATA_EXISTING_BACKWARD", "symbol": symbol, "oldest_bar": oldest_dt.isoformat()})
             return start
 
     # ── Private: Fetch & Persist Loop ─────────────────────────────────────────
@@ -955,11 +903,11 @@ class Historian:
         Raises HistorianError when retries are exhausted.
         """
         critical_block = {
-            "event": "API RESPONSE ERROR",
-            "Symbol": f"{symbol}",
-            "Chunk": f"{start_dt.date()} → {end_dt.date()}",
-            "message": f"API response mishapen {_HTTP_TIMEOUT_S}s. {exc}",
-            "Attempt": f"{attempt}/{_MAX_RETRIES}. Sleeping for {backoff:.0f}s before retrying.",
+            "event": "API_RESPONSE_ERROR",
+            "symbol": symbol,
+            "chunk": f"{start_dt.date()} to {end_dt.date()}",
+            "error": str(exc),
+            "attempt": f"{attempt}/{_MAX_RETRIES}",
         }
         if attempt < _MAX_RETRIES:
             await asyncio.sleep(backoff)
@@ -998,35 +946,11 @@ class Historian:
         )
 
         if is_symbol_error:
-            logger.error(
-                {
-                    "event": "API ERROR — SYMBOL NOT RECOGNISED",
-                    "message": api_message,
-                    "symbol": symbol,
-                    "start_dt": start_dt.isoformat(),
-                    "end_dt": end_dt.isoformat(),
-                }
-            )
+            logger.error({"event": "API_SYMBOL_NOT_FOUND", "symbol": symbol, "message": api_message[:100]})
         elif is_data_unavailable:
-            logger.debug(
-                {
-                    "event": "API — NO DATA FOR WINDOW",
-                    "message": api_message,
-                    "symbol": symbol,
-                    "start_dt": start_dt.isoformat(),
-                    "end_dt": end_dt.isoformat(),
-                }
-            )
+            logger.debug({"event": "API_NO_DATA_FOR_WINDOW", "symbol": symbol})
         else:
-            logger.warning(
-                {
-                    "event": "API — UNKNOWN 400 ERROR",
-                    "message": api_message,
-                    "symbol": symbol,
-                    "start_dt": start_dt.isoformat(),
-                    "end_dt": end_dt.isoformat(),
-                }
-            )
+            logger.warning({"event": "API_UNKNOWN_ERROR", "symbol": symbol, "message": api_message[:100]})
 
     async def _enforce_rate_limit(self) -> None:
         """
@@ -1045,11 +969,7 @@ class Historian:
         remaining: float = _REQUEST_INTERVAL_S - elapsed
 
         if remaining > 0:
-            logger.debug(
-                {
-                    "event": "ENFORCING RATE LIMIT",
-                }
-            )
+            logger.debug({"event": "RATE_LIMIT_WAIT", "seconds": round(remaining, 1)})
             await asyncio.sleep(remaining)
 
     # ── Private: Parsing ──────────────────────────────────────────────────────

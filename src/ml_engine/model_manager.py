@@ -203,27 +203,13 @@ class ModelManager:
         try:
             self._storage_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            logger.error(
-                "ModelManager requires a writable directory to persist model artifacts and metadata sidecars.",
-                extra={
-                    "event": "MODEL_MANAGER_INIT_FAILURE",
-                    "path": {exc},
-                    "directory": {self._storage_dir},
-                },
-            )
+            logger.error({"event": "MODEL_MANAGER_INIT_FAILURE", "directory": str(self._storage_dir), "error": str(exc)})
             raise ModelManagerError(
                 f"Cannot create storage directory: {self._storage_dir}",
                 stage="init",
             ) from exc
 
-        logger.info(
-            "ModelManager initialised",
-            extra={
-                "event": "MODEL_IS_UP",
-                "directory": f"{self._storage_dir}",
-                "version": _VERSION,
-            },
-        )
+        logger.info({"event": "MODEL_MANAGER_INIT", "directory": str(self._storage_dir), "version": _VERSION})
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
@@ -253,15 +239,7 @@ class ModelManager:
             ModelManagerError: If serialisation or file I/O fails.
         """
         if result.artifact is None:
-            logger.critical(
-                "save() received a TrainerResult with artifact=None.This means the trainer did not assign a trained model objectto self.model before returning the TrainerResult.",
-                extra={
-                    "event": "MODEL_MANAGER_SAVE_FAILURE",
-                    "model": result.model_name,
-                    "symbol": result.symbol,
-                    "expiry": result.expiry_key,
-                },
-            )
+            logger.critical({"event": "MODEL_SAVE_ARTIFACT_NONE", "model": result.model_name, "symbol": result.symbol, "expiry": result.expiry_key})
             raise ValueError(
                 "ModelManager.save() received a TrainerResult with "
                 "artifact=None. Train the model before saving."
@@ -277,7 +255,7 @@ class ModelManager:
         for p in (artifact_path, metadata_path):
             if p.exists():
                 p.unlink()
-                logger.debug(f"[^] Removed old file: {p.name}")
+                logger.debug({"event": "MODEL_FILE_REMOVED", "file": p.name})
 
         # Detect serialisation format from the artifact type.
         is_sb3: bool = self._is_sb3_model(result.artifact)
@@ -287,22 +265,13 @@ class ModelManager:
             # ── 1. Write artifact ────────────────────────────────────────
             if is_sb3:
                 result.artifact.save(str(artifact_path))  # type: ignore
-                logger.debug(
-                    "SB3 artifact saved via native .save(): %s",
-                    artifact_path.name,
-                )
+                logger.debug({"event": "MODEL_ARTIFACT_SAVED", "format": "sb3", "file": artifact_path.name})
             elif is_pytorch:
                 torch.save(result.artifact.state_dict(), artifact_path)
-                logger.debug(
-                    "PyTorch state_dict saved: %s",
-                    artifact_path.name,
-                )
+                logger.debug({"event": "MODEL_ARTIFACT_SAVED", "format": "pytorch", "file": artifact_path.name})
             else:
                 joblib.dump(result.artifact, artifact_path)
-                logger.debug(
-                    "joblib artifact saved: %s",
-                    artifact_path.name,
-                )
+                logger.debug({"event": "MODEL_ARTIFACT_SAVED", "format": "joblib", "file": artifact_path.name})
 
             # ── 2. Write metadata sidecar ────────────────────────────────
             metadata: dict[str, Any] = {
@@ -326,14 +295,7 @@ class ModelManager:
             with open(metadata_path, "w", encoding="utf-8") as fh:
                 json.dump(metadata, fh, indent=4)
 
-            logger.info(
-                "[^] ModelManager.save(): model=%s symbol=%s expiry=%s auc=%.4f artifact=%s",
-                result.model_name,
-                result.symbol,
-                result.expiry_key,
-                result.metrics.get("auc", 0.0),
-                artifact_path.name,
-            )
+            logger.info({"event": "MODEL_SAVED", "model": result.model_name, "symbol": result.symbol, "expiry": result.expiry_key, "auc": round(result.metrics.get("auc", 0.0), 4)})
 
             # Push both files to Azure Blob so the model survives
             # a container restart. Storage is a no-op in LOCAL mode.
@@ -347,21 +309,7 @@ class ModelManager:
             for orphan in (artifact_path, metadata_path):
                 self._safe_unlink(orphan)
 
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"MODEL MANAGER SAVE FAILURE\n"
-                f"Model: {result.model_name}\n"
-                f"Symbol: {result.symbol}\n"
-                f"Expiry: {result.expiry_key}\n"
-                f"Error: {exc}\n\n"
-                f"CONTEXT: An error occurred while writing the artifact or its\n"
-                f"metadata sidecar to disk. Any partial files have been removed\n"
-                f"automatically to keep the model registry in a consistent state.\n"
-                f"\nFIX: Verify available disk space and write permissions on\n"
-                f"the storage directory: {self._storage_dir}\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "MODEL_SAVE_FAILURE", "model": result.model_name, "symbol": result.symbol, "expiry": result.expiry_key, "error": str(exc)})
             raise ModelManagerError(
                 f"save() failed for {result.model_name}: {exc}",
                 stage="save",
@@ -444,34 +392,13 @@ class ModelManager:
 
         try:
             model = self._resolve_model(is_sb3, is_pytorch, path, model_class, metadata)
-            logger.info(
-                "[^] ModelManager.load(): model=%s symbol=%s expiry=%s version=%s artifact=%s",
-                str(metadata.get("model_name", "UNKNOWN"))[:64],
-                str(metadata.get("symbol", "UNKNOWN"))[:32],
-                str(metadata.get("expiry_key", "UNKNOWN"))[:16],
-                model_version,
-                path.name,
-            )
+            logger.info({"event": "MODEL_LOADED", "model": str(metadata.get("model_name", "?"))[:64], "symbol": str(metadata.get("symbol", "?"))[:32], "expiry": str(metadata.get("expiry_key", "?"))[:16], "version": model_version})
             return model
 
         except (ValueError, ModelManagerError):
             raise
         except Exception as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"MODEL MANAGER LOAD FAILURE: DESERIALISATION ERROR\n"
-                f"Artifact: {path.name}\n"
-                f"Error: {exc}\n\n"
-                f"CONTEXT: The artifact file exists and passed version validation\n"
-                f"but could not be deserialised. The file may be corrupted or\n"
-                f"truncated. For PyTorch artifacts, the model_class architecture\n"
-                f"may not match what was used at training time.\n"
-                f"\nFIX: Verify the artifact file is not zero-bytes or truncated.\n"
-                f"For PyTorch artifacts, confirm the model_class matches the\n"
-                f"architecture recorded in the extra field of the metadata sidecar.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "MODEL_LOAD_DESERIALISE_FAILURE", "artifact": path.name, "error": str(exc)})
             raise ModelManagerError(
                 f"load() failed for {path.name}: {exc}",
                 stage="load",
@@ -482,42 +409,13 @@ class ModelManager:
         if model_version == _VERSION:
             return
         if not self._settings.allow_stale_models:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"MODEL MANAGER LOAD FAILURE: VERSION MISMATCH\n"
-                f"Model feature_version : {model_version}\n"
-                f"Current _VERSION      : {_VERSION}\n"
-                f"Artifact              : {artifact_name}\n\n"
-                f"CONTEXT: This model was trained against a different feature\n"
-                f"schema version. Loading it will produce incorrect predictions\n"
-                f"because the input vector shape and column ordering do not\n"
-                f"match what the model was trained on.\n"
-                f"\nFIX: Retrain the model against the current feature schema\n"
-                f"({_VERSION}), or set ALLOW_STALE_MODELS=True in your .env\n"
-                f"file to bypass this check at your own risk.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "MODEL_VERSION_MISMATCH", "model_version": model_version, "current_version": _VERSION, "artifact": artifact_name})
             raise ModelManagerError(
                 f"Version mismatch: model={model_version} current={_VERSION}. "
                 f"Retrain the model or set allow_stale_models=True.",
                 stage="load",
             )
-        warning_block = (
-            f"\n{'%' * 60}\n"
-            f"MODEL MANAGER WARNING: STALE MODEL LOADED\n"
-            f"Model feature_version : {model_version}\n"
-            f"Current _VERSION      : {_VERSION}\n"
-            f"Artifact              : {artifact_name}\n\n"
-            f"CONTEXT: allow_stale_models=True is set in config. This model\n"
-            f"was trained against a different feature schema. Its predictions\n"
-            f"may be silently wrong because column ordering or feature values\n"
-            f"no longer match what the model learned.\n"
-            f"\nFIX: Retrain the model against the current schema ({_VERSION})\n"
-            f"as soon as possible and remove ALLOW_STALE_MODELS=True.\n"
-            f"{'%' * 60}"
-        )
-        logger.warning(warning_block)
+        logger.warning({"event": "MODEL_STALE_LOADED", "model_version": model_version, "current_version": _VERSION, "artifact": artifact_name})
 
     def _resolve_model(
         self,
@@ -532,27 +430,14 @@ class ModelManager:
             return self._load_sb3(path, metadata)
         if is_pytorch:
             if model_class is None:
-                error_block = (
-                    f"\n{'!' * 60}\n"
-                    f"MODEL MANAGER LOAD FAILURE: MISSING MODEL CLASS\n"
-                    f"Artifact: {path.name}\n\n"
-                    f"CONTEXT: This artifact is a PyTorch model (state_dict).\n"
-                    f"PyTorch state_dicts contain weights only — they cannot be\n"
-                    f"deserialised without the corresponding network architecture\n"
-                    f"(nn.Module subclass) being provided by the caller.\n"
-                    f"\nFIX: Instantiate the correct nn.Module subclass with the\n"
-                    f"same hyperparameters used at training time (check the extra\n"
-                    f"field in the metadata sidecar), then pass it via model_class=.\n"
-                    f"{'!' * 60}"
-                )
-                logger.critical(error_block)
+                logger.critical({"event": "MODEL_LOAD_PYTORCH_NO_CLASS", "artifact": path.name})
                 raise ValueError(
                     f"artifact '{path.name}' is a PyTorch model. "
                     f"Provide a pre-instantiated nn.Module via model_class=."
                 )
             return self._load_pytorch(path, model_class)
         model = joblib.load(path)
-        logger.debug("[^] joblib artifact loaded: %s", path.name)
+        logger.debug({"event": "MODEL_ARTIFACT_LOADED", "format": "joblib", "file": path.name})
         return model
 
     # ── Registry ─────────────────────────────────────────────────────────────
@@ -592,38 +477,14 @@ class ModelManager:
             artifact_file = meta_file.with_suffix(_ARTIFACT_SUFFIX)
 
             if not artifact_file.exists():
-                warning_block = (
-                    f"\n{'%' * 60}\n"
-                    f"MODEL MANAGER WARNING: ORPHANED METADATA SIDECAR\n"
-                    f"Sidecar : {meta_file.name}\n"
-                    f"Expected artifact: {artifact_file.name}\n\n"
-                    f"CONTEXT: A metadata sidecar exists on disk without a corresponding\n"
-                    f"artifact file. This usually means the artifact was manually deleted\n"
-                    f"or a previous save() call failed mid-write. This record is skipped.\n"
-                    f"\nFIX: Delete the orphaned sidecar to clean the registry, or\n"
-                    f"re-run the training pass to regenerate the artifact pair.\n"
-                    f"{'%' * 60}"
-                )
-                logger.warning(warning_block)
+                logger.warning({"event": "MODEL_ORPHANED_SIDECAR", "sidecar": meta_file.name, "missing_artifact": artifact_file.name})
                 continue
 
             try:
                 with open(meta_file, "r", encoding="utf-8") as fh:
                     meta: dict[str, Any] = json.load(fh)
             except (json.JSONDecodeError, OSError) as exc:
-                warning_block = (
-                    f"\n{'%' * 60}\n"
-                    f"MODEL MANAGER WARNING: MALFORMED METADATA SIDECAR\n"
-                    f"File: {meta_file.name}\n"
-                    f"Error: {exc}\n\n"
-                    f"CONTEXT: The metadata sidecar could not be parsed as valid JSON.\n"
-                    f"This record is skipped in the registry. The artifact file may\n"
-                    f"still exist on disk but cannot be loaded without valid metadata.\n"
-                    f"\nFIX: Delete both the artifact and sidecar files and re-run the\n"
-                    f"training pass to regenerate a clean artifact/sidecar pair.\n"
-                    f"{'%' * 60}"
-                )
-                logger.warning(warning_block)
+                logger.warning({"event": "MODEL_MALFORMED_SIDECAR", "file": meta_file.name, "error": str(exc)})
                 continue
 
             record = ModelRecord(
@@ -652,13 +513,7 @@ class ModelManager:
 
         records.sort(key=lambda r: r.trained_at, reverse=True)
 
-        logger.debug(
-            "[^] list_models(): symbol=%s expiry=%s model=%s -> %d records",
-            symbol,
-            expiry_key,
-            model_name,
-            len(records),
-        )
+        logger.debug({"event": "MODEL_LIST_SCANNED", "symbol": symbol, "expiry": expiry_key, "model": model_name, "count": len(records)})
 
         return records
 
@@ -693,23 +548,7 @@ class ModelManager:
         ]
 
         if not candidates:
-            warning_block = (
-                f"\n{'%' * 60}\n"
-                f"MODEL MANAGER WARNING: NO CURRENT-VERSION ARTIFACTS FOUND\n"
-                f"Symbol     : {symbol}\n"
-                f"Expiry key : {expiry_key}\n"
-                f"Model name : {model_name}\n"
-                f"Version    : {_VERSION}\n\n"
-                f"CONTEXT: No artifacts matching the current feature schema version\n"
-                f"were found for this symbol/expiry combination. Stale artifacts\n"
-                f"from a different version are excluded from selection to prevent\n"
-                f"silent prediction errors.\n"
-                f"\nFIX: Run a training pass for symbol={symbol} expiry={expiry_key}\n"
-                f"to produce a current-version ({_VERSION}) artifact before\n"
-                f"attempting inference.\n"
-                f"{'%' * 60}"
-            )
-            logger.warning(warning_block)
+            logger.warning({"event": "MODEL_NO_ARTIFACTS", "symbol": symbol, "expiry": expiry_key, "model": model_name, "version": _VERSION})
             return None
 
         rl_candidates = [r for r in candidates if r.is_sb3]
@@ -723,14 +562,7 @@ class ModelManager:
             best = rl_candidates[0]
 
         if best is not None:
-            logger.info(
-                "[^] get_best_model(): selected model=%s symbol=%s "
-                "expiry=%s auc=%.4f",
-                best.model_name,
-                best.symbol,
-                best.expiry_key,
-                best.auc,
-            )
+            logger.info({"event": "MODEL_SELECTED", "model": best.model_name, "symbol": best.symbol, "expiry": best.expiry_key, "auc": round(best.auc, 4)})
 
         return best
 
@@ -770,7 +602,7 @@ class ModelManager:
                         or download failed.
         """
         if self._storage._container_client is None:
-            logger.debug("[^] pull_from_blob: DATA_MODE is LOCAL — skipping Blob pull.")
+            logger.debug({"event": "MODEL_BLOB_PULL_SKIPPED", "mode": "LOCAL"})
             return None
 
         return await asyncio.to_thread(
@@ -799,20 +631,7 @@ class ModelManager:
             ]
 
             if not artifact_blobs:
-                warning_block = (
-                    f"\n{'%' * 60}\n"
-                    f"MODEL MANAGER WARNING: NO BLOB ARTIFACT FOUND\n"
-                    f"Symbol     : {symbol}\n"
-                    f"Expiry key : {expiry_key}\n"
-                    f"Model name : {model_name}\n\n"
-                    f"CONTEXT: No matching .artifact blob was found under the\n"
-                    f"models/ prefix in Azure Blob Storage. The container will\n"
-                    f"start without a pre-trained model.\n"
-                    f"\nFIX: Run a training pass to produce and upload a model\n"
-                    f"artifact before starting the inference container.\n"
-                    f"{'%' * 60}"
-                )
-                logger.warning(warning_block)
+                logger.warning({"event": "MODEL_BLOB_NOT_FOUND", "symbol": symbol, "expiry": expiry_key, "model": model_name})
                 return None
 
             artifact_filename = Path(artifact_blobs[0].name).name
@@ -823,28 +642,12 @@ class ModelManager:
             )
 
             if local_path is not None:
-                logger.info(
-                    "[^] pull_from_blob: restored %s -> %s",
-                    artifact_filename,
-                    local_path,
-                )
+                logger.info({"event": "MODEL_BLOB_RESTORED", "artifact": artifact_filename})
 
             return str(local_path) if local_path is not None else None
 
         except Exception as e:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"MODEL MANAGER PULL FROM BLOB FAILURE\n"
-                f"Symbol     : {symbol}\n"
-                f"Expiry key : {expiry_key}\n"
-                f"Error      : {e}\n\n"
-                f"CONTEXT: An unexpected error occurred while listing or\n"
-                f"downloading blobs from Azure Storage. The container will\n"
-                f"start without a restored model.\n"
-                f"\nFIX: Check AZURE_STORAGE_CONN and network connectivity.\n"
-                f"{'!' * 60}"
-            )
-            logger.error(error_block)
+            logger.error({"event": "MODEL_BLOB_PULL_FAILURE", "symbol": symbol, "expiry": expiry_key, "error": str(e)})
             return None
 
     # ── Validation ───────────────────────────────────────────────────────────
@@ -880,22 +683,14 @@ class ModelManager:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
         except json.JSONDecodeError as exc:
-            logger.critical(
-                "METADATA PARSE FAILURE file=%s error=%s",
-                self._sanitize_log(path.name),
-                self._sanitize_log(exc),
-            )
+            logger.critical({"event": "MODEL_METADATA_PARSE_FAILURE", "file": self._sanitize_log(path.name), "error": self._sanitize_log(exc)})
             raise ModelManagerError(
                 f"Metadata JSON parse failure: {path.name}",
                 stage="validate_metadata",
             ) from exc
 
         if not isinstance(raw, dict):
-            logger.critical(
-                "METADATA INVALID STRUCTURE file=%s got=%s",
-                self._sanitize_log(path.name),
-                self._sanitize_log(type(raw).__name__),
-            )
+            logger.critical({"event": "MODEL_METADATA_INVALID_STRUCTURE", "file": self._sanitize_log(path.name), "got": self._sanitize_log(type(raw).__name__)})
             raise ModelManagerError(
                 f"Metadata root must be a JSON object, got {type(raw).__name__}: {path.name}",
                 stage="validate_metadata",
@@ -922,11 +717,7 @@ class ModelManager:
         )
         missing = [f for f in sorted(_REQUIRED_FIELDS) if f not in metadata]
         if missing:
-            logger.critical(
-                "METADATA MISSING FIELDS file=%s missing=%s",
-                self._sanitize_log(path.name),
-                missing,
-            )
+            logger.critical({"event": "MODEL_METADATA_MISSING_FIELDS", "file": self._sanitize_log(path.name), "missing": missing})
             raise ModelManagerError(
                 f"Metadata missing required fields {missing}: {path.name}",
                 stage="validate_metadata",
@@ -963,24 +754,9 @@ class ModelManager:
 
         try:
             path.unlink()
-            logger.info(
-                "[^] ModelManager.delete(): artifact removed: %s",
-                path.name,
-            )
+            logger.info({"event": "MODEL_ARTIFACT_DELETED", "artifact": path.name})
         except OSError as exc:
-            error_block = (
-                f"\n{'!' * 60}\n"
-                f"MODEL MANAGER DELETE FAILURE\n"
-                f"Artifact: {path.name}\n"
-                f"Error: {exc}\n\n"
-                f"CONTEXT: The artifact file could not be deleted from disk.\n"
-                f"The model registry may still reference this file until it\n"
-                f"is successfully removed.\n"
-                f"\nFIX: Verify that no other process holds an open file handle\n"
-                f"on this artifact, then retry the delete operation.\n"
-                f"{'!' * 60}"
-            )
-            logger.critical(error_block)
+            logger.critical({"event": "MODEL_DELETE_FAILURE", "artifact": path.name, "error": str(exc)})
             raise ModelManagerError(
                 f"delete() failed to remove artifact {path.name}: {exc}",
                 stage="delete",
@@ -989,39 +765,11 @@ class ModelManager:
         if metadata_path.exists():
             try:
                 metadata_path.unlink()
-                logger.info(
-                    "[^] ModelManager.delete(): sidecar removed: %s",
-                    metadata_path.name,
-                )
+                logger.info({"event": "MODEL_SIDECAR_DELETED", "sidecar": metadata_path.name})
             except OSError as exc:
-                warning_block = (
-                    f"\n{'%' * 60}\n"
-                    f"MODEL MANAGER WARNING: SIDECAR DELETION FAILED\n"
-                    f"Artifact removed   : {path.name}\n"
-                    f"Sidecar not removed: {metadata_path.name}\n"
-                    f"Error: {exc}\n\n"
-                    f"CONTEXT: The artifact was successfully deleted but the metadata\n"
-                    f"sidecar could not be removed. The orphaned sidecar will appear\n"
-                    f"in list_models() scans but will be automatically skipped because\n"
-                    f"its corresponding artifact file no longer exists.\n"
-                    f"\nFIX: Manually delete {metadata_path.name} to clean the registry.\n"
-                    f"{'%' * 60}"
-                )
-                logger.warning(warning_block)
+                logger.warning({"event": "MODEL_SIDECAR_DELETE_FAILED", "sidecar": metadata_path.name, "error": str(exc)})
         else:
-            warning_block = (
-                f"\n{'%' * 60}\n"
-                f"MODEL MANAGER WARNING: NO SIDECAR FOUND DURING DELETE\n"
-                f"Artifact: {path.name}\n"
-                f"Expected sidecar: {metadata_path.name}\n\n"
-                f"CONTEXT: The artifact was deleted but no companion metadata sidecar\n"
-                f"was found at the expected path. The registry may have already been\n"
-                f"in an inconsistent state before this delete operation was called.\n"
-                f"\nFIX: No further action required. Run list_models() to verify\n"
-                f"the registry is now clean.\n"
-                f"{'%' * 60}"
-            )
-            logger.warning(warning_block)
+            logger.warning({"event": "MODEL_SIDECAR_MISSING_ON_DELETE", "artifact": path.name, "expected_sidecar": metadata_path.name})
 
     # ── Internal Helpers ─────────────────────────────────────────────────────
 
@@ -1091,10 +839,7 @@ class ModelManager:
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
         model_class.load_state_dict(state_dict)
         model_class.eval()
-        logger.debug(
-            "[^] PyTorch state_dict loaded into model_class: %s",
-            path.name,
-        )
+        logger.debug({"event": "MODEL_ARTIFACT_LOADED", "format": "pytorch", "file": path.name})
         return model_class
 
     @staticmethod
@@ -1130,10 +875,7 @@ class ModelManager:
 
         module_path = _SB3_CLASS_MAP.get(model_name)
         if module_path is None:
-            logger.critical(
-                "MODEL_LOAD_UNKNOWN_SB3 known_count=%d",
-                len(_SB3_CLASS_MAP),
-            )
+            logger.critical({"event": "MODEL_LOAD_UNKNOWN_SB3", "model_name": model_name})
             raise ModelManagerError(
                 "Unknown SB3 model_name in metadata sidecar. "
                 "Verify model_name matches a known RL trainer, or add it "
@@ -1146,10 +888,7 @@ class ModelManager:
             module = importlib.import_module(module_str)
             algorithm_class = getattr(module, class_str)
         except ImportError as exc:
-            logger.critical(
-                "MODEL_LOAD_SB3_IMPORT_ERROR error=%s",
-                ModelManager._sanitize_log(exc),
-            )
+            logger.critical({"event": "MODEL_LOAD_SB3_IMPORT_ERROR", "error": ModelManager._sanitize_log(exc)})
             raise ModelManagerError(
                 "Required SB3 package is not installed in this environment. "
                 "Add stable-baselines3 or sb3-contrib to your Dockerfile.",
@@ -1157,10 +896,7 @@ class ModelManager:
             ) from exc
 
         model = algorithm_class.load(str(path))
-        logger.debug(
-            "[^] SB3 model loaded via native .load(): %s",
-            path.name,
-        )
+        logger.debug({"event": "MODEL_ARTIFACT_LOADED", "format": "sb3", "file": path.name})
         return model
 
     def __repr__(self) -> str:
