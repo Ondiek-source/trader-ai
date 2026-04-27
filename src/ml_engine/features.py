@@ -283,12 +283,23 @@ class FeatureMatrix:
         object.__setattr__(self, "matrix", np.asarray(self.matrix, dtype=np.float32))
         self.matrix.flags.writeable = False
         if self.matrix.ndim != 2:
-            logger.critical({"event": "FEATURE_MATRIX_INVALID_SHAPE", "shape": str(self.matrix.shape)})
+            logger.critical(
+                {
+                    "event": "FEATURE_MATRIX_INVALID_SHAPE",
+                    "shape": str(self.matrix.shape),
+                }
+            )
             raise ValueError(
                 f"FeatureMatrix requires 2D array, got shape {self.matrix.shape}"
             )
         if self.matrix.shape[1] != len(self.feature_names):
-            logger.critical({"event": "FEATURE_MATRIX_DIMENSION_MISMATCH", "matrix_cols": self.matrix.shape[1], "feature_names_len": len(self.feature_names)})
+            logger.critical(
+                {
+                    "event": "FEATURE_MATRIX_DIMENSION_MISMATCH",
+                    "matrix_cols": self.matrix.shape[1],
+                    "feature_names_len": len(self.feature_names),
+                }
+            )
             raise ValueError(
                 f"matrix columns ({self.matrix.shape[1]}) != "
                 f"feature_names length ({len(self.feature_names)})"
@@ -314,6 +325,7 @@ class FeatureMatrix:
 
 
 # ── The Engineer ─────────────────────────────────────────────────────────────
+
 
 class FeatureEngineer:
     """
@@ -350,6 +362,7 @@ class FeatureEngineer:
         self,
         bars: pd.DataFrame,
         ticks: pd.DataFrame | None = None,
+        timeframe: str = "M1",
     ) -> pd.DataFrame:
         """
         The Master Pipeline: Bars + Ticks -> Normalized Features DataFrame.
@@ -375,7 +388,7 @@ class FeatureEngineer:
 
         # 1. Normalize Frequency using the Map
         # We target M1 as the base for binary options features
-        target_freq = _RESAMPLE_MAP.get("M1", "1min")
+        target_freq = _RESAMPLE_MAP.get(timeframe, "1min")
 
         # Ensure index is DatetimeIndex for resampling.
         # A silent pd.to_datetime() on an integer index (e.g. epoch seconds vs
@@ -383,13 +396,24 @@ class FeatureEngineer:
         # We log a warning so the caller can fix the data source, and raise
         # immediately if the conversion itself fails.
         if not isinstance(bars.index, pd.DatetimeIndex):
-            logger.warning({"event": "FEATURE_BARS_NON_DATETIME_INDEX", "index_type": type(bars.index).__name__})
+            logger.warning(
+                {
+                    "event": "FEATURE_BARS_NON_DATETIME_INDEX",
+                    "index_type": type(bars.index).__name__,
+                }
+            )
 
         try:
             bars = bars.copy()
             bars.index = pd.to_datetime(bars.index)
         except Exception as exc:  # pragma: no cover — pathological index type
-            logger.critical({"event": "FEATURE_BARS_INDEX_COERCE_FAILED", "index_type": type(bars.index).__name__, "error": str(exc)})
+            logger.critical(
+                {
+                    "event": "FEATURE_BARS_INDEX_COERCE_FAILED",
+                    "index_type": type(bars.index).__name__,
+                    "error": str(exc),
+                }
+            )
             raise ValueError(
                 f"bars index cannot be coerced to DatetimeIndex: {exc}"
             ) from exc
@@ -410,7 +434,13 @@ class FeatureEngineer:
         required = {"open", "high", "low", "close", "volume"}
         missing = required - set(fe.columns)
         if missing:
-            logger.critical({"event": "FEATURE_MISSING_COLUMNS", "required": sorted(required), "missing": sorted(missing)})
+            logger.critical(
+                {
+                    "event": "FEATURE_MISSING_COLUMNS",
+                    "required": sorted(required),
+                    "missing": sorted(missing),
+                }
+            )
             raise ValueError(f"Input bars missing columns: {missing}")
 
         # 1. PRICE ACTION
@@ -453,7 +483,14 @@ class FeatureEngineer:
             # Rolling window warmup routinely drops the first ~26 bars (MACD span).
             # This is expected and not an error — log at DEBUG so it doesn't
             # pollute INFO streams in production.
-            logger.debug({"event": "FEATURE_ROWS_DROPPED", "dropped": dropped, "total": before, "pct": round(dropped / before * 100, 1)})
+            logger.debug(
+                {
+                    "event": "FEATURE_ROWS_DROPPED",
+                    "dropped": dropped,
+                    "total": before,
+                    "pct": round(dropped / before * 100, 1),
+                }
+            )
         return fe.dropna()
 
     # ── Private: Pipeline Helpers ────────────────────────────────────────────
@@ -466,7 +503,13 @@ class FeatureEngineer:
         gap_timestamps = fe.index[fe["close"].isna()].to_series()
         total_len = len(fe) + n_gaps
         if gap_timestamps.empty or total_len == 0:
-            logger.info({"event": "BACKFILL_GAP_CHECK", "shape": str(fe.shape), "message": "No gap timestamps found"})
+            logger.info(
+                {
+                    "event": "BACKFILL_GAP_CHECK",
+                    "shape": str(fe.shape),
+                    "message": "No gap timestamps found",
+                }
+            )
             return
 
         dow = gap_timestamps.dt.dayofweek
@@ -492,9 +535,25 @@ class FeatureEngineer:
         unexpected_gaps = n_gaps - market_closed_count
 
         if unexpected_gaps > 0:
-            logger.info({"event": "UNEXPECTED_DATA_GAP", "unexpected_gaps": unexpected_gaps, "total_bars": len(fe) + n_gaps, "pct": round(unexpected_gaps / (len(fe) + n_gaps) * 100, 1), "max_ffill": _MAX_FFILL_BARS})
+            logger.info(
+                {
+                    "event": "UNEXPECTED_DATA_GAP",
+                    "unexpected_gaps": unexpected_gaps,
+                    "total_bars": len(fe) + n_gaps,
+                    "pct": round(unexpected_gaps / (len(fe) + n_gaps) * 100, 1),
+                    "max_ffill": _MAX_FFILL_BARS,
+                }
+            )
         else:
-            logger.info({"event": "WEEKEND_HOLIDAY_GAPS", "n_gaps": n_gaps, "total_bars": len(fe) + n_gaps, "pct": round(n_gaps / (len(fe) + n_gaps) * 100, 1), "max_ffill": _MAX_FFILL_BARS})
+            logger.info(
+                {
+                    "event": "WEEKEND_HOLIDAY_GAPS",
+                    "n_gaps": n_gaps,
+                    "total_bars": len(fe) + n_gaps,
+                    "pct": round(n_gaps / (len(fe) + n_gaps) * 100, 1),
+                    "max_ffill": _MAX_FFILL_BARS,
+                }
+            )
 
     def _warn_missing_schema(self, fe: pd.DataFrame) -> None:
         """Warn if any primary feature columns expected by the schema are absent."""
@@ -503,7 +562,14 @@ class FeatureEngineer:
         ]
         missing_schema = [col for col in all_primary if col not in fe.columns]
         if missing_schema:
-            logger.warning({"event": "FEATURE_SCHEMA_INCOMPLETE", "missing_count": len(missing_schema), "total": len(all_primary), "missing": missing_schema})
+            logger.warning(
+                {
+                    "event": "FEATURE_SCHEMA_INCOMPLETE",
+                    "missing_count": len(missing_schema),
+                    "total": len(all_primary),
+                    "missing": missing_schema,
+                }
+            )
 
     # ── 1. PRICE ACTION ─────────────────────────────────────────────────────
 
@@ -985,7 +1051,13 @@ class FeatureEngineer:
 
         missing = set(resolved) - set(available)
         if missing:
-            logger.warning({"event": "EXPIRY_COLUMNS_MISSING", "expiry_key": expiry_key, "missing": list(missing)})
+            logger.warning(
+                {
+                    "event": "EXPIRY_COLUMNS_MISSING",
+                    "expiry_key": expiry_key,
+                    "missing": list(missing),
+                }
+            )
 
         return fe[available]
 
@@ -995,6 +1067,7 @@ class FeatureEngineer:
         self,
         bars: pd.DataFrame,
         ticks: pd.DataFrame | None = None,
+        timeframe: str = "M1",
     ) -> FeatureVector:
         """
         The Live Inference Gate.
@@ -1019,7 +1092,7 @@ class FeatureEngineer:
                 if any unexpected exception occurs inside the pipeline.
         """
         try:
-            full_df = self.transform(bars, ticks)
+            full_df = self.transform(bars, ticks, timeframe=timeframe)
         except Exception as e:
             raise FeatureEngineerError(
                 f"transform() failed: {e}", stage="transform"
@@ -1047,7 +1120,9 @@ class FeatureEngineer:
             bad_names = [
                 available_cols[i] for i, ok in enumerate(finite_mask) if not ok
             ]
-            logger.warning({"event": "FEATURE_NON_FINITE_VALUES", "features": bad_names})
+            logger.warning(
+                {"event": "FEATURE_NON_FINITE_VALUES", "features": bad_names}
+            )
             values = np.where(finite_mask, values, 0.0).astype(np.float32)
 
         ts_value: pd.Timestamp = full_df.index[-1]
@@ -1065,6 +1140,7 @@ class FeatureEngineer:
         bars: pd.DataFrame,
         symbol: str,
         ticks: pd.DataFrame | None = None,
+        timeframe: str = "M1",
     ) -> FeatureMatrix:
         """
         Batch mode: transform full historical bars into a FeatureMatrix.
@@ -1086,7 +1162,7 @@ class FeatureEngineer:
             FeatureEngineerError: If transform() fails or returns empty.
         """
         try:
-            full_df = self.transform(bars, ticks)
+            full_df = self.transform(bars, ticks, timeframe=timeframe)
         except Exception as e:
             raise FeatureEngineerError(
                 f"build_matrix() failed at transform: {e}", stage="build_matrix"
