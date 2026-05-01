@@ -331,7 +331,6 @@ class WebhookSender:
                 f"Check PAIRS and OTC_PAIRS in your .env."
             )
         quotex_symbol: str = symbol_map[signal.symbol]
-
         payload: dict[str, Any] = {
             "side": side,
             "symbol": quotex_symbol,
@@ -349,7 +348,9 @@ class WebhookSender:
                 "model": signal.model_name,
             }
         )
+        import sys
 
+        sys.exit(0)
         return await self.send_async(payload)
 
     # ── Private helpers ────────────────────────────────────────────────────────

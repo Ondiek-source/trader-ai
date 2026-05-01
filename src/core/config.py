@@ -31,7 +31,6 @@ from core.exceptions import (
     ConfigCeilingError,
 )
 
-
 # Load .env file for local development
 load_dotenv()
 
@@ -54,16 +53,6 @@ VALID_PAIRS: set[str] = {
     "USD_CAD",
     "USD_CHF",
     "XAU_USD",
-}
-
-VALID_OTC_BASE_PAIRS: set[str] = {
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "AUDUSD",
-    "USDCAD",
-    "USDCHF",
-    "XAUUSD",
 }
 
 VALID_EXPIRIES: set[int] = {60, 300, 900}
@@ -243,75 +232,6 @@ def _parse_and_validate_pairs(name: str, raw: str) -> list[str]:
     return pairs
 
 
-def _parse_otc_pairs(raw: str) -> list[str]:
-    """
-    Parse and validated ``OTC_PAIRS`` from env var.
-
-    Process:
-        1. Split by comma, strip whitespace
-        2. Remove any suffix (_OTC, _otc, -OTC, etc.) to get base pair
-        3. Convert base pair to UPPERCASE for validation
-        4. Validate base pair against allowed list
-        5. Reconstruct with CORRECT format: basepair_otc (lowercase)
-
-    Accepts valid comma-separated Quotex otc symbol names, e.g.::
-
-        "EURUSD_otc,GBPUSD_otc,USDJPY_otc,XAUUSD_otc"
-
-    If empty, symbols are derived from ``PAIRS`` at stream start time
-    (``EUR_USD`` → ``EURUSD_otc``).
-
-    Args:
-        raw: Raw comma-separated string from the environment variable.
-
-    Returns:
-        List of validated OTC symbol names, or empty list if unset.
-    """
-    if not raw.strip():
-        return []
-
-    # Split and clean
-    raw_symbols = [p.strip().replace("_", "") for p in raw.split(",") if p.strip()]
-    if not raw_symbols:
-        raise ConfigValidationError(
-            field_name="OTC_PAIRS",
-            value=raw,
-            reason=(
-                "String contains no valid symbols (only delimiters?),\n"
-                "OTC_PAIRS must contain at least one symbol name.\n"
-                "Example: OTC_PAIRS=EURUSD_otc,GBPUSD_otc"
-            ),
-        )
-
-    validated_pairs = []
-    for raw_symbol in raw_symbols:
-        # Step 1: Remove any suffix to get base pair
-        base_pair = raw_symbol.upper()  # Start with uppercase for processing
-
-        # Remove common suffixes
-        for suffix in ["OTC", "otc", "OTC", "otc", "Otc", "oTC"]:
-            if base_pair.endswith(suffix):
-                base_pair = base_pair[: -len(suffix)]
-                break
-
-        # Step 2: Validate base pair
-        if base_pair not in VALID_OTC_BASE_PAIRS:
-            raise ConfigPairError(
-                field_name="OTC_PAIRS",
-                pair=raw_symbol,
-                valid_pairs=sorted(VALID_OTC_BASE_PAIRS),
-            )
-
-        # Step 3: Reconstruct with CORRECT format (uppercase _otc)
-        correct_symbol = f"{base_pair.upper()}_otc"
-        validated_pairs.append(correct_symbol)
-
-    # NOTE: do not log here — _parse_otc_pairs is called from load_config()
-    # before logging is configured. Normalization count is visible in the
-    # validated pair list returned to the caller.
-    return validated_pairs
-
-
 # ── Configuration dataclass ───────────────────────────────────────────────────
 
 
@@ -343,6 +263,7 @@ class Config:
 
     # ── Trading ───────────────────────────────────────────────────────────
     pairs: list[str]
+    use_otc: bool
     confidence_threshold: float
     expiry_seconds: int
     daily_trade_target: int
@@ -390,7 +311,6 @@ class Config:
 
     # ── Data source routing ──────────────────────────────────────────────
     use_quotex_streaming: bool
-    otc_pairs: list[str]
     poll_interval: float
 
     # ──Infrastructure ───────────────────────────────────────────────────────
@@ -545,29 +465,22 @@ class Config:
                 reason="Both QUOTEX_EMAIL and QUOTEX_PASSWORD are required for Quotex streaming",
             )
 
-        if self.otc_pairs and len(self.otc_pairs) != len(self.pairs):
-            raise ConfigLengthMismatchError(
-                field1="OTC_PAIRS",
-                len1=len(self.otc_pairs),
-                field2="PAIRS",
-                len2=len(self.pairs),
-            )
-
     @property
     def quotex_symbols(self) -> dict[str, str]:
         """
         TRANSLATOR: This sits ready for the Trading Engine.
         It maps the 'Pure' names to 'Broker' names.
 
-        For example, if PAIRS contains "EUR_USD", this property will provide
-        the corresponding Quotex symbol, which is typically "EURUSD_otc".
+        Behavior:
+        - If use_otc=True: Returns symbols with '_otc' suffix (e.g., EURUSD_otc)
+        - If use_otc=False: Returns regular Forex symbols (e.g., EURUSD)
         """
-        # If you explicitly provided OTC_PAIRS in .env, map them 1:1
-        if self.otc_pairs:
-            return dict(zip(self.pairs, self.otc_pairs))
-
-        # Otherwise, auto-translate: EUR_USD -> EURUSD_otc
-        return {p: f"{p.replace('_', '')}_otc" for p in self.pairs}
+        if self.use_otc:
+            # OTC mode: EUR_USD -> EURUSD_otc
+            return {p: f"{p.replace('_', '')}_otc" for p in self.pairs}
+        else:
+            # Regular Forex mode: EUR_USD -> EURUSD
+            return {p: p.replace("_", "") for p in self.pairs}
 
 
 def load_config() -> Config:
@@ -591,7 +504,6 @@ def load_config() -> Config:
         dashboard_port=_int("DASHBOARD_PORT", 8080),
         display_tz=_int("DISPLAY_TZ", 0),
         # Data source routing
-        otc_pairs=_parse_otc_pairs(_optional("OTC_PAIRS", "")),
         poll_interval=_parse_float("POLL_INTERVAL", default=1.0),
         use_quotex_streaming=_bool("USE_QUOTEX_STREAMING", True),
         # Martingales
@@ -619,6 +531,7 @@ def load_config() -> Config:
         daily_trade_target=_int("DAILY_TRADE_TARGET", 10),
         expiry_seconds=_int("EXPIRY_SECONDS", 60),
         pairs=pairs,
+        use_otc=_bool("USE_OTC", False),
         daily_net_profit_target=daily_net_profit_target,
         trading_window_hours=_int("TRADING_WINDOW_HOURS", 19),
         # Training
