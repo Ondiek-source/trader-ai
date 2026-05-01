@@ -50,6 +50,7 @@ VALID_PAIRS: set[str] = {
     "GBP_USD",
     "USD_JPY",
     "AUD_USD",
+    "EUR_JPY",
     "USD_CAD",
     "USD_CHF",
     "XAU_USD",
