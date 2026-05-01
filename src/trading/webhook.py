@@ -322,13 +322,12 @@ class WebhookSender:
         side: str = "buy" if direction == "CALL" else "sell"
 
         # Delegate symbol resolution entirely to Config.quotex_symbols.
-        # This respects explicit OTC_PAIRS if set, or auto-translates.
         symbol_map: dict[str, str] = settings.quotex_symbols
         if signal.symbol not in symbol_map:
             raise ValueError(
                 f"Signal symbol '{signal.symbol}' is not in the configured "
                 f"pairs. Known symbols: {list(symbol_map.keys())}. "
-                f"Check PAIRS and OTC_PAIRS in your .env."
+                f"Check PAIRS and USE_OTC in your .env."
             )
         quotex_symbol: str = symbol_map[signal.symbol]
         payload: dict[str, Any] = {
@@ -348,9 +347,6 @@ class WebhookSender:
                 "model": signal.model_name,
             }
         )
-        import sys
-
-        sys.exit(0)
         return await self.send_async(payload)
 
     # ── Private helpers ────────────────────────────────────────────────────────
