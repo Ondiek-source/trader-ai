@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --retries 10 \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     "catboost>=1.2.0" \
+    "exchange-calendars>=4.5.0" \ 
     "gymnasium>=0.29.0" \
     "lightgbm>=4.3.0" \
     "numpy>=1.26.0" \

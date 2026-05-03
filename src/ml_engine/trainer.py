@@ -153,7 +153,14 @@ def get_best_device() -> str:
     else:
         device = "cpu"
 
-    logger.info({"event": "DEVICE_SELECTED", "device": device, "cuda": torch.cuda.is_available(), "mps": torch.backends.mps.is_available()})
+    logger.info(
+        {
+            "event": "DEVICE_SELECTED",
+            "device": device,
+            "cuda": torch.cuda.is_available(),
+            "mps": torch.backends.mps.is_available(),
+        }
+    )
     return device
 
 
@@ -379,11 +386,15 @@ class DataShaper:
         x_aligned: pd.DataFrame = feat_df.loc[common_index]
         y_aligned: pd.Series = labels.loc[common_index]
 
+        valid_mask = y_aligned >= 0
+        x_aligned = x_aligned[valid_mask]
+        y_aligned = y_aligned[valid_mask]
+
         n_total: int = len(x_aligned)
         min_required: int = 100
         if n_total < min_required:
             raise TrainerError(
-                f"[%] Aligned dataset has only {n_total} rows — minimum "
+                f"Aligned dataset has only {n_total} rows — minimum "
                 f"{min_required} required for a meaningful split. "
                 f"Provide a longer historical bar range.",
                 stage="split",
@@ -419,7 +430,17 @@ class DataShaper:
             n_total=n_total,
         )
 
-        logger.info({"event": "DATA_SPLIT", "symbol": feature_matrix.symbol, "expiry": expiry_key, "total": n_total, "train": len(split.x_train), "val": len(split.x_val), "test": len(split.x_test)})
+        logger.info(
+            {
+                "event": "DATA_SPLIT",
+                "symbol": feature_matrix.symbol,
+                "expiry": expiry_key,
+                "total": n_total,
+                "train": len(split.x_train),
+                "val": len(split.x_val),
+                "test": len(split.x_test),
+            }
+        )
 
         return split
 
@@ -462,7 +483,12 @@ def _compute_metrics(
             split — log a warning).
     """
     if len(np.unique(y_true)) < 2:
-        logger.warning({"event": "METRICS_DEGENERATE_LABELS", "unique_classes": int(len(np.unique(y_true)))})
+        logger.warning(
+            {
+                "event": "METRICS_DEGENERATE_LABELS",
+                "unique_classes": int(len(np.unique(y_true))),
+            }
+        )
         return {
             "accuracy": 0.0,
             "precision": 0.0,
@@ -757,7 +783,16 @@ class XGBoostTrainer(BaseTrainer):
                 verbose=False,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "XGBoost", "best_iteration": self.model.best_iteration, "spw": round(spw, 2), "lr": current_lr, "incremental": is_incremental})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "XGBoost",
+                    "best_iteration": self.model.best_iteration,
+                    "spw": round(spw, 2),
+                    "lr": current_lr,
+                    "incremental": is_incremental,
+                }
+            )
 
             metrics = self.evaluate(split.x_val, split.y_val)
             importances: dict[str, float] = dict(
@@ -898,7 +933,16 @@ class LightGBMTrainer(BaseTrainer):
                 callbacks=callbacks,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "LightGBM", "best_iteration": self.model.best_iteration_, "spw": round(spw, 2), "lr": current_lr, "incremental": is_incremental})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "LightGBM",
+                    "best_iteration": self.model.best_iteration_,
+                    "spw": round(spw, 2),
+                    "lr": current_lr,
+                    "incremental": is_incremental,
+                }
+            )
 
             metrics = self.evaluate(split.x_val, split.y_val)
             importances = dict(
@@ -1006,7 +1050,16 @@ class CatBoostTrainer(BaseTrainer):
                 eval_set=eval_pool,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "CatBoost", "best_iteration": self.model.get_best_iteration(), "task_type": task_type, "lr": current_lr, "incremental": is_incremental})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "CatBoost",
+                    "best_iteration": self.model.get_best_iteration(),
+                    "task_type": task_type,
+                    "lr": current_lr,
+                    "incremental": is_incremental,
+                }
+            )
 
             metrics = self.evaluate(split.x_val, split.y_val)
             importances = dict(
@@ -1098,7 +1151,14 @@ class RandomForestTrainer(BaseTrainer):
 
             self.model.fit(split.x_train, split.y_train)
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "RandomForest", "n_estimators": self.n_estimators, "max_depth": self.max_depth})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "RandomForest",
+                    "n_estimators": self.n_estimators,
+                    "max_depth": self.max_depth,
+                }
+            )
 
             metrics = self.evaluate(split.x_val, split.y_val)
             importances = dict(
@@ -1214,7 +1274,14 @@ class StackingEnsembleTrainer(BaseTrainer):
                 y_prob=self.model.predict_proba(meta_x)[:, 1],
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "StackingEnsemble", "base_models": list(self.base_predictions.keys()), "meta_c": self.meta_c})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "StackingEnsemble",
+                    "base_models": list(self.base_predictions.keys()),
+                    "meta_c": self.meta_c,
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -1317,7 +1384,16 @@ def _train_torch_model(
         val_loss: float = val_loss_accum / max(val_batches, 1)
         val_losses.append(val_loss)
 
-        logger.debug({"event": "EPOCH", "epoch": epoch + 1, "epochs": epochs, "val_loss": round(val_loss, 6), "best": round(best_val_loss, 6), "patience": f"{patience_counter}/{patience}"})
+        logger.debug(
+            {
+                "event": "EPOCH",
+                "epoch": epoch + 1,
+                "epochs": epochs,
+                "val_loss": round(val_loss, 6),
+                "best": round(best_val_loss, 6),
+                "patience": f"{patience_counter}/{patience}",
+            }
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1326,7 +1402,9 @@ def _train_torch_model(
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                logger.info({"event": "EARLY_STOP", "epoch": epoch + 1, "patience": patience})
+                logger.info(
+                    {"event": "EARLY_STOP", "epoch": epoch + 1, "patience": patience}
+                )
                 break
     # Restore best weights regardless of early stopping.
     if best_weights:
@@ -1523,7 +1601,17 @@ class LSTMTrainer(BaseTrainer):
                 y_true=y_val_trimmed[: len(val_probs)],
                 y_prob=val_probs,
             )
-            logger.info({"event": "TRAIN_COMPLETE", "model": "LSTM", "epochs_run": len(val_losses), "final_val_loss": round(val_losses[-1] if val_losses else float("nan"), 6), "auc": round(metrics.get("auc", 0.0), 4)})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "LSTM",
+                    "epochs_run": len(val_losses),
+                    "final_val_loss": round(
+                        val_losses[-1] if val_losses else float("nan"), 6
+                    ),
+                    "auc": round(metrics.get("auc", 0.0), 4),
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -1532,7 +1620,10 @@ class LSTMTrainer(BaseTrainer):
             )
 
         except Exception as exc:
-            logger.error({"event": "TRAIN_FAILURE", "model": "LSTM", "error": str(exc)}, exc_info=True)
+            logger.error(
+                {"event": "TRAIN_FAILURE", "model": "LSTM", "error": str(exc)},
+                exc_info=True,
+            )
             raise TrainerError(
                 f"LSTMTrainer.train() failed: {exc}", stage="train"
             ) from exc
@@ -1717,7 +1808,16 @@ class GRUTrainer(LSTMTrainer):
                 y_prob=val_probs,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "GRU", "epochs_run": len(val_losses), "final_val_loss": round(val_losses[-1] if val_losses else float("nan"), 6)})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "GRU",
+                    "epochs_run": len(val_losses),
+                    "final_val_loss": round(
+                        val_losses[-1] if val_losses else float("nan"), 6
+                    ),
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -1930,7 +2030,14 @@ class TCNTrainer(LSTMTrainer):
             )
 
             receptive_field = (2**self.n_layers) * self.kernel_size
-            logger.info({"event": "TRAIN_COMPLETE", "model": "TCN", "epochs_run": len(val_losses), "receptive_field_bars": receptive_field})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "TCN",
+                    "epochs_run": len(val_losses),
+                    "receptive_field_bars": receptive_field,
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -2062,7 +2169,16 @@ class CNNLSTMTrainer(LSTMTrainer):
                 y_prob=val_probs,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "CNN-LSTM", "epochs_run": len(val_losses), "final_val_loss": round(val_losses[-1] if val_losses else float("nan"), 6)})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "CNN-LSTM",
+                    "epochs_run": len(val_losses),
+                    "final_val_loss": round(
+                        val_losses[-1] if val_losses else float("nan"), 6
+                    ),
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -2219,7 +2335,15 @@ class TransformerTrainer(LSTMTrainer):
                 y_prob=val_probs,
             )
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": "Transformer", "epochs_run": len(val_losses), "n_heads": self.n_heads, "n_layers": self.n_layers})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": "Transformer",
+                    "epochs_run": len(val_losses),
+                    "n_heads": self.n_heads,
+                    "n_layers": self.n_layers,
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -2301,11 +2425,12 @@ class _ForexBinaryEnv(_GymEnv):
 
     def reset(
         self,
+        *,
         seed: int | None = None,
         options: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         """Reset the environment to the first bar."""
-        del seed, options  # Required by gymnasium.Env interface; unused here.
+        super().reset(seed=seed, options=options)  # Call parent to handle seeding
         self.current_step = 0
         return self.features[0], {}
 
@@ -2432,7 +2557,14 @@ class _RLBaseTrainer(BaseTrainer):
 
             self.model = self._build_sb3_model(train_env)
 
-            logger.info({"event": "RL_TRAIN_START", "model": self.model_name, "n_steps": self.n_steps_train, "incremental": is_incremental})
+            logger.info(
+                {
+                    "event": "RL_TRAIN_START",
+                    "model": self.model_name,
+                    "n_steps": self.n_steps_train,
+                    "incremental": is_incremental,
+                }
+            )
 
             self.model.learn(
                 total_timesteps=self.n_steps_train,
@@ -2468,7 +2600,14 @@ class _RLBaseTrainer(BaseTrainer):
                 "total_val_steps": len(episode_rewards),
             }
 
-            logger.info({"event": "TRAIN_COMPLETE", "model": self.model_name, "mean_reward": round(mean_reward, 4), "sharpe": round(sharpe_proxy, 4)})
+            logger.info(
+                {
+                    "event": "TRAIN_COMPLETE",
+                    "model": self.model_name,
+                    "mean_reward": round(mean_reward, 4),
+                    "sharpe": round(sharpe_proxy, 4),
+                }
+            )
 
             return self._build_result(
                 split=split,
@@ -2782,7 +2921,14 @@ class RecurrentPPOTrainer(_RLBaseTrainer):
         original_lr: float = self.learning_rate
         if is_incremental:
             self.learning_rate = original_lr / 10
-            logger.info({"event": "RL_LR_SCALED", "model": "RecurrentPPO", "from_lr": original_lr, "to_lr": self.learning_rate})
+            logger.info(
+                {
+                    "event": "RL_LR_SCALED",
+                    "model": "RecurrentPPO",
+                    "from_lr": original_lr,
+                    "to_lr": self.learning_rate,
+                }
+            )
         try:
             return super().train(split, is_incremental=is_incremental)
         finally:

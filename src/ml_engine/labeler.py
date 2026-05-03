@@ -57,6 +57,7 @@ import numpy as np
 import pandas as pd
 
 from ml_engine.features import BINARY_EXPIRY_RULES, _VERSION
+from core.exceptions import LabelerError
 
 logger = logging.getLogger(__name__)
 
@@ -89,30 +90,6 @@ assert set(BINARY_EXPIRY_RULES.keys()) == set(_EXPIRY_SECONDS.keys()), (
     f"FIX: When adding a new expiry key to features.py BINARY_EXPIRY_RULES, "
     f"add the matching duration entry to _EXPIRY_SECONDS in labeler.py."
 )
-
-
-# ── Custom Exception ─────────────────────────────────────────────────────────
-
-
-class LabelerError(Exception):
-    """
-    Raised when the Labeler cannot produce a valid label set.
-
-    Distinct from ValueError (which signals a caller contract violation
-    such as a malformed input DataFrame) — LabelerError signals a
-    runtime failure inside the labeling pipeline that the trainer must
-    handle explicitly.
-
-    Attributes:
-        stage: The pipeline stage that failed (e.g. "compute_labels").
-    """
-
-    def __init__(self, message: str, stage: str = "") -> None:
-        super().__init__(message)
-        self.stage = stage
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"LabelerError(stage={self.stage!r}, message={str(self)!r})"
 
 
 # ── Labeler ──────────────────────────────────────────────────────────────────
@@ -149,7 +126,7 @@ class Labeler:
         >>> meta = labeler.get_metadata(labels, symbol="EUR_USD")
     """
 
-    def __init__(self, expiry_key: str = "1_MIN") -> None:
+    def __init__(self, expiry_key: str = "1_MIN", atr_threshold: float = 0.0) -> None:
         """
         Initialise the Labeler for a specific expiry window.
 
@@ -185,13 +162,14 @@ class Labeler:
         self.expiry_key: str = expiry_key
         self.expiry_seconds: int = _EXPIRY_SECONDS[expiry_key]
         self.lookahead_bars: int = self.expiry_seconds // _M1_BAR_SECONDS
-
+        self.atr_threshold: float = atr_threshold
         logger.debug(
-            "[^] Labeler initialised: expiry_key=%s, expiry_seconds=%d, "
-            "lookahead_bars=%d",
+            "Labeler initialised: expiry_key=%s, expiry_seconds=%d, "
+            "lookahead_bars=%d, atr_threshold=%s",
             self.expiry_key,
             self.expiry_seconds,
             self.lookahead_bars,
+            self.atr_threshold,
         )
 
     # ── Label Generation ─────────────────────────────────────────────────────
@@ -200,92 +178,81 @@ class Labeler:
         """
         Compute binary classification labels over a bar DataFrame.
 
-        For each bar at index t, the label is 1 if the close price at
-        t + lookahead_bars is strictly greater than the close price at
-        t, and 0 otherwise. The final lookahead_bars rows are dropped
-        because no future close exists to compare against — training on
-        these rows would introduce NaN-derived corruption.
-
-        The returned Series index is aligned to the input DataFrame
-        index, minus the tail rows that were dropped. Callers must
-        align the FeatureMatrix timestamps to this index before
-        passing both to DataShaper.
+        If atr_threshold > 0, only labels moves where the price change
+        magnitude exceeds atr_threshold × ATR are kept. Rows with smaller
+        moves are marked as -1 (SKIP) and should be filtered out during training.
 
         Args:
-            df: OHLCV DataFrame with a DatetimeIndex and at minimum a
-                "close" column. Typically the output of
-                FeatureEngineer.transform() cast to a DataFrame, or
-                the raw bars DataFrame before feature engineering.
+            df: OHLCV DataFrame with DatetimeIndex. Must have 'close' column.
+            If atr_threshold > 0, must also have 'ATR' column.
 
         Returns:
-            pd.Series: Integer series of dtype int32 with values in
-                {0, 1}. Index matches the input DataFrame index minus
-                the final lookahead_bars rows. Name is set to "label"
-                for downstream alignment clarity.
-
-        Raises:
-            ValueError: If "close" column is absent from df.
-            LabelerError: If df is empty, or if all rows are dropped
-                after NaN removal (e.g. lookahead_bars >= len(df)).
+            pd.Series: Integer series with values in {0, 1, -1} where:
+                1 = CALL (price rose significantly)
+                0 = PUT (price fell significantly)
+                -1 = SKIP (move too small to be reliable)
         """
         if df.empty:
             raise LabelerError(
-                "compute_labels() received an empty DataFrame. "
-                "Ensure historical bars are loaded before labeling.",
+                "compute_labels() received an empty DataFrame.",
                 stage="compute_labels",
             )
 
         if "close" not in df.columns:
             raise ValueError(
-                "[!] compute_labels() requires a 'close' column. "
+                "compute_labels() requires a 'close' column. "
                 f"Columns present: {list(df.columns)}"
             )
 
         if self.lookahead_bars >= len(df):
             raise LabelerError(
-                f"[%] lookahead_bars ({self.lookahead_bars}) >= "
+                f"lookahead_bars ({self.lookahead_bars}) >= "
                 f"DataFrame length ({len(df)}). "
                 f"Provide more historical bars for expiry_key='{self.expiry_key}'.",
                 stage="compute_labels",
             )
 
-        # Shift close price backwards by lookahead_bars to align the
-        # future close with the current bar index. shift(-N) moves values
-        # N positions earlier in the index, so df["close"].shift(-N).iloc[t]
-        # gives the close price at t + N.
-        future_close: pd.Series = df["close"].shift(-self.lookahead_bars)
+        # Future close price (N bars ahead)
+        future_close = df["close"].shift(-self.lookahead_bars)
 
-        # Binary label: 1 = CALL win (price rose), 0 = PUT win or flat.
-        # Cast to int32 to minimise memory footprint across large matrices.
-        raw_labels: pd.Series = (future_close > df["close"]).astype(np.int32)
+        # Direction label: 1 = up, 0 = down or flat
+        direction_labels = (future_close > df["close"]).astype(np.int32)
 
-        # Drop the tail rows where future_close is NaN. These are the last
-        # lookahead_bars rows where no outcome is observable.
-        labels: pd.Series = raw_labels.dropna().rename("label")
+        # If no filtering, return standard labels (drop NaN tail)
+        if self.atr_threshold <= 0:
+            labels = direction_labels.dropna().rename("label")
+            logger.debug(f"Standard labels: {len(labels):,} rows")
+            return labels
 
-        # Sanity guard: if dropna removed everything, the DataFrame was too
-        # short relative to the lookahead window.
-        # NOTE: In practice this branch is unreachable — astype(np.int32) is
-        # applied before dropna(), which converts NaN comparisons to 0 (False).
-        # int32 cannot hold NaN so dropna() is a no-op. The lookahead_bars >=
-        # len(df) guard above already blocks the edge case that would otherwise
-        # make labels empty. Retained as a defensive contract.
-        if labels.empty:  # pragma: no cover — defensive contract; see note above
-            raise LabelerError(
-                f"[%] All rows dropped after NaN removal in compute_labels(). "
-                f"DataFrame had {len(df)} rows, lookahead_bars={self.lookahead_bars}. "
-                f"Provide a longer history window.",
-                stage="compute_labels",
+        # --- Magnitude filtering ---
+        # Requires ATR column
+        if "ATR" not in df.columns:
+            raise ValueError(
+                f"atr_threshold={self.atr_threshold} requires 'ATR' column. "
+                "Run feature engineering before labeling."
             )
 
-        dropped: int = len(df) - len(labels)
-        logger.debug(
-            "[^] compute_labels(): %d labels produced, %d tail rows dropped "
-            "(lookahead_bars=%d, expiry_key=%s).",
-            len(labels),
-            dropped,
-            self.lookahead_bars,
-            self.expiry_key,
+        # Calculate move magnitude (absolute price change)
+        move_magnitude = (future_close - df["close"]).abs()
+
+        # Minimum move required to keep the label
+        min_move = df["ATR"] * self.atr_threshold
+
+        # Apply filter: -1 for moves below threshold
+        labels = (
+            direction_labels.where(move_magnitude >= min_move, other=-1)
+            .dropna()
+            .rename("label")
+        )
+
+        labels = labels.astype(np.int32)
+
+        kept = (labels >= 0).sum()
+        skipped = (labels == -1).sum()
+        logger.info(
+            f"Labels with threshold {self.atr_threshold}×ATR: "
+            f"{kept:,} kept ({kept/len(labels)*100:.1f}%), "
+            f"{skipped:,} skipped ({skipped/len(labels)*100:.1f}%)"
         )
 
         return labels
@@ -340,6 +307,7 @@ class Labeler:
             "expiry_key": self.expiry_key,
             "expiry_seconds": self.expiry_seconds,
             "lookahead_bars": self.lookahead_bars,
+            "atr_threshold": self.atr_threshold,
             "symbol": symbol,
             "label_generated_at": datetime.now(tz=timezone.utc).isoformat(),
             "total_rows": total,
@@ -476,11 +444,7 @@ class RewardCalculator:
         reward: float = self.payout_ratio if is_correct else -1.0
 
         logger.debug(
-            "[^] calculate_reward(): action=%d is_correct=%s "
-            "reward=%.4f",
-            action,
-            is_correct,
-            reward,
+            f"calculate_reward(): action={action} is_correct={is_correct} reward={reward:.4f}",
         )
 
         return float(reward)

@@ -387,6 +387,30 @@ class TrainerError(Exception):
         return f"TrainerError(stage={self.stage!r}, message={str(self)!r})"
 
 
+# ── Labeler Errors ────────────────────────────────────────────────────────────
+
+
+class LabelerError(Exception):
+    """
+    Raised when the Labeler cannot produce a valid label set.
+
+    Distinct from ValueError (which signals a caller contract violation
+    such as a malformed input DataFrame) — LabelerError signals a
+    runtime failure inside the labeling pipeline that the trainer must
+    handle explicitly.
+
+    Attributes:
+        stage: The pipeline stage that failed (e.g. "compute_labels").
+    """
+
+    def __init__(self, message: str, stage: str = "") -> None:
+        super().__init__(message)
+        self.stage = stage
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"LabelerError(stage={self.stage!r}, message={str(self)!r})"
+
+
 # ── Runtime Errors ────────────────────────────────────────────────────────────
 
 

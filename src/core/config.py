@@ -272,7 +272,7 @@ class Config:
         float | None
     )  # None = disabled; use daily_trade_target only
     trading_window_hours: int
-
+    atr_threshold: float
     # ── Operational ───────────────────────────────────────────────────────
     practice_mode: bool
     log_level: str
@@ -535,6 +535,7 @@ def load_config() -> Config:
         use_otc=_bool("USE_OTC", False),
         daily_net_profit_target=daily_net_profit_target,
         trading_window_hours=_int("TRADING_WINDOW_HOURS", 19),
+        atr_threshold=_parse_float("ATR_THRESHOLD", default=1.0),
         # Training
         backfill_source=_optional("BACKFILL_SOURCE", "TWELVE").upper(),
         backfill_pairs=_parse_and_validate_pairs(

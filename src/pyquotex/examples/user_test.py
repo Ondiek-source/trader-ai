@@ -1,9 +1,11 @@
 import asyncio
+from pathlib import Path
 from pyquotex.stable_api import Quotex
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
-)
+# USER_AGENT = (
+#     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
+# )
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 
 
 class QuotexExchange:
@@ -15,6 +17,8 @@ class QuotexExchange:
             password=kwargs.get("password") or "",
             lang=kwargs.get("lang", "pt"),  # Language default set to Portuguese
         )
+        data_dir = Path(__file__).parent.parent.parent / "data"
+        data_dir.mkdir(exist_ok=True)
         self.client.set_session(user_agent=USER_AGENT)
         self.client.debug_ws_enable = True
         self.connected = False
@@ -38,8 +42,8 @@ class QuotexExchange:
 
 async def main():
     params = {
-        "email": "email@gmail.com",
-        "password": "password",
+        "email": "appke350@gmail.com",
+        "password": "465856xoR",
         "lang": "pt",
     }
     trade = QuotexExchange(**params)

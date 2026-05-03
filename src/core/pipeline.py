@@ -81,7 +81,6 @@ from ml_engine.trainer import (
     LSTMTrainer,
 )
 
-
 # How many seconds before midnight (UTC) to fire the daily report.
 _DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
 
@@ -675,7 +674,9 @@ class Pipeline:
             )
             return None
 
-    async def _stage_model_load(self, manager: ModelManager) -> dict[tuple[str, str], Any]:
+    async def _stage_model_load(
+        self, manager: ModelManager
+    ) -> dict[tuple[str, str], Any]:
         """
         Pull model artifacts from Blob and load them into memory.
 
@@ -750,7 +751,9 @@ class Pipeline:
 
         for symbol in self._settings.pairs:
             try:
-                engine = await LiveEngine.create(symbol, expiry_key, model_manager=manager)
+                engine = await LiveEngine.create(
+                    symbol, expiry_key, model_manager=manager
+                )
 
             except LiveEngineError as exc:
                 raise PipelineError(str(exc), stage="ignition") from exc
@@ -1227,7 +1230,10 @@ class Pipeline:
                 # Check local registry first — works in both LOCAL and CLOUD mode.
                 # pull_from_blob() returns None in LOCAL mode so would always
                 # fall through and trigger an unnecessary retrain.
-                if manager.get_best_model(symbol=symbol, expiry_key=expiry_key) is not None:
+                if (
+                    manager.get_best_model(symbol=symbol, expiry_key=expiry_key)
+                    is not None
+                ):
                     logger.info(
                         {
                             "event": "RETRAIN_MODEL_EXISTS",
@@ -1348,13 +1354,16 @@ class Pipeline:
             feature_matrix = engineer.build_matrix(
                 bars_df, symbol, timeframe=_TIMEFRAME_MAP.get(expiry_key, "M1")
             )
-            labels = Labeler(expiry_key=expiry_key).compute_labels(bars_df)
+            atr_threshold = self._settings.atr_threshold
+            labels = Labeler(
+                expiry_key=expiry_key, atr_threshold=atr_threshold
+            ).compute_labels(bars_df)
             split = DataShaper().split(feature_matrix, labels, expiry_key)
 
             models_to_try = [
-                # ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
+                ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
                 # ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),  # excluded: 4.67 GiB artifact breaks container boot
-                # ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
+                ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
                 ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
                 # TODO: LSTM/GRU/TCN need AUC-compatible training loop before re-enabling
             ]

@@ -1,31 +1,29 @@
 """
-src/ml_engine/features.py — The Translator.
+src/ml_engine/features.py — The Translator (Pruned V2).
 
-Role: Transform raw Vault data (Bar / Tick DataFrames) into the full
+Role: Transform raw Vault data (Bar DataFrames) into the pruned
 FEATURE_SET_BINARY_OPTIONS_AI feature matrix ready for model inference.
 
-Design document: docs/ml_engine/Features.md
-Test harness:    docs/ml_engine/Features_Test_Harness.md
+This is V2 of the feature engineer, pruned to 21 high-importance features
+based on V2 Colab experiment results (AUC 0.8659).
 
 Architecture
 ------------
-Five primary feature groups are computed in dependency order:
+Four primary feature groups are computed in dependency order:
     1. PRICE_ACTION   — candlestick geometry and pattern flags
-    2. MOMENTUM       — RSI, MACD, ROC, log-return series
+    2. MOMENTUM       — RSI, MACD, log-return series
     3. VOLATILITY     — ATR, Bollinger Bands, Keltner Channels
-    4. MICRO_STRUCTURE — tick-level velocity, spread, order-flow (optional)
-    5. CONTEXT        — session flags, cyclical time encoding
+    4. CONTEXT        — time-of-day encoding
 
-A sixth DERIVED pass computes gate thresholds and top-weighted helpers that
-depend on the five primary groups having already been written into the frame.
+    A fifth DERIVED pass computes helper features (e.g., MACD_HIST_SLOPE)
+    that depend on the four primary groups having already been written.
 
-Public API
-----------
+    Public API
+    ----------
     get_feature_engineer() -> FeatureEngineer          (singleton)
-    FeatureEngineer.transform(bars, ticks)             -> pd.DataFrame
-    FeatureEngineer.get_latest(bars, ticks)            -> FeatureVector
-    FeatureEngineer.build_matrix(bars, symbol, ticks)  -> FeatureMatrix
-    FeatureEngineer.get_expiry_features(fe, k)         -> pd.DataFrame
+    FeatureEngineer.transform(bars)                    -> pd.DataFrame
+    FeatureEngineer.get_latest(bars)                   -> FeatureVector
+    FeatureEngineer.build_matrix(bars, symbol)         -> FeatureMatrix
 """
 
 from __future__ import annotations
@@ -75,11 +73,28 @@ _RESAMPLE_MAP: dict[str, str] = {"M1": "1min", "M5": "5min", "M15": "15min"}
 
 # Feature engineering schema version. Increment when the column set or
 # computation logic changes in a way that invalidates cached vectors.
-_VERSION: str = "3.3.0-full-binary"
+_VERSION: str = "4.0.0-pruned"
 
 # ── Indicator Periods ───────────────────────────────────────────────────────
 # All look-back periods are defined here so they can be found and changed in
 # one place without hunting through the computation methods.
+# Multi-timeframe
+_MTF_RSI_PERIOD: int = 5
+_MTF_TREND_FAST: int = 5
+_MTF_TREND_SLOW: int = 13
+_MTF_CLOSE_POS_WINDOW: int = 10
+
+# Regime detection
+_REGIME_ATR_LONG: int = 100
+_REGIME_ADX_PERIOD: int = 14
+_REGIME_SMA_PERIODS: list[int] = [20, 50, 200]
+
+# Lagged features
+_LAGGED_FEATURES: list[str] = ["CLOSE_POSITION_IN_CANDLE", "RETURN_1", "RSI"]
+_LAGGED_PERIODS: list[int] = [1, 2, 3, 5]
+
+# Rolling statistics
+_ROLLING_WINDOWS: list[int] = [5, 10]
 
 # Momentum
 _RSI_PERIOD: int = 5  # Wilder RSI look-back
@@ -114,12 +129,8 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
         "MACD_VALUE",
         "MACD_SIGNAL",
         "MACD_HIST",
-        "ROC_5",
-        "ROC_10",
-        "ROC_20",
         "RETURN_1",
         "RETURN_3",
-        "RETURN_5",
         "MOMENTUM_OSCILLATOR",
         "CCI",
     ],
@@ -131,47 +142,65 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
         "BB_PERCENT_B",
         "KC_WIDTH",
         "NATR",
-        "RANGE_EXPANSION_RATIO",
         "RELATIVE_VOLUME_RVOL",
     ],
     "PRICE_ACTION": [
         "BODY_TO_RANGE_RATIO",
         "UPPER_WICK_TO_BODY_RATIO",
         "LOWER_WICK_TO_BODY_RATIO",
-        "ENGULFING_BINARY",
-        "THREE_BAR_SLOPE",
-        "PINBAR_SIGNAL",
-        "DOJI_BINARY",
-        "MARUBOZU_BINARY",
         "CONSECUTIVE_BULL_BARS",
         "CONSECUTIVE_BEAR_BARS",
         "CLOSE_POSITION_IN_CANDLE",
-        "HIGH_LOW_RANGE_NORMALIZED",
-        "CANDLE_POSITION_IN_DAY",
-        "PREVIOUS_CANDLE_DIRECTION",
         "TWO_BAR_REVERSAL",
     ],
-    "MICRO_STRUCTURE": [
-        "TICK_VELOCITY",
-        "SPREAD_NORMALIZED",
-        "TICK_DELTA_CUMULATIVE",
-        "ORDER_FLOW_IMBALANCE",
-    ],
     "CONTEXT": [
-        "SESSION_LONDON",
-        "SESSION_NEWYORK",
-        "SESSION_TOKYO",
-        "SESSION_OVERLAP_LONDON_NY",
-        "TIME_SINE",
-        "TIME_COSINE",
-        "DAY_OF_WEEK_SINE",
-        "DAY_OF_WEEK_COSINE",
-        "MINUTES_TO_NEWS",
         "HOUR_OF_DAY_NORMALIZED",
-        "IS_GAP_OPEN",
-        "GAP_MINUTES",
-        "GAP_PIPS",
-        "IS_MONDAY_OPEN",
+    ],
+    "MULTI_TIMEFRAME": [
+        "RSI_5T",
+        "TREND_5T",
+        "CLOSE_POS_5T",
+        "RSI_15T",
+        "TREND_15T",
+        "CLOSE_POS_15T",
+    ],
+    "REGIME": [
+        "VOLATILITY_REGIME",
+        "ADX",
+        "DIST_SMA20",
+        "DIST_SMA50",
+        "DIST_SMA200",
+        "BB_KC_SQUEEZE",
+    ],
+    "INTERACTION": [
+        "RSI_TREND_5T",
+        "CLOSEPOS_VOLREGIME",
+        "BB_MOMENTUM",
+        "STREAK_TREND",
+        "ADX_RETURN",
+    ],
+    "LAGGED": [
+        "CLOSE_POSITION_IN_CANDLE_LAG1",
+        "CLOSE_POSITION_IN_CANDLE_LAG2",
+        "CLOSE_POSITION_IN_CANDLE_LAG3",
+        "CLOSE_POSITION_IN_CANDLE_LAG5",
+        "RETURN_1_LAG1",
+        "RETURN_1_LAG2",
+        "RETURN_1_LAG3",
+        "RETURN_1_LAG5",
+        "RSI_LAG1",
+        "RSI_LAG2",
+        "RSI_LAG3",
+        "RSI_LAG5",
+        "RETURN_1_MEAN_5",
+        "RETURN_1_STD_5",
+        "RSI_MEAN_10",
+        "CLOSE_POS_MEAN_5",
+    ],
+    "SESSION_INTENSITY": [
+        "RVOL_LONDON",
+        "RVOL_NEWYORK",
+        "RVOL_TOKYO",
     ],
 }
 
@@ -179,23 +208,12 @@ FEATURE_SET_BINARY_OPTIONS_AI = {
 # These are computed internally for eligibility gates and expiry rules
 # but are not part of the primary schema fed to the model.
 
-TOP_WEIGHTED_FEATURES = [
-    "BODY_TO_RANGE_RATIO",
-    "UPPER_WICK_TO_BODY_RATIO",
-    "TICK_VELOCITY",
-    "RELATIVE_VOLUME_RVOL",
-    "BB_WIDTH",
-    "ROC_5_ACCELERATION",
-    "ENGULFING_BINARY",
-    "ATR_RATIO_CHANGE",
-    "THREE_BAR_SLOPE",
-    "SPREAD_NORMALIZED",
-]
+TOP_WEIGHTED_FEATURES = []
 
 BINARY_EXPIRY_RULES = {
-    "1_MIN": ["TICK_VELOCITY", "RVOL", "BODY_TO_RANGE_RATIO"],
-    "5_MIN": ["ROC_5", "BB_WIDTH", "THREE_BAR_SLOPE"],
-    "15_MIN": ["MACD_HIST_SLOPE", "ATR", "SESSION_CONTEXT"],
+    "1_MIN": [],
+    "5_MIN": [],
+    "15_MIN": [],
 }
 
 
@@ -361,22 +379,20 @@ class FeatureEngineer:
     def transform(
         self,
         bars: pd.DataFrame,
-        ticks: pd.DataFrame | None = None,
         timeframe: str = "M1",
     ) -> pd.DataFrame:
         """
-        The Master Pipeline: Bars + Ticks -> Normalized Features DataFrame.
+        The Master Pipeline: Bars -> Normalized Features DataFrame.
 
-        Applies all five feature groups in dependency order. Each group
+        Applies all four feature groups in dependency order. Each group
         is guarded by a config flag. The returned DataFrame has one row
         per input bar (after dropna) with all computed feature columns
         appended.
 
         Args:
             bars: OHLCV DataFrame with DatetimeIndex. Must contain
-                columns: open, high, low, close, volume.
-            ticks: Optional tick DataFrame with DatetimeIndex and
-                columns: bid, ask. Required for MICRO_STRUCTURE features.
+            columns: open, high, low, close, volume.
+            timeframe: Resample frequency. Default "M1".
 
         Returns:
             pd.DataFrame: Feature matrix aligned to bar index.
@@ -455,23 +471,29 @@ class FeatureEngineer:
         if self._settings.feat_volatility_enabled:
             fe = self._compute_volatility(fe)
 
-        # 4. MICRO STRUCTURE
-        if self._settings.feat_micro_enabled and ticks is not None:
-            fe = self._compute_micro_structure(fe, ticks, target_freq)
-        else:
-            # Zero-fill micro structure columns so the schema is always complete
-            for col in FEATURE_SET_BINARY_OPTIONS_AI["MICRO_STRUCTURE"]:
-                if col not in fe.columns:
-                    fe[col] = 0.0
-
-        # 5. CONTEXT
+        # 4. CONTEXT
         if self._settings.feat_context_enabled:
             fe = self._compute_context(
                 fe
             )  # always runs — feeds gates and top-weighted features
 
-        # 6. DERIVED (fe)
+        # 5. MULTI-TIMEFRAME
+        fe = self._compute_multitimeframe(fe)
+
+        # 6. REGIME DETECTION
+        fe = self._compute_regime(fe)
+
+        # 7. INTERACTION FEATURES
+        fe = self._compute_interactions(fe)
+
+        # 8. LAGGED FEATURES
+        fe = self._compute_lagged(fe)
+
+        # 9. DERIVED (fe)
         fe = self._compute_derived(fe)
+
+        # 10. SESSION INTENSITY
+        fe = self._compute_session_intensity(fe)
 
         self._warn_missing_schema(fe)
 
@@ -577,20 +599,17 @@ class FeatureEngineer:
         """
         Compute all PRICE_ACTION features from raw OHLCV data.
 
-        Features computed:
+        Retained features:
             BODY_TO_RANGE_RATIO, UPPER_WICK_TO_BODY_RATIO,
-            LOWER_WICK_TO_BODY_RATIO, DOJI_BINARY, MARUBOZU_BINARY,
-            THREE_BAR_SLOPE, CONSECUTIVE_BULL_BARS, CONSECUTIVE_BEAR_BARS,
-            CLOSE_POSITION_IN_CANDLE, PREVIOUS_CANDLE_DIRECTION,
-            ENGULFING_BINARY, PINBAR_SIGNAL, HIGH_LOW_RANGE_NORMALIZED,
-            CANDLE_POSITION_IN_DAY, TWO_BAR_REVERSAL
+            LOWER_WICK_TO_BODY_RATIO, CONSECUTIVE_BULL_BARS,
+            CONSECUTIVE_BEAR_BARS, CLOSE_POSITION_IN_CANDLE,
+            TWO_BAR_REVERSAL
         """
 
         hi_lo = (fe["high"] - fe["low"]).replace(0, _EPS)
-        body_raw = fe["close"] - fe["open"]
-        body_abs = body_raw.abs()
+        body_abs = (fe["close"] - fe["open"]).abs()
 
-        # ── Core Ratios ──────────────────────────────────────────────────
+        # Core Ratios
         fe["BODY_TO_RANGE_RATIO"] = body_abs / hi_lo
 
         upper_wick = fe["high"] - fe[["open", "close"]].max(axis=1)
@@ -599,49 +618,8 @@ class FeatureEngineer:
         fe["UPPER_WICK_TO_BODY_RATIO"] = upper_wick / body_abs.replace(0, _EPS)
         fe["LOWER_WICK_TO_BODY_RATIO"] = lower_wick / body_abs.replace(0, _EPS)
 
-        # ── Candlestick Pattern Binary Flags ─────────────────────────────
-
-        # Doji: body is tiny relative to range (< 10 %)
-        fe["DOJI_BINARY"] = (fe["BODY_TO_RANGE_RATIO"] < 0.1).astype(int)
-
-        # Marubozu: body dominates range (> 90 %)
-        fe["MARUBOZU_BINARY"] = (fe["BODY_TO_RANGE_RATIO"] > 0.9).astype(int)
-
-        # Engulfing: current bar's body fully contains previous bar's body
-        prev_open = fe["open"].shift(1)
-        prev_close = fe["close"].shift(1)
-
-        # Bullish engulfing: prev bear, curr bull, curr body engulfs prev body
-        bullish_engulf = (
-            (prev_close < prev_open)  # previous bar bearish
-            & (fe["close"] > fe["open"])  # current bar bullish
-            & (fe["open"] <= prev_close)  # current open at/below prev close
-            & (fe["close"] >= prev_open)  # current close at/above prev open
-        )
-
-        # Bearish engulfing: prev bull, curr bear, curr body engulfs prev body
-        bearish_engulf = (
-            (prev_close > prev_open)  # previous bar bullish
-            & (fe["close"] < fe["open"])  # current bar bearish
-            & (fe["open"] >= prev_close)  # current open at/above prev close
-            & (fe["close"] <= prev_open)  # current close at/below prev open
-        )
-
-        fe["ENGULFING_BINARY"] = (bullish_engulf | bearish_engulf).astype(int)
-
-        # Pin bar: one wick is >= 2x the body, other wick is small
-        # Bullish pin: long lower wick, small upper wick
-        # Bearish pin: long upper wick, small lower wick
-        is_bullish_pin = (lower_wick >= 2 * body_abs.replace(0, _EPS)) & (
-            upper_wick <= 0.3 * lower_wick.replace(0, _EPS)
-        )
-        is_bearish_pin = (upper_wick >= 2 * body_abs.replace(0, _EPS)) & (
-            lower_wick <= 0.3 * upper_wick.replace(0, _EPS)
-        )
-        fe["PINBAR_SIGNAL"] = (is_bullish_pin | is_bearish_pin).astype(int)
-
-        # Two-bar reversal: bar1 bearish, bar2 bullish, bar2 close > bar1 open
-        #   OR bar1 bullish, bar2 bearish, bar2 close < bar1 open
+        # Two-bar reversal
+        body_raw = fe["close"] - fe["open"]
         prev_body = body_raw.shift(1)
         two_bar_bull = (
             (prev_body < 0) & (body_raw > 0) & (fe["close"] > fe["open"].shift(1))
@@ -651,10 +629,7 @@ class FeatureEngineer:
         )
         fe["TWO_BAR_REVERSAL"] = (two_bar_bull | two_bar_bear).astype(int)
 
-        # ── Slope & Consecutive ──────────────────────────────────────────
-
-        fe["THREE_BAR_SLOPE"] = fe["close"].diff(3) / 3
-
+        # Consecutive bars
         bull = (fe["close"] > fe["open"]).astype(int)
         fe["CONSECUTIVE_BULL_BARS"] = bull.groupby(
             (bull != bull.shift()).cumsum()
@@ -665,27 +640,8 @@ class FeatureEngineer:
             (bear != bear.shift()).cumsum()
         ).cumsum()
 
-        # ── Position Features ────────────────────────────────────────────
-
+        # Close position in candle
         fe["CLOSE_POSITION_IN_CANDLE"] = (fe["close"] - fe["low"]) / hi_lo
-
-        fe["PREVIOUS_CANDLE_DIRECTION"] = pd.Series(
-            np.sign(body_raw.shift(1)), index=fe.index
-        ).fillna(0)
-
-        # High-low range normalized by rolling average range (_BB_PERIOD bars)
-        bar_range = fe["high"] - fe["low"]
-        avg_range = bar_range.rolling(_BB_PERIOD).mean().replace(0, _EPS)
-        fe["HIGH_LOW_RANGE_NORMALIZED"] = bar_range / avg_range
-
-        # Candle position within the trading day (0.0 = day open, 1.0 = day close)
-        if isinstance(fe.index, pd.DatetimeIndex):
-            day_start = fe.index.normalize()  # midnight of each bar's day
-            # Approximate trading day as 00:00–23:59
-            minutes_since_midnight = (fe.index - day_start).total_seconds() / 60.0
-            fe["CANDLE_POSITION_IN_DAY"] = minutes_since_midnight / 1440.0
-        else:  # pragma: no cover — index is always DatetimeIndex when called via transform()
-            fe["CANDLE_POSITION_IN_DAY"] = 0.0
 
         return fe
 
@@ -695,10 +651,9 @@ class FeatureEngineer:
         """
         Compute all MOMENTUM features.
 
-        Features computed:
+        Retained features:
             RSI, CCI, MACD_VALUE, MACD_SIGNAL, MACD_HIST,
-            ROC_5, ROC_10, ROC_20, RETURN_1, RETURN_3, RETURN_5,
-            MOMENTUM_OSCILLATOR
+            RETURN_1, RETURN_3, MOMENTUM_OSCILLATOR
         """
 
         # ── RSI (Wilder-smoothed) ────────────────────────────────────────
@@ -706,9 +661,6 @@ class FeatureEngineer:
         gain = delta.clip(lower=0)
         loss = (-delta).clip(lower=0)
 
-        # Wilder's smoothing: EWM with alpha=1/period approximates the recursive
-        # smoothed-average formula. min_periods=_RSI_PERIOD ensures the first
-        # value is a true SMA, not a partial-window estimate.
         avg_gain = gain.ewm(
             alpha=1 / _RSI_PERIOD, min_periods=_RSI_PERIOD, adjust=False
         ).mean()
@@ -734,21 +686,12 @@ class FeatureEngineer:
         )
         fe["MACD_HIST"] = fe["MACD_VALUE"] - fe["MACD_SIGNAL"]
 
-        # ── Rate of Change ───────────────────────────────────────────────
-        # fill_method=None: NaN gaps from the resample have already been
-        # handled by the _MAX_FFILL_BARS strategy; we don't want pct_change
-        # to silently forward-fill them again here.
-        for n in [5, 10, 20]:
-            fe[f"ROC_{n}"] = fe["close"].pct_change(n, fill_method=None)
-
         # ── Returns (log) ────────────────────────────────────────────────
-        for n in [1, 3, 5]:
-            fe[f"RETURN_{n}"] = np.log(
-                fe["close"] / fe["close"].shift(n).replace(0, _EPS)
-            )
+        # Only keep RETURN_1 and RETURN_3 (RETURN_5 removed)
+        fe["RETURN_1"] = np.log(fe["close"] / fe["close"].shift(1).replace(0, _EPS))
+        fe["RETURN_3"] = np.log(fe["close"] / fe["close"].shift(3).replace(0, _EPS))
 
         # ── Momentum Oscillator ──────────────────────────────────────────
-        # Classic price momentum: close minus close N bars ago.
         fe["MOMENTUM_OSCILLATOR"] = fe["close"] - fe["close"].shift(_MOMENTUM_PERIOD)
 
         return fe
@@ -798,12 +741,6 @@ class FeatureEngineer:
         kc_lower = ema_kc - _KC_MULTIPLIER * fe["ATR"]
         fe["KC_WIDTH"] = (kc_upper - kc_lower) / ema_kc.replace(0, _EPS)
 
-        # ── Range Expansion Ratio ────────────────────────────────────────
-        # Current range / rolling-average range — detects breakout expansions.
-        current_range = fe["high"] - fe["low"]
-        avg_range = current_range.rolling(_BB_PERIOD).mean().replace(0, _EPS)
-        fe["RANGE_EXPANSION_RATIO"] = current_range / avg_range
-
         # ── Relative Volume (RVOL) ───────────────────────────────────────
         # Bar volume relative to its rolling average — detects volume surges.
         vol_ma = fe["volume"].rolling(_BB_PERIOD).mean().replace(0, _EPS)
@@ -811,201 +748,344 @@ class FeatureEngineer:
 
         return fe
 
-    # ── 4. MICRO STRUCTURE ──────────────────────────────────────────────────
-
-    def _compute_micro_structure(
-        self,
-        fe: pd.DataFrame,
-        ticks: pd.DataFrame,
-        target_freq: str,
-    ) -> pd.DataFrame:
-        """
-        Compute all MICRO_STRUCTURE features from tick-level data.
-
-        Features computed:
-            TICK_VELOCITY, SPREAD_NORMALIZED,
-            TICK_DELTA_CUMULATIVE, ORDER_FLOW_IMBALANCE
-
-        Args:
-            fe: Bar DataFrame (index is DatetimeIndex).
-            ticks: Tick DataFrame with columns: bid, ask.
-        """
-
-        # ── Tick Velocity ────────────────────────────────────────────────
-        # Number of ticks per bar window (1-min resample)
-        tick_counts = ticks["bid"].resample(target_freq).count()
-        fe["TICK_VELOCITY"] = tick_counts.reindex(fe.index).fillna(0)
-
-        # ── Spread Normalized ────────────────────────────────────────────
-        # Tick-level ask-bid spread averaged per bar, then normalised by close.
-        tick_spread = ticks["ask"] - ticks["bid"]
-        avg_spread: pd.Series = tick_spread.resample(target_freq).mean()
-        fe["SPREAD_NORMALIZED"] = avg_spread.reindex(fe.index).ffill().fillna(0) / fe[
-            "close"
-        ].replace(0, _EPS)
-
-        # ── Tick Delta Cumulative & Order Flow Imbalance ─────────────────
-        #
-        # IMPORTANT — APPROXIMATION NOTE:
-        # True order-flow features require per-trade aggressor-side data
-        # (i.e. whether the initiator was the buyer or the seller). Neither
-        # Quotex streaming nor the Twelve Data REST feed provides this.
-        #
-        # We approximate using mid-price direction:
-        #   sign(mid.diff()) == +1 → price moved up → inferred buy pressure
-        #   sign(mid.diff()) == -1 → price moved down → inferred sell pressure
-        #
-        # This is a well-known approximation (sometimes called the "tick rule")
-        # and is standard when aggressor-side data is unavailable. It is noisy
-        # on low-activity bars but directionally informative on high-velocity
-        # bars. Features derived from it should be treated as weak signals and
-        # not relied on as the sole trade trigger.
-        #
-        # ORDER_FLOW_IMBALANCE falls back to 0.5 → 0.0 (centred, neutral) when
-        # no ticks are present in the window — not 0.5 — because the feature is
-        # shifted by -0.5 to be zero-centred for the model.
-        tick_mid = (ticks["bid"] + ticks["ask"]) / 2
-        tick_delta_raw: pd.Series = pd.Series(
-            np.sign(tick_mid.diff()), index=tick_mid.index
-        ).fillna(0)
-        tick_delta_resampled: pd.Series = tick_delta_raw.resample(target_freq).sum()
-        fe["TICK_DELTA_CUMULATIVE"] = (
-            tick_delta_resampled.reindex(fe.index).fillna(0).rolling(_BB_PERIOD).sum()
-        )
-
-        buy_ticks: pd.Series = (tick_delta_raw > 0).resample(target_freq).sum()
-        total_ticks: pd.Series = (
-            tick_delta_raw.abs().resample(target_freq).sum().replace(0, _EPS)
-        )
-        # Shift by -0.5 so neutral (50/50 buy/sell) → 0.0, buyer dominance → +0.5,
-        # seller dominance → -0.5. fillna(0.5) before shift → fillna(0.0) net.
-        fe["ORDER_FLOW_IMBALANCE"] = (buy_ticks / total_ticks).reindex(fe.index).fillna(
-            0.5
-        ) - 0.5
-
-        return fe
-
-    # ── 5. CONTEXT ──────────────────────────────────────────────────────────
+    # ── 4. CONTEXT ──────────────────────────────────────────────────────────
 
     def _compute_context(self, fe: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute all CONTEXT features from the DatetimeIndex.
+        Compute CONTEXT features from the DatetimeIndex.
 
-        Features computed:
-            SESSION_LONDON, SESSION_NEWYORK, SESSION_TOKYO,
-            SESSION_OVERLAP_LONDON_NY, TIME_SINE, TIME_COSINE,
-            DAY_OF_WEEK_SINE, DAY_OF_WEEK_COSINE, MINUTES_TO_NEWS,
+        Retained features:
             HOUR_OF_DAY_NORMALIZED
         """
         if not isinstance(fe.index, pd.DatetimeIndex):
             logger.warning({"event": "FEATURE_CONTEXT_NO_DATETIME_INDEX"})
-            for col in FEATURE_SET_BINARY_OPTIONS_AI["CONTEXT"]:
-                fe[col] = 0.0
+            fe["HOUR_OF_DAY_NORMALIZED"] = 0.0
             return fe
 
         h = fe.index.hour
         m = fe.index.minute
-        d = fe.index.dayofweek
 
-        # ── Session Flags (UTC hours) ────────────────────────────────────
-        fe["SESSION_LONDON"] = ((h >= 7) & (h <= 16)).astype(int)
-        fe["SESSION_NEWYORK"] = ((h >= 12) & (h <= 21)).astype(int)
-        fe["SESSION_TOKYO"] = ((h >= 0) & (h <= 9)).astype(int)
-
-        # Overlap: both London and New York are active (12:00–16:00 UTC)
-        fe["SESSION_OVERLAP_LONDON_NY"] = ((h >= 12) & (h <= 16)).astype(int)
-
-        # ── Cyclical Time Encoding ───────────────────────────────────────
-        # Hour + minute fractional hour for sub-hourly resolution
+        # Hour of Day Normalized (0.0 to 1.0)
         fractional_hour = h + m / 60.0
-
-        fe["TIME_SINE"] = np.sin(2 * np.pi * fractional_hour / 24)
-        fe["TIME_COSINE"] = np.cos(2 * np.pi * fractional_hour / 24)
-
-        fe["DAY_OF_WEEK_SINE"] = np.sin(2 * np.pi * d / 7)
-        fe["DAY_OF_WEEK_COSINE"] = np.cos(2 * np.pi * d / 7)
-
-        # ── Hour of Day Normalized ───────────────────────────────────────
-        # Maps 0–23 → 0.0–1.0
         fe["HOUR_OF_DAY_NORMALIZED"] = fractional_hour / 24.0
 
-        # ── Minutes to News (placeholder) ────────────────────────────────
-        # Default: assume no imminent news. Override when economic calendar
-        # API is integrated (see backlog BL-XX: news-feed integration).
-        fe["MINUTES_TO_NEWS"] = _MINUTES_TO_NEWS_PLACEHOLDER
+        return fe
 
-        # ── Gap-Aware Features ───────────────────────────────────────────
-        # These describe the time gap between consecutive bars so the model
-        # learns that post-weekend / post-holiday bars are a different regime.
-        # No fabricated price data is needed — the gap itself is the signal.
+    # ── 5. MULTI-TIMEFRAME ───────────────────────────────────────────────────
 
-        time_deltas = fe.index.to_series().diff().dt.total_seconds().div(60)
+    def _compute_multitimeframe(self, fe: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute multi-timeframe features (5T and 15T).
+        """
+        EPS = _EPS
 
-        # Flag: did this bar open after a gap longer than 2 minutes?
-        fe["IS_GAP_OPEN"] = (time_deltas > 2).astype(int)
+        # ── 5T Features ──────────────────────────────────────────────────────
+        resampled_5t = (
+            fe[["open", "high", "low", "close", "volume"]]
+            .resample(_RESAMPLE_MAP["M5"])
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
 
-        # How many minutes was the gap? Capped at 1 week (10080 min) to
-        # prevent extreme outliers from distorting the model.
-        fe["GAP_MINUTES"] = time_deltas.clip(upper=10080).fillna(0)
+        # RSI_5T
+        delta_5t = resampled_5t["close"].diff()
+        gain_5t = delta_5t.clip(lower=0)
+        loss_5t = (-delta_5t).clip(lower=0)
+        ag = gain_5t.ewm(
+            alpha=1 / _MTF_RSI_PERIOD, min_periods=_MTF_RSI_PERIOD, adjust=False
+        ).mean()
+        al = loss_5t.ewm(
+            alpha=1 / _MTF_RSI_PERIOD, min_periods=_MTF_RSI_PERIOD, adjust=False
+        ).mean()
+        rsi_5t = 100 - (100 / (1 + ag / al.replace(0, EPS)))
 
-        # Price gap in pips (open vs previous close). Zero on non-gap bars.
-        prev_close = fe["close"].shift(1)
-        raw_gap_pips = (fe["open"] - prev_close).abs() / 0.0001
-        fe["GAP_PIPS"] = raw_gap_pips.where(fe["IS_GAP_OPEN"] == 1, other=0.0).fillna(0)
+        # TREND_5T
+        ema5 = resampled_5t["close"].ewm(span=_MTF_TREND_FAST, adjust=False).mean()
+        ema13 = resampled_5t["close"].ewm(span=_MTF_TREND_SLOW, adjust=False).mean()
+        trend_5t = np.sign(ema5 - ema13).astype(np.float32)
 
-        # Flag: Monday open (post-weekend regime — typically gappy and noisy)
-        fe["IS_MONDAY_OPEN"] = ((fe.index.dayofweek == 0) & (fe.index.hour < 4)).astype(
-            int
+        # CLOSE_POS_5T
+        rolling_hi = resampled_5t["high"].rolling(_MTF_CLOSE_POS_WINDOW).max()
+        rolling_lo = resampled_5t["low"].rolling(_MTF_CLOSE_POS_WINDOW).min()
+        range_5t = (rolling_hi - rolling_lo).replace(0, EPS)
+        close_pos_5t = (resampled_5t["close"] - rolling_lo) / range_5t
+
+        # Assign using reindex
+        fe["RSI_5T"] = rsi_5t.reindex(fe.index, method="ffill").astype(np.float32)
+        fe["TREND_5T"] = (
+            pd.Series(trend_5t, index=resampled_5t.index)
+            .reindex(fe.index, method="ffill")
+            .astype(np.float32)
+        )
+        fe["CLOSE_POS_5T"] = close_pos_5t.reindex(fe.index, method="ffill").astype(
+            np.float32
+        )
+
+        # ── 15T Features ─────────────────────────────────────────────────────
+        resampled_15t = (
+            fe[["open", "high", "low", "close", "volume"]]
+            .resample(_RESAMPLE_MAP["M15"])
+            .agg(
+                {
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                }
+            )
+            .dropna()
+        )
+
+        # RSI_15T
+        delta_15t = resampled_15t["close"].diff()
+        gain_15t = delta_15t.clip(lower=0)
+        loss_15t = (-delta_15t).clip(lower=0)
+        ag = gain_15t.ewm(
+            alpha=1 / _MTF_RSI_PERIOD, min_periods=_MTF_RSI_PERIOD, adjust=False
+        ).mean()
+        al = loss_15t.ewm(
+            alpha=1 / _MTF_RSI_PERIOD, min_periods=_MTF_RSI_PERIOD, adjust=False
+        ).mean()
+        rsi_15t = 100 - (100 / (1 + ag / al.replace(0, EPS)))
+
+        # TREND_15T
+        ema5 = resampled_15t["close"].ewm(span=_MTF_TREND_FAST, adjust=False).mean()
+        ema13 = resampled_15t["close"].ewm(span=_MTF_TREND_SLOW, adjust=False).mean()
+        trend_15t = np.sign(ema5 - ema13).astype(np.float32)
+
+        # CLOSE_POS_15T
+        rolling_hi = resampled_15t["high"].rolling(_MTF_CLOSE_POS_WINDOW).max()
+        rolling_lo = resampled_15t["low"].rolling(_MTF_CLOSE_POS_WINDOW).min()
+        range_15t = (rolling_hi - rolling_lo).replace(0, EPS)
+        close_pos_15t = (resampled_15t["close"] - rolling_lo) / range_15t
+
+        # Assign using reindex
+        fe["RSI_15T"] = rsi_15t.reindex(fe.index, method="ffill").astype(np.float32)
+        fe["TREND_15T"] = (
+            pd.Series(trend_15t, index=resampled_15t.index)
+            .reindex(fe.index, method="ffill")
+            .astype(np.float32)
+        )
+        fe["CLOSE_POS_15T"] = close_pos_15t.reindex(fe.index, method="ffill").astype(
+            np.float32
         )
 
         return fe
 
-    # ── 6. DERIVED (Gates + Top-Weighted + Expiry Helpers) ──────────────────
+    # ── 6. REGIME DETECTION ───────────────────────────────────────────────────
+
+    def _compute_regime(self, fe: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute market regime detection features.
+
+        Features computed:
+            VOLATILITY_REGIME, ADX, DIST_SMA20, DIST_SMA50, DIST_SMA200,
+            BB_KC_SQUEEZE
+        """
+        EPS = _EPS
+
+        # VOLATILITY_REGIME: ATR ratio to 100-bar average ATR
+        atr_long = fe["ATR"].rolling(_REGIME_ATR_LONG).mean().replace(0, EPS)
+        fe["VOLATILITY_REGIME"] = (fe["ATR"] / atr_long).astype(np.float32)
+
+        # ADX (Average Directional Index) - trend strength
+        # +DI and -DI calculation
+        high = fe["high"]
+        low = fe["low"]
+        close = fe["close"]
+
+        plus_dm = (high - high.shift(1)).clip(lower=0)
+        minus_dm = (low.shift(1) - low).clip(lower=0)
+
+        # Smoothed DM and TR using Wilder's smoothing (EMA with alpha=1/period)
+        tr = pd.concat(
+            [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
+            axis=1,
+        ).max(axis=1)
+
+        atr = tr.ewm(
+            alpha=1 / _REGIME_ADX_PERIOD, min_periods=_REGIME_ADX_PERIOD, adjust=False
+        ).mean()
+
+        plus_di = 100 * (
+            plus_dm.ewm(
+                alpha=1 / _REGIME_ADX_PERIOD,
+                min_periods=_REGIME_ADX_PERIOD,
+                adjust=False,
+            ).mean()
+            / atr.replace(0, EPS)
+        )
+        minus_di = 100 * (
+            minus_dm.ewm(
+                alpha=1 / _REGIME_ADX_PERIOD,
+                min_periods=_REGIME_ADX_PERIOD,
+                adjust=False,
+            ).mean()
+            / atr.replace(0, EPS)
+        )
+
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, EPS)
+        fe["ADX"] = (
+            dx.ewm(
+                alpha=1 / _REGIME_ADX_PERIOD,
+                min_periods=_REGIME_ADX_PERIOD,
+                adjust=False,
+            )
+            .mean()
+            .astype(np.float32)
+        )
+
+        # Distance to moving averages (percentage)
+        for period in _REGIME_SMA_PERIODS:
+            sma = fe["close"].rolling(period).mean()
+            fe[f"DIST_SMA{period}"] = (
+                (fe["close"] - sma) / sma.replace(0, EPS) * 100
+            ).astype(np.float32)
+
+        # BB_KC_SQUEEZE: 1 when Bollinger Bands are inside Keltner Channels
+        if "BB_WIDTH" in fe.columns and "KC_WIDTH" in fe.columns:
+            fe["BB_KC_SQUEEZE"] = (fe["BB_WIDTH"] < fe["KC_WIDTH"]).astype(np.int8)
+        else:
+            fe["BB_KC_SQUEEZE"] = 0
+
+        return fe
+
+    # ── 7. INTERACTION FEATURES ───────────────────────────────────────────────
+
+    def _compute_interactions(self, fe: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute feature interaction combinations.
+
+        Features computed:
+            RSI_TREND_5T, CLOSEPOS_VOLREGIME, BB_MOMENTUM,
+            STREAK_TREND, ADX_RETURN
+        """
+
+        # Define interactions: (output_name, col_a, col_b, use_abs, fallback)
+        interactions = [
+            ("RSI_TREND_5T", "RSI", "TREND_5T", False, 0.0),
+            (
+                "CLOSEPOS_VOLREGIME",
+                "CLOSE_POSITION_IN_CANDLE",
+                "VOLATILITY_REGIME",
+                False,
+                0.0,
+            ),
+            ("BB_MOMENTUM", "BB_WIDTH", "MOMENTUM_OSCILLATOR", True, 0.0),
+            ("STREAK_TREND", "CONSECUTIVE_BEAR_BARS", "TREND_5T", False, 0.0),
+            ("ADX_RETURN", "ADX", "RETURN_1", False, 0.0),
+        ]
+
+        for out_name, col_a, col_b, use_abs, fallback in interactions:
+            if col_a in fe.columns and col_b in fe.columns:
+                product = fe[col_a] * fe[col_b]
+                if use_abs:
+                    product = product.abs()
+                    fe[out_name] = product.astype(
+                        np.float32
+                    )  # <-- MOVED OUTSIDE the if
+                else:
+                    fe[out_name] = fallback
+
+        return fe
+
+    # ── 8. LAGGED FEATURES ───────────────────────────────────────────────────
+
+    def _compute_lagged(self, fe: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute lagged versions of key features.
+
+        Features computed:
+            CLOSE_POS_LAG1, CLOSE_POS_LAG2, CLOSE_POS_LAG3, CLOSE_POS_LAG5
+            RETURN_1_LAG1, RETURN_1_LAG2, RETURN_1_LAG3, RETURN_1_LAG5
+            RSI_LAG1, RSI_LAG2, RSI_LAG3, RSI_LAG5
+            RETURN_1_MEAN_5, RETURN_1_STD_5, RSI_MEAN_10, CLOSE_POS_MEAN_5
+        """
+
+        # Lagged individual features
+        for col in _LAGGED_FEATURES:
+            if col in fe.columns:
+                for lag in _LAGGED_PERIODS:
+                    fe[f"{col}_LAG{lag}"] = fe[col].shift(lag).astype(np.float32)
+
+        # Rolling statistics
+        if "RETURN_1" in fe.columns:
+            fe["RETURN_1_MEAN_5"] = fe["RETURN_1"].rolling(5).mean().astype(np.float32)
+            fe["RETURN_1_STD_5"] = fe["RETURN_1"].rolling(5).std().astype(np.float32)
+
+        if "RSI" in fe.columns:
+            fe["RSI_MEAN_10"] = fe["RSI"].rolling(10).mean().astype(np.float32)
+
+        if "CLOSE_POSITION_IN_CANDLE" in fe.columns:
+            fe["CLOSE_POS_MEAN_5"] = (
+                fe["CLOSE_POSITION_IN_CANDLE"].rolling(5).mean().astype(np.float32)
+            )
+
+        return fe
+
+    # ── 9. SESSION INTENSITY ─────────────────────────────────────────────────
+
+    def _compute_session_intensity(self, fe: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute session-specific relative volume.
+
+        Features computed:
+            RVOL_LONDON, RVOL_NEWYORK, RVOL_TOKYO
+
+        For bars outside session hours or with insufficient history,
+        RVOL is set to 1.0 (normal volume) instead of NaN.
+        """
+        # Initialize all RVOL features to 1.0 (normal volume) by default
+        for sess in ["LONDON", "NEWYORK", "TOKYO"]:
+            fe[f"RVOL_{sess}"] = 1.0
+
+        # Only compute actual values if we have a DatetimeIndex
+        if isinstance(fe.index, pd.DatetimeIndex):
+            h = fe.index.hour
+
+            # Session hour definitions (UTC)
+            session_hours = {
+                "LONDON": (h >= 7) & (h <= 16),
+                "NEWYORK": (h >= 12) & (h <= 21),
+                "TOKYO": (h >= 0) & (h <= 9),
+            }
+
+            for sess_name, sess_mask in session_hours.items():
+                # Volume during this session (NaN outside session)
+                sess_vol = fe["volume"].where(sess_mask)
+                # 100-bar rolling average volume during this session
+                sess_avg = sess_vol.rolling(100).mean().replace(0, _EPS)
+                # Relative volume: current / session average
+                rvol = (fe["volume"] / sess_avg).astype(np.float32)
+                # Fill NaN (outside session or insufficient history) with 1.0 = normal
+                rvol = rvol.fillna(1.0)
+                fe[f"RVOL_{sess_name}"] = rvol
+
+        return fe
+
+    # ── 10. DERIVED (Gates + Top-Weighted + Expiry Helpers) ──────────────────
 
     def _compute_derived(self, fe: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute derived features referenced by TOP_WEIGHTED_FEATURES,
-        and BINARY_EXPIRY_RULES.
+        Compute derived features.
 
-        These are computed AFTER all primary groups so they can
-        reference ATR, BB_WIDTH, ROC_5, MACD_HIST, etc.
+        With TOP_WEIGHTED_FEATURES and BINARY_EXPIRY_RULES emptied,
+        this method now only computes MACD_HIST_SLOPE (kept for potential future use).
         """
-
-        # ── ROC_5 Acceleration ───────────────────────────────────────────
-        # Second derivative of price: change in ROC_5 over 1 bar.
-        if "ROC_5" in fe.columns:
-            roc5: pd.Series = fe["ROC_5"]
-            fe["ROC_5_ACCELERATION"] = roc5.diff()
-        else:
-            fe["ROC_5_ACCELERATION"] = 0.0
-
-        # ── ATR Ratio Change ──────────────────────────────────────────
-        # Percentage change in ATR over _ATR_PERIOD bars — detects
-        # volatility regime shifts (expansion / contraction transitions).
-        if "ATR" in fe.columns:
-            atr_prev: pd.Series = fe["ATR"].shift(_ATR_PERIOD).replace(0, _EPS)
-            fe["ATR_RATIO_CHANGE"] = (fe["ATR"] - atr_prev) / atr_prev
-        else:
-            fe["ATR_RATIO_CHANGE"] = 0.0
-
-        # ── MACD Histogram Slope ─────────────────────────────────────────
-        # Change in MACD_HIST over 3 bars — used in 15-min expiry rules.
+        # MACD Histogram Slope (kept for compatibility)
         if "MACD_HIST" in fe.columns:
             fe["MACD_HIST_SLOPE"] = fe["MACD_HIST"].diff(3) / 3
         else:
             fe["MACD_HIST_SLOPE"] = 0.0
-
-        # ── Session Context (aggregate flag for 15-min expiry) ───────────
-        session_cols = [
-            "SESSION_LONDON",
-            "SESSION_NEWYORK",
-            "SESSION_TOKYO",
-        ]
-        available_sessions = [c for c in session_cols if c in fe.columns]
-        if available_sessions:
-            fe["SESSION_CONTEXT"] = fe[available_sessions].max(axis=1)
-        else:
-            fe["SESSION_CONTEXT"] = 0.0
 
         return fe
 
@@ -1066,33 +1146,32 @@ class FeatureEngineer:
     def get_latest(
         self,
         bars: pd.DataFrame,
-        ticks: pd.DataFrame | None = None,
         timeframe: str = "M1",
     ) -> FeatureVector:
         """
         The Live Inference Gate.
 
-        Transforms the latest bars (+ optional ticks) into a single
-        FeatureVector ready for model.predict(). Raises FeatureEngineerError
-        if the pipeline cannot produce a valid vector — the engine layer is
-        responsible for deciding whether to retry or skip the signal.
+        Transforms the latest bars into a single FeatureVector ready for
+        model.predict(). Raises FeatureEngineerError if the pipeline cannot
+        produce a valid vector — the engine layer is responsible for deciding
+        whether to retry or skip the signal.
 
         Args:
-            bars:  Recent OHLCV bars with DatetimeIndex (minimum ~30 rows
-                   for rolling-window warmup; fewer rows yield an empty
-                   feature frame after dropna).
-            ticks: Optional recent ticks for MICRO_STRUCTURE features.
-                   Pass None to zero-fill those columns.
+            bars: Recent OHLCV bars with DatetimeIndex (minimum ~30 rows
+            for rolling-window warmup; fewer rows yield an empty
+            feature frame after dropna).
+            timeframe: Resample frequency. Default "M1".
 
         Returns:
             FeatureVector: immutable, float32, read-only numpy vector.
 
         Raises:
             FeatureEngineerError: If transform produces an empty frame, or
-                if any unexpected exception occurs inside the pipeline.
+            if any unexpected exception occurs inside the pipeline.
         """
+
         try:
-            full_df = self.transform(bars, ticks, timeframe=timeframe)
+            full_df = self.transform(bars, timeframe=timeframe)
         except Exception as e:
             raise FeatureEngineerError(
                 f"transform() failed: {e}", stage="transform"
@@ -1139,7 +1218,6 @@ class FeatureEngineer:
         self,
         bars: pd.DataFrame,
         symbol: str,
-        ticks: pd.DataFrame | None = None,
         timeframe: str = "M1",
     ) -> FeatureMatrix:
         """
@@ -1151,9 +1229,9 @@ class FeatureEngineer:
         live inference (use get_latest() for that).
 
         Args:
-            bars:   Full historical OHLCV DataFrame with DatetimeIndex.
+            bars: Full historical OHLCV DataFrame with DatetimeIndex.
             symbol: Currency pair identifier stored in matrix metadata.
-            ticks:  Optional tick DataFrame for MICRO_STRUCTURE features.
+            timeframe: Resample frequency. Default "M1".
 
         Returns:
             FeatureMatrix: immutable, float32, version-stamped batch matrix.
@@ -1161,8 +1239,9 @@ class FeatureEngineer:
         Raises:
             FeatureEngineerError: If transform() fails or returns empty.
         """
+
         try:
-            full_df = self.transform(bars, ticks, timeframe=timeframe)
+            full_df = self.transform(bars, timeframe=timeframe)
         except Exception as e:
             raise FeatureEngineerError(
                 f"build_matrix() failed at transform: {e}", stage="build_matrix"

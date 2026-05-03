@@ -15,9 +15,11 @@ The calendar is cached per-year to avoid repeated lookups.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
+import exchange_calendars as xcals
+
 from typing import Optional
+from functools import lru_cache
+from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +91,10 @@ def _easter_sunday(year: int) -> Optional[date]:
 
 # ── Library-Based Calendar ───────────────────────────────────────────────────
 
+
 def _get_library_holidays(year: int) -> Optional[set[date]]:
     """Try to get holidays from exchange_calendars (NYSE schedule)."""
     try:
-        import exchange_calendars as xcals
 
         # NYSE calendar covers: New Year's, MLK Day, Presidents' Day,
         # Good Friday, Memorial Day, Juneteenth, Independence Day,
@@ -101,7 +103,7 @@ def _get_library_holidays(year: int) -> Optional[set[date]]:
         xcal = xcals.get_calendar("XNYS")
         schedule = xcal.schedule.loc[str(year)]
         # Get all sessions (trading days); holidays are the gaps
-        all_sessions = set(schedule.index.date)
+        all_sessions = set(schedule.index.date)  # type: ignore
         # Generate all weekdays in the year
         start = date(year, 1, 1)
         end = date(year, 12, 31)
@@ -119,6 +121,7 @@ def _get_library_holidays(year: int) -> Optional[set[date]]:
 
 
 # ── Main API ─────────────────────────────────────────────────────────────────
+
 
 @lru_cache(maxsize=10)
 def get_forex_holidays(year: int) -> set[date]:
@@ -234,11 +237,7 @@ def get_gap_classification(
     while current <= gap_end:
         dow = current.weekday()
         hour = current.hour
-        is_weekend = (
-            dow == 5
-            or (dow == 6 and hour < 21)
-            or (dow == 4 and hour >= 21)
-        )
+        is_weekend = dow == 5 or (dow == 6 and hour < 21) or (dow == 4 and hour >= 21)
         if not is_weekend:
             all_weekend = False
         if not is_forex_closed(current):
