@@ -47,37 +47,28 @@ Public API
     TradeSignal                          — frozen dataclass, inference output
     SignalGeneratorError                 — raised on unrecoverable failures
     SignalGenerator(symbol, expiry_key)
-    SignalGenerator.generate(fv, fe_df)  -> TradeSignal
+    SignalGenerator.generate(fv)         -> TradeSignal
     SignalGenerator.reload()             -> bool
 """
 
 from __future__ import annotations
 
+import torch
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any
-
 import numpy as np
 import pandas as pd
 
+from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from core.config import get_settings
 
 from ml_engine.features import (
     BINARY_EXPIRY_RULES,
     FeatureVector,
-    _VERSION,
-    get_feature_engineer,
 )
 from ml_engine.labeler import _EXPIRY_SECONDS
 from ml_engine.model_manager import ModelManager, ModelRecord
-
-try:
-    import torch
-
-    _HAS_TORCH = True
-except ImportError:
-    _HAS_TORCH = False
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +117,6 @@ class TradeSignal:
         expiry_key:      Expiry window identifier, e.g. "5_MIN".
         expiry_seconds:  Duration of the expiry window in seconds.
         timestamp:       UTC datetime when the signal was generated.
-        symbol:          Currency pair the signal was generated for.
         model_name:      Trainer class name that produced the artifact,
                             e.g. "XGBoostTrainer". From ModelRecord.
         feature_version: _VERSION string from features.py at inference time.
@@ -243,7 +233,7 @@ class SignalGenerator:
 
     Example:
         >>> gen = SignalGenerator(symbol="EUR_USD", expiry_key="5_MIN")
-        >>> signal = gen.generate(feature_vector, feature_dataframe)
+        >>> signal = gen.generate(feature_vector)
         >>> if signal.is_executable():
         ...     webhook.fire(signal)
     """
@@ -284,7 +274,9 @@ class SignalGenerator:
         self.expiry_seconds: int = _EXPIRY_SECONDS[expiry_key]
         self.threshold: float = self._settings.confidence_threshold
 
-        self._manager: ModelManager = model_manager or ModelManager(storage_dir=self._settings.model_dir)
+        self._manager: ModelManager = model_manager or ModelManager(
+            storage_dir=self._settings.model_dir
+        )
 
         # Model artifact and its registry record. Both None until a
         # trained artifact exists. generate() returns SKIP when None.
@@ -298,7 +290,15 @@ class SignalGenerator:
         # Attempt initial load — no error if no artifact found.
         self.reload()
 
-        logger.info({"event": "SIGNAL_GENERATOR_INIT", "symbol": self.symbol, "expiry_key": self.expiry_key, "threshold": round(self.threshold, 2), "model": self._record.model_name if self._record else "NONE"})
+        logger.info(
+            {
+                "event": "SIGNAL_GENERATOR_INIT",
+                "symbol": self.symbol,
+                "expiry_key": self.expiry_key,
+                "threshold": round(self.threshold, 2),
+                "model": self._record.model_name if self._record else "NONE",
+            }
+        )
 
     # ── Model Loading ─────────────────────────────────────────────────────────
 
@@ -320,7 +320,13 @@ class SignalGenerator:
         )
 
         if record is None:
-            logger.warning({"event": "SIGNAL_NO_MODEL", "symbol": self.symbol, "expiry_key": self.expiry_key})
+            logger.warning(
+                {
+                    "event": "SIGNAL_NO_MODEL",
+                    "symbol": self.symbol,
+                    "expiry_key": self.expiry_key,
+                }
+            )
             self._model = None
             self._record = None
             return False
@@ -338,11 +344,25 @@ class SignalGenerator:
             self._model = self._manager.load(record.artifact_path)
             self._record = record
 
-            logger.info({"event": "SIGNAL_MODEL_LOADED", "model": record.model_name, "auc": round(record.auc, 4)})
+            logger.info(
+                {
+                    "event": "SIGNAL_MODEL_LOADED",
+                    "model": record.model_name,
+                    "auc": round(record.auc, 4),
+                }
+            )
             return True
 
         except Exception as exc:
-            logger.critical({"event": "SIGNAL_MODEL_LOAD_FAILED", "symbol": self.symbol, "expiry_key": self.expiry_key, "artifact": str(record.artifact_path), "error": str(exc)})
+            logger.critical(
+                {
+                    "event": "SIGNAL_MODEL_LOAD_FAILED",
+                    "symbol": self.symbol,
+                    "expiry_key": self.expiry_key,
+                    "artifact": str(record.artifact_path),
+                    "error": str(exc),
+                }
+            )
             self._model = None
             self._record = None
             return False
@@ -359,7 +379,14 @@ class SignalGenerator:
             mgr: ThresholdManager instance (typed Any to avoid circular import).
         """
         self._threshold_mgr = mgr
-        logger.info({"event": "SIGNAL_THRESHOLD_MANAGER_SET", "base_threshold": round(mgr.base_threshold, 2), "step": round(mgr.step, 2), "max_streak": mgr.max_streak})
+        logger.info(
+            {
+                "event": "SIGNAL_THRESHOLD_MANAGER_SET",
+                "base_threshold": round(mgr.base_threshold, 2),
+                "step": round(mgr.step, 2),
+                "max_streak": mgr.max_streak,
+            }
+        )
 
     def inject_model(self, model: Any, record: ModelRecord) -> None:
         """
@@ -386,7 +413,6 @@ class SignalGenerator:
     def generate(
         self,
         fv: FeatureVector,
-        fe_df: pd.DataFrame,
     ) -> TradeSignal:
         """
         Translate a FeatureVector into a TradeSignal.
@@ -400,9 +426,6 @@ class SignalGenerator:
         Args:
             fv:    FeatureVector from FeatureEngineer.get_latest().
                     Carries the 50-feature float32 vector for inference.
-            fe_df: Full feature DataFrame from FeatureEngineer.transform()
-                    for the current bar window. Currently unused but
-                    retained for future derived-feature needs.
 
         Returns:
             TradeSignal: Always returns a signal — never raises for normal
@@ -426,8 +449,18 @@ class SignalGenerator:
         # ── 2. Model inference ────────────────────────────────────────────
         try:
             prob: float = self._infer(fv)
+        except SignalGeneratorError:
+            raise
         except Exception as exc:
-            logger.critical({"event": "SIGNAL_INFERENCE_FAILED", "symbol": self.symbol, "expiry_key": self.expiry_key, "model": self._record.model_name, "error": str(exc)})
+            logger.critical(
+                {
+                    "event": "SIGNAL_INFERENCE_FAILED",
+                    "symbol": self.symbol,
+                    "expiry_key": self.expiry_key,
+                    "model": self._record.model_name,
+                    "error": str(exc),
+                }
+            )
             raise SignalGeneratorError(
                 f"Model inference failed for {self._record.model_name}: {exc}",
                 stage="infer",
@@ -459,7 +492,17 @@ class SignalGenerator:
             feature_version=fv.version,
         )
 
-        logger.info({"event": "SIGNAL_GENERATED", "symbol": self.symbol, "direction": signal.direction, "confidence": round(signal.confidence, 2), "model": signal.model_name, "expiry": signal.expiry_key, "threshold": round(effective_threshold, 2)})
+        logger.info(
+            {
+                "event": "SIGNAL_GENERATED",
+                "symbol": self.symbol,
+                "direction": signal.direction,
+                "confidence": round(signal.confidence, 2),
+                "model": signal.model_name,
+                "expiry": signal.expiry_key,
+                "threshold": round(effective_threshold, 2),
+            }
+        )
 
         return signal
 
@@ -490,9 +533,6 @@ class SignalGenerator:
         # _infer() is only called from generate() after the self._record is None
         # guard. Assert here so Pylance narrows the type for this method.
         assert self._record is not None
-
-        if not _HAS_TORCH:
-            raise RuntimeError("PyTorch required for inference")
 
         # SB3 detection: same MRO check as model_manager._is_sb3_model()
         is_sb3 = any(
@@ -528,7 +568,14 @@ class SignalGenerator:
             prob = float(proba_output[0, 1])
 
         if not np.isfinite(prob):
-            logger.critical({"event": "SIGNAL_INFERENCE_NON_FINITE", "symbol": self.symbol, "model": self._record.model_name, "probability": prob})
+            logger.critical(
+                {
+                    "event": "SIGNAL_INFERENCE_NON_FINITE",
+                    "symbol": self.symbol,
+                    "model": self._record.model_name,
+                    "probability": prob,
+                }
+            )
             raise SignalGeneratorError(
                 f"Model {self._record.model_name} returned non-finite "
                 f"probability: {prob}.",

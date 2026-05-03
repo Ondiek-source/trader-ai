@@ -120,6 +120,11 @@ _MAX_FFILL_BARS: int = 5
 # Context
 _MINUTES_TO_NEWS_PLACEHOLDER: int = 90  # Default until economic calendar API is wired
 
+# Minimum M1 bars required for transform() to produce a non-empty DataFrame.
+# Derived from the longest rolling window (_MACD_SLOW) plus lag periods and
+# multi-timeframe resample headroom. Pipeline reads this for warmup validation.
+MIN_BARS_REQUIRED: int = 26  # _MACD_SLOW (18) + max lag (5) + resample safety (3)
+
 
 # ── Feature Schema ──────────────────────────────────────────────────────────
 
@@ -460,22 +465,18 @@ class FeatureEngineer:
             raise ValueError(f"Input bars missing columns: {missing}")
 
         # 1. PRICE ACTION
-        if self._settings.feat_price_action_enabled:
-            fe = self._compute_price_action(fe)
+        fe = self._compute_price_action(fe)
 
         # 2. MOMENTUM
-        if self._settings.feat_momentum_enabled:
-            fe = self._compute_momentum(fe)
+        fe = self._compute_momentum(fe)
 
         # 3. VOLATILITY
-        if self._settings.feat_volatility_enabled:
-            fe = self._compute_volatility(fe)
+        fe = self._compute_volatility(fe)
 
         # 4. CONTEXT
-        if self._settings.feat_context_enabled:
-            fe = self._compute_context(
-                fe
-            )  # always runs — feeds gates and top-weighted features
+        fe = self._compute_context(
+            fe
+        )  # always runs — feeds gates and top-weighted features
 
         # 5. MULTI-TIMEFRAME
         fe = self._compute_multitimeframe(fe)

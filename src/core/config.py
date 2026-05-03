@@ -57,7 +57,7 @@ VALID_PAIRS: set[str] = {
 }
 
 VALID_EXPIRIES: set[int] = {60, 300, 900}
-VALID_SOURCES: set[str] = {"TWELVE", "QUOTEX"}
+VALID_SOURCES: set[str] = {"QUOTEX"}
 
 # ── Value truncation helper ───────────────────────────────────────────────────
 
@@ -246,9 +246,6 @@ class Config:
     sourced from environment variables and validated.
     """
 
-    # ── Twelve Data ───────────────────────────────────────────────────────
-    twelvedata_api_key: str
-
     # ── Azure Storage ─────────────────────────────────────────────────────
     azure_storage_conn: str
     container_name: str
@@ -264,7 +261,6 @@ class Config:
 
     # ── Trading ───────────────────────────────────────────────────────────
     pairs: list[str]
-    use_otc: bool
     confidence_threshold: float
     expiry_seconds: int
     daily_trade_target: int
@@ -291,24 +287,12 @@ class Config:
     display_tz: int  # UTC offset in hours applied to all display timestamps
 
     # ── ML / Training ──────────────────────────────────────────────────────────
-    backfill_source: str  # "TWELVE" or "QUOTEX"
     backfill_years: int
     backfill_pairs: list[str]
     max_sequences: int
     max_rf_rows: int
     memory_saver_mode: bool
     gpu_enabled: bool
-
-    # Feature Toggles
-    feat_momentum_enabled: bool
-    feat_volatility_enabled: bool
-    feat_price_action_enabled: bool
-    feat_micro_enabled: bool
-    feat_context_enabled: bool
-
-    # Gate Thresholds
-    gate_min_rvol: float
-    gate_max_spread: float
 
     # ── Data source routing ──────────────────────────────────────────────
     use_quotex_streaming: bool
@@ -473,15 +457,10 @@ class Config:
         It maps the 'Pure' names to 'Broker' names.
 
         Behavior:
-        - If use_otc=True: Returns symbols with '_otc' suffix (e.g., EURUSD_otc)
-        - If use_otc=False: Returns regular Forex symbols (e.g., EURUSD)
+            - Returns regular Forex symbols (e.g., EURUSD)
         """
-        if self.use_otc:
-            # OTC mode: EUR_USD -> EURUSD_otc
-            return {p: f"{p.replace('_', '')}_otc" for p in self.pairs}
-        else:
-            # Regular Forex mode: EUR_USD -> EURUSD
-            return {p: p.replace("_", "") for p in self.pairs}
+        # Regular Forex mode: EUR_USD -> EURUSD
+        return {p: p.replace("_", "") for p in self.pairs}
 
 
 def load_config() -> Config:
@@ -532,31 +511,20 @@ def load_config() -> Config:
         daily_trade_target=_int("DAILY_TRADE_TARGET", 10),
         expiry_seconds=_int("EXPIRY_SECONDS", 60),
         pairs=pairs,
-        use_otc=_bool("USE_OTC", False),
         daily_net_profit_target=daily_net_profit_target,
         trading_window_hours=_int("TRADING_WINDOW_HOURS", 19),
         atr_threshold=_parse_float("ATR_THRESHOLD", default=1.0),
         # Training
-        backfill_source=_optional("BACKFILL_SOURCE", "TWELVE").upper(),
         backfill_pairs=_parse_and_validate_pairs(
             "BACKFILL_PAIRS", _optional("BACKFILL_PAIRS", "EUR_USD")
         ),
         gpu_enabled=_bool("GPU_ENABLED", False),
         backfill_years=_int("BACKFILL_YEARS", 2),
         max_sequences=_int("MAX_SEQUENCES", 100000),
-        feat_momentum_enabled=_bool("FEAT_MOMENTUM_ENABLED", True),
-        feat_volatility_enabled=_bool("FEAT_VOLATILITY_ENABLED", True),
-        feat_price_action_enabled=_bool("FEAT_PRICE_ACTION_ENABLED", True),
-        feat_micro_enabled=_bool("FEAT_MICRO_ENABLED", True),
-        feat_context_enabled=_bool("FEAT_CONTEXT_ENABLED", True),
-        gate_min_rvol=_parse_float("GATE_MIN_RVOL", 1.5),
-        gate_max_spread=_parse_float("GATE_MAX_SPREAD", 0.0005),
         allow_stale_models=_bool("ALLOW_STALE_MODELS", False),
         train_on_full_history=_bool("TRAIN_ON_FULL_HISTORY", True),
         model_retrain_interval=_int("MODEL_RETRAIN_INTERVAL", 3600),
         model_save_interval=_int("MODEL_SAVE_INTERVAL", 1800),
-        # Twelve Data
-        twelvedata_api_key=_require("TWELVEDATA_API_KEY"),
         # Webhook
         webhook_key=_optional("WEBHOOK_KEY", ""),
         webhook_secret=_optional("WEBHOOK_SECRET", ""),

@@ -1,27 +1,17 @@
 """
-quotex_reader.py — Reads closed trade results from Quotex account.
+engine/quotex_stream.py — Live tick stream + trade result tracking via Quotex.
 
-Uses pyquotex (cleitonleonel/pyquotex) unofficial WebSocket API.
-Module: pyquotex.stable_api (NOT quotexapi — package renamed in v1.0)
-Install: pip install git+https://github.com/cleitonleonel/pyquotex.git
+Provides the live price feed and closed-trade result matching for the
+LiveEngine. Connects to the Quotex WebSocket API via pyquotex and polls
+real-time prices at ~1 Hz. Result resolution uses balance-delta detection
+and trade history matching to reconcile executed signals with outcomes.
 
-CONFIRMED API (from pyquotex docs):
-    - Quotex(email, password, lang="en")
-    - await client.connect() → (bool, reason_str)
-    - client.change_account("PRACTICE" | "REAL")
-    - client.set_account_mode("PRACTICE" | "REAL")
-    - await client.get_balance() → float
-    - await client.get_history() → [{"ticket": id, "profitAmount": float, ...}, ...]
-    - await client.get_result(operation_id) → ("win"|"loss", details)
-    - await client.check_win(operation_id) → True (profit) | False (loss)
-    - client.get_profit() → float (after check_win)
-    - Direction strings: "call" (UP/buy) | "put" (DOWN/sell)
-    - Asset format: "EURUSD_otc" (OTC, 24/7) | "EURUSD" (market hours)
+Classes:
+    QuotexDataStream — WebSocket connection, tick subscription, result tracking.
 
-Strategy (no trade ID available — our bot places trades, not us):
-    1. Balance-delta: monitor account balance; change at expiry = trade result.
-    2. get_history(): scan recent trades for matching asset + profitAmount.
-    3. get_result(id): get win/loss for a specific operation ID from history.
+    Result detection strategies (tried in order):
+        1. Balance-delta: monitor account balance; change at expiry = trade result.
+        2. get_history(): scan recent trades for matching asset + profitAmount.
 """
 
 from __future__ import annotations
@@ -32,10 +22,7 @@ import logging
 
 from typing import Any
 from ml_engine.model import Tick
-from core.config import get_settings
-from core.exceptions import NotificationError
 from datetime import datetime, timedelta, timezone
-
 
 logger = logging.getLogger(__name__)
 
@@ -61,27 +48,9 @@ PAIR_TO_ASSETS: dict[str, list[str]] = {
 
 # Direction: our internal → Quotex API
 DIRECTION_TO_QUOTEX: dict[str, str] = {"UP": "call", "DOWN": "put"}
-QUOTEX_TO_DIRECTION: dict[str, str] = {
-    "call": "UP", "put": "DOWN",
-    "0": "UP", "1": "DOWN",  # command field: 0=call, 1=put
-}
 
 # ── Library import ─────────────────────────────────────────────────────────────
-_QuotexClient: Any = None
-QUOTEX_LIB_AVAILABLE: bool = False
-try:
-    from pyquotex.stable_api import Quotex as _QuotexClient
-
-    QUOTEX_LIB_AVAILABLE = True
-except Exception as _qx_err:
-    logger.critical(
-        {
-            "event": "pyquotex_import_failed",
-            "error_type": type(_qx_err).__name__,
-            "error": str(_qx_err),
-            "message": "pyquotex library not available - Quotex streaming disabled",
-        }
-    )
+from pyquotex.stable_api import Quotex as _QuotexClient  # noqa: F401
 
 
 class QuotexDataStream:
@@ -99,8 +68,8 @@ class QuotexDataStream:
         practice_mode: ``True`` for demo account, ``False`` for real.
     """
 
-    RESULT_BUFFER_SECONDS = 5   # wait after signal expiry before first check
-    HISTORY_RETRY_INTERVAL = 15 # seconds between each subsequent retry
+    RESULT_BUFFER_SECONDS = 5  # wait after signal expiry before first check
+    HISTORY_RETRY_INTERVAL = 15  # seconds between each subsequent retry
     BALANCE_POLL_INTERVAL = 1.5  # seconds between balance checks
     MAX_HISTORY_ATTEMPTS = 3  # cap history method calls per resolve
     MAX_RECONNECT_DELAY = 120  # seconds
@@ -114,7 +83,6 @@ class QuotexDataStream:
         practice_mode: bool = True,
         client: Any = None,
     ) -> None:
-        self._settings = get_settings()
         self.symbol = symbol
 
         self._email = email
@@ -128,14 +96,9 @@ class QuotexDataStream:
         self._client: Any = client
         self._connected = False
         self._balance: float = 0.0
-        self._prev_balance: float = 0.0
 
-        # {signal_id → {signal, expiry_time, balance_before, attempts, resolved}}
+        # {signal_id → {signal, expiry_time, attempts, resolved}}
         self._pending: dict[str, dict[str, Any]] = {}
-
-        # Cached history from last get_history() call
-        self._cached_history: list[dict[str, Any]] = []
-        self._history_cache_time: float = 0.0
 
         # Results ready for consumption by main loop
         self._result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -166,7 +129,8 @@ class QuotexDataStream:
                     "file": _MODULE_FILE,
                 }
             )
-            return False, ""
+            raise RuntimeError("Quotex client constructor returned None")
+
         ok, reason = await self._client.connect()
         if not ok:
             logger.error(
@@ -189,7 +153,6 @@ class QuotexDataStream:
             if asyncio.iscoroutine(result):
                 await result
         self._balance = await self._safe_get_balance()
-        self._prev_balance = self._balance
         mode_tag = "[PRACTICE MODE]" if self._practice_mode else "[LIVE MODE]"
         logger.info(
             {
@@ -250,16 +213,6 @@ class QuotexDataStream:
         client used by QuotexStream), reuses it — only sets the account mode
         and fetches the initial balance without opening a second WebSocket.
         """
-        if not QUOTEX_LIB_AVAILABLE:
-            return False
-        if not self._email or not self._password:
-            logger.warning(
-                {
-                    "event": "quotex_no_credentials",
-                }
-            )
-            return False
-
         max_retries = 3
         retry_delay = 5
 
@@ -295,14 +248,13 @@ class QuotexDataStream:
         self, signal_id: str, signal: dict[str, Any], expiry_time: datetime
     ) -> None:
         """Register a signal that needs result matching at *expiry_time*."""
-        balance_snapshot = self._balance
         self._pending[signal_id] = {
             "signal": signal,
             "expiry_time": expiry_time,
-            "balance_before": balance_snapshot,
             "attempts": 0,
             "resolved": False,
-            "next_attempt_at": expiry_time + timedelta(seconds=self.RESULT_BUFFER_SECONDS),
+            "next_attempt_at": expiry_time
+            + timedelta(seconds=self.RESULT_BUFFER_SECONDS),
         }
         logger.info(
             {
@@ -313,7 +265,6 @@ class QuotexDataStream:
                 "confidence": round(signal.get("confidence") or 0, 2),
                 "fired_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                 "expiry_at": expiry_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "balance_snapshot": balance_snapshot,
             }
         )
 
@@ -412,7 +363,6 @@ class QuotexDataStream:
         """
         if not self._balance:
             self._balance = await self._safe_get_balance()
-            self._prev_balance = self._balance
 
         while self._connected:
             await asyncio.sleep(self.BALANCE_POLL_INTERVAL)
@@ -497,7 +447,9 @@ class QuotexDataStream:
         for field in ("directionType", "direction", "command"):
             raw = trade.get(field)
             if raw is not None:
-                trade_dir = {"0": "call", "1": "put"}.get(str(raw).lower(), str(raw).lower())
+                trade_dir = {"0": "call", "1": "put"}.get(
+                    str(raw).lower(), str(raw).lower()
+                )
                 if trade_dir != signal_quotex:
                     return None
                 break
@@ -505,13 +457,17 @@ class QuotexDataStream:
         # as close_time_timestamp. Fall back to string parsing if absent.
         close_ts = trade.get("close_time_timestamp")
         if close_ts is not None:
-            trade_time = datetime.fromtimestamp(float(close_ts), tz=timezone.utc).replace(tzinfo=None)
+            trade_time = datetime.fromtimestamp(
+                float(close_ts), tz=timezone.utc
+            ).replace(tzinfo=None)
             return abs((trade_time - target_time).total_seconds())
         close_time_str = trade.get("close_time") or trade.get("closeTime", "")
         if not close_time_str:
             return None
         try:
-            trade_time = datetime.strptime(str(close_time_str)[:19], "%Y-%m-%d %H:%M:%S")
+            trade_time = datetime.strptime(
+                str(close_time_str)[:19], "%Y-%m-%d %H:%M:%S"
+            )
         except ValueError:
             return None
         return abs((trade_time - target_time).total_seconds())
@@ -574,7 +530,9 @@ class QuotexDataStream:
                 sample = [
                     {
                         "asset": t.get("symbol") or t.get("asset", "?"),
-                        "cmd": t.get("command") or t.get("direction") or t.get("directionType", "?"),
+                        "cmd": t.get("command")
+                        or t.get("direction")
+                        or t.get("directionType", "?"),
                         "close_ts": t.get("close_time_timestamp"),
                         "close_time": (str(t.get("close_time") or ""))[:19],
                         "profit": t.get("profitAmount"),
@@ -627,8 +585,14 @@ class QuotexDataStream:
             )
 
             return self._make_result(
-                "", pair, direction, outcome, payout=payout, stake=stake,
-                open_price=open_price, close_price=close_price,
+                "",
+                pair,
+                direction,
+                outcome,
+                payout=payout,
+                stake=stake,
+                open_price=open_price,
+                close_price=close_price,
             )
 
         except TimeoutError:
@@ -732,26 +696,26 @@ class QuotexDataStream:
             source="QUOTEX",
         )
 
-    def _check_realtime_capability(self, otc_asset: str, state: str) -> str:
+    def _check_realtime_capability(self, asset: str, state: str) -> str:
         """Log a one-time error if start_realtime_price is unavailable. Returns new state."""
         if state != "degraded":
-            logger.error({"event": "STREAM_REALTIME_UNAVAILABLE", "symbol": otc_asset})
+            logger.error({"event": "STREAM_REALTIME_UNAVAILABLE", "symbol": asset})
         return "degraded"
 
-    def _extract_price_points(self, result: Any, otc_asset: str) -> list | None:
+    def _extract_price_points(self, result: Any, asset: str) -> list | None:
         """Return price_points list from a start_realtime_price result, or None."""
         if result and isinstance(result, dict):
-            return result.get(otc_asset)
+            return result.get(asset)
         return None
 
-    def _handle_price_points(self, otc_asset: str, state: str) -> str:
+    def _handle_price_points(self, asset: str, state: str) -> str:
         """Log stream-up transition. Returns updated state."""
         if state == "degraded":
-            logger.info({"event": "STREAM_UP", "symbol": otc_asset})
+            logger.info({"event": "STREAM_UP", "symbol": asset})
             state = "ok"
         return state
 
-    async def _poll_once(self, otc_asset: str, state: str) -> tuple[str, list[Tick]]:
+    async def _poll_once(self, asset: str, state: str) -> tuple[str, list[Tick]]:
         """
         One polling iteration. Handles all sleeps internally so the caller
         (subscribe) stays a thin generator loop with no branching.
@@ -759,21 +723,21 @@ class QuotexDataStream:
         """
         try:
             if not hasattr(self._client, "start_realtime_price"):
-                state = self._check_realtime_capability(otc_asset, state)
+                state = self._check_realtime_capability(asset, state)
                 await asyncio.sleep(1)
                 return state, []
 
-            result = await self._client.start_realtime_price(otc_asset, 1)
-            price_points = self._extract_price_points(result, otc_asset)
+            result = await self._client.start_realtime_price(asset, 1)
+            price_points = self._extract_price_points(result, asset)
 
             if price_points:
-                state = self._handle_price_points(otc_asset, state)
+                state = self._handle_price_points(asset, state)
                 ticks = [self._build_tick(pp) for pp in price_points]
                 await asyncio.sleep(1)
                 return state, ticks
 
             if state != "degraded":
-                logger.warning({"event": "STREAM_OFFLINE", "symbol": otc_asset})
+                logger.warning({"event": "STREAM_OFFLINE", "symbol": asset})
                 state = "degraded"
             await asyncio.sleep(4)
             return state, []
@@ -782,37 +746,40 @@ class QuotexDataStream:
             raise
         except Exception as e:
             if state != "degraded":
-                logger.error({"event": "STREAM_ERROR", "symbol": otc_asset, "error_type": type(e).__name__, "error": str(e)})
+                logger.error(
+                    {
+                        "event": "STREAM_ERROR",
+                        "symbol": asset,
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    }
+                )
                 state = "degraded"
             if not self._connected:
-                logger.info(
-                    {"event": "quotex_stream_reconnecting", "symbol": otc_asset}
-                )
+                logger.info({"event": "quotex_stream_reconnecting", "symbol": asset})
                 await self._reconnect()
                 if self._connected:
                     state = "ok"
-                    logger.info(
-                        {"event": "quotex_stream_reconnected", "symbol": otc_asset}
-                    )
+                    logger.info({"event": "quotex_stream_reconnected", "symbol": asset})
             await asyncio.sleep(1)
             return state, []
 
     async def subscribe(self):
         """
-        Async generator that yields real-time price ticks for Quotex OTC pairs.
+        Async generator that yields real-time price ticks for Quotex Pairs.
         Since pyquotex doesn't support a real price stream, this method polls
         the latest price every 1000 ms using start_realtime_price() with batch_size=1.
         """
-        otc_asset = self.symbol
+        asset = self.symbol
         state = "ok"
 
         while self._connected:
-            state, ticks = await self._poll_once(otc_asset, state)
+            state, ticks = await self._poll_once(asset, state)
             for tick in ticks:
                 yield tick
 
         if hasattr(self._client, "stop_candles_stream"):
-            self._client.stop_candles_stream(otc_asset)
+            self._client.stop_candles_stream(asset)
 
     # ── Reconnection ──────────────────────────────────────────────────────────
 
@@ -827,29 +794,3 @@ class QuotexDataStream:
             except Exception as exc:
                 logger.warning({"event": "QUOTEX_RECONNECT_ERROR", "error": str(exc)})
             delay = min(delay * 2, self.MAX_RECONNECT_DELAY)
-
-
-# ── Async runner (supervised task entry point) ─────────────────────────────────
-
-
-async def run_quotex_reader(reader: QuotexDataStream) -> None:
-    """Top-level entry point for asyncio.create_task.
-
-    Does NOT call reader.connect() — main() already connected the reader
-    before launching this task. Calling connect() a second time opens a
-    duplicate WebSocket session on the same Quotex account, which kills
-    the first. If the initial connect failed, poll_results()'s internal
-    _reconnect() loop handles recovery.
-    """
-    if not QUOTEX_LIB_AVAILABLE:
-        logger.info(
-            {
-                "event": "QUOTEX_READER_DISABLED",
-                "reason": "pyquotex_not_installed",
-                "note": "Quotex result reading unavailable.",
-            }
-        )
-        while True:
-            await asyncio.sleep(3600)
-    else:
-        await reader.poll_results()

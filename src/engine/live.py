@@ -17,15 +17,8 @@ SignalGenerator, WebhookSender, Reporter, and Journal.
 
 Stream routing
 --------------
-Live tick source is determined once at construction from config:
-
-    USE_QUOTEX_STREAMING=True  -> QuotexDataStream  (OTC symbols via Quotex)
-    USE_QUOTEX_STREAMING=False -> TwelveTicksStream (standard forex pairs)
-
-TwelveData is ALWAYS used by historian.py for historical backfill
-regardless of this setting. This routing only governs LIVE ticks.
-The OTC symbol translation (EUR_USD -> EURUSD_otc) is done by
-config.quotex_symbols — live.py never constructs symbol names.
+Live ticks are sourced exclusively from Quotex via QuotexDataStream.
+Symbol translation (EUR_USD -> EURUSD) is done by config.quotex_symbols.
 
 Cold-start
 ----------
@@ -96,6 +89,7 @@ from typing import Any
 from datetime import datetime, timedelta, timezone
 from core.config import get_settings
 from core.dashboard import status_store
+from ml_engine.labeler import _EXPIRY_SECONDS
 from data.journal import Journal, SignalEntry, TradeEntry
 from data.storage import (
     Storage,
@@ -107,11 +101,11 @@ from ml_engine.features import (
     FeatureEngineer,
     FeatureEngineerError,
     get_feature_engineer,
+    MIN_BARS_REQUIRED,
 )
 from engine.bar_builder import LiveBarBuilder
 from ml_engine.model import Bar, Tick as ModelTick
 from ml_engine.model_manager import ModelManager
-from engine.twelveticks_stream import TwelveDataStream
 from engine.quotex_stream import QuotexDataStream
 from trading.signals import SignalGenerator, SignalGeneratorError, TradeSignal
 from trading.threshold_manager import ThresholdManager
@@ -126,11 +120,6 @@ logger = logging.getLogger(__name__)
 
 # ── Module Constants ──────────────────────────────────────────────────────────
 
-# Minimum M1 bars before inference starts.
-# MACD slow span = 26 bars. _MIN_BARS_REQUIRED adds a safety margin
-# so the first get_latest() call never hits the empty-DataFrame guard.
-_MIN_BARS_REQUIRED: int = 30
-
 # Maximum bars loaded from storage per tick.
 # 100 M1 bars * ~50 float64 columns * 8 bytes = ~40KB per call.
 # Capped to prevent OOM when storage holds years of history.
@@ -141,7 +130,7 @@ _BAR_WINDOW: int = 100
 # that are actually a symptom of a deeper unrecoverable failure.
 _MAX_CONSECUTIVE_ERRORS: int = 20
 
-_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M5", "15_MIN": "M15"}
+_TIMEFRAME_MAP = {"1_MIN": "M1"}  # all expiries use M1 bars
 
 
 class LiveEngine:
@@ -348,14 +337,11 @@ class LiveEngine:
 
         return engine
 
-    def _init_stream(self) -> QuotexDataStream | TwelveDataStream:
+    def _init_stream(self) -> QuotexDataStream:
         """
         Construct the correct live tick stream from config.
 
-        Quotex is used for OTC live ticks when USE_QUOTEX_STREAMING=True.
-        TwelveData is used for standard forex live ticks otherwise.
-        TwelveData is ALWAYS used by historian.py for backfill — this
-        method only governs the live tick source.
+        Quotex is used for live ticks when USE_QUOTEX_STREAMING=True.
 
         Returns:
             Stream instance with a subscribe() async generator method.
@@ -365,37 +351,20 @@ class LiveEngine:
                 fatal — the engine cannot run without a tick source.
         """
         try:
-            if self._settings.use_quotex_streaming:
-                otc_symbol: str = self._settings.quotex_symbols[self.symbol]
-                logger.info(
-                    {
-                        "event": "STREAM_INITIALIZED",
-                        "symbol": self.symbol,
-                        "type": "QuotexDataStream",
-                        "otc_symbol": otc_symbol,
-                    }
-                )
-                return QuotexDataStream(
-                    email=self._settings.quotex_email,
-                    password=self._settings.quotex_password,
-                    practice_mode=self._settings.practice_mode,
-                    symbol=otc_symbol,
-                )
-            else:
-                logger.info(
-                    {
-                        "event": "STREAM_INITIALIZED",
-                        "symbol": self.symbol,
-                        "type": "TwelveDataStream",
-                    }
-                )
-                return TwelveDataStream(
-                    api_key=self._settings.twelvedata_api_key,
-                    pairs=self._settings.pairs,
-                    storage=self._storage,
-                    flush_size=self._settings.tick_flush_size,
-                )
-
+            symbol: str = self._settings.quotex_symbols[self.symbol]
+            logger.info(
+                {
+                    "event": "STREAM_INITIALIZED",
+                    "symbol": self.symbol,
+                    "type": "QuotexDataStream",
+                }
+            )
+            return QuotexDataStream(
+                email=self._settings.quotex_email,
+                password=self._settings.quotex_password,
+                practice_mode=self._settings.practice_mode,
+                symbol=symbol,
+            )
         except Exception as exc:
             raise LiveEngineError(
                 f"Stream construction failed for {self.symbol}: {exc}",
@@ -736,34 +705,23 @@ class LiveEngine:
                 )
 
         # ── 3. Minimum bars warmup guard ──────────────────────────────────
-        if len(hist_bars) < _MIN_BARS_REQUIRED:
+        if len(hist_bars) < MIN_BARS_REQUIRED:
             logger.debug(
                 {
                     "event": "MINIMUM_BARS_WARMUP",
                     "bars_loaded": len(hist_bars),
-                    "bars_required": _MIN_BARS_REQUIRED,
+                    "bars_required": MIN_BARS_REQUIRED,
                     "symbol": self.symbol,
-                    "message": f"Warmup {len(hist_bars)}/{_MIN_BARS_REQUIRED} bars for {self.symbol}",
+                    "message": f"Warmup {len(hist_bars)}/{MIN_BARS_REQUIRED} bars for {self.symbol}",
                 }
             )
             return
 
         # ── 4. Feature engineering ────────────────────────────────────────
-        # transform() and get_latest() receive the live ticks so that
-        # TICK_VELOCITY, SPREAD_NORMALIZED, TICK_DELTA_CUMULATIVE and
-        # ORDER_FLOW_IMBALANCE are computed from real data instead of
-        # being zero-filled.
-        live_ticks: pd.DataFrame | None = ticks_df if not ticks_df.empty else None
-        try:
-            fe_df: pd.DataFrame = self._engineer.transform(
-                hist_bars,
-                live_ticks,
-                timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
-            )
 
+        try:
             fv = self._engineer.get_latest(
                 hist_bars,
-                live_ticks,
                 timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
             )
         except FeatureEngineerError as exc:
@@ -783,7 +741,6 @@ class LiveEngine:
             async with self._reload_lock:
                 signal: TradeSignal = self._signal_gen.generate(
                     fv=fv,
-                    fe_df=fe_df,
                 )
         except SignalGeneratorError as exc:
             logger.warning(
@@ -896,8 +853,7 @@ class LiveEngine:
 
         # Register signal for result tracking via Quotex history matching
         if hasattr(self._stream, "register_pending"):
-            _EXPIRY_SECONDS_MAP = {"1_MIN": 60, "5_MIN": 300, "15_MIN": 900}
-            expiry_seconds = _EXPIRY_SECONDS_MAP.get(signal.expiry_key, 60)
+            expiry_seconds = _EXPIRY_SECONDS.get(signal.expiry_key, 60)
             expiry_time = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
             self._stream.register_pending(
                 signal_id=f"{signal.symbol}_{int(datetime.now(timezone.utc).timestamp())}",

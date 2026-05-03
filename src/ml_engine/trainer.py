@@ -90,13 +90,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -113,11 +112,7 @@ import xgboost as xgb
 from ml_engine.features import (
     BINARY_EXPIRY_RULES,
     FeatureMatrix,
-    _VERSION,
 )
-from ml_engine.labeler import _EXPIRY_SECONDS
-from ml_engine.sequence_generator import TimeSeriesDataset, get_dataloader
-from core.config import get_settings
 from core.exceptions import TrainerError
 
 try:

@@ -50,7 +50,6 @@ Public API
 
 from __future__ import annotations
 import sys
-import time
 import signal
 import asyncio
 import logging
@@ -66,54 +65,41 @@ from data.historian import Historian, HistorianError, get_historian
 from data.storage import Storage, StorageError, get_storage
 from engine.live import LiveEngine, LiveEngineError
 from data.forex_calendar import is_forex_closed
-from ml_engine.features import FeatureEngineerError, get_feature_engineer
+from ml_engine.features import (
+    FeatureEngineerError,
+    get_feature_engineer,
+    _MAX_FFILL_BARS,
+    MIN_BARS_REQUIRED,
+)
 from ml_engine.model_manager import ModelManager
-from ml_engine.labeler import Labeler
+from ml_engine.labeler import Labeler, _EXPIRY_SECONDS
 
 from ml_engine.trainer import (
     DataShaper,
     XGBoostTrainer,
     CatBoostTrainer,
-    RandomForestTrainer,
-    GRUTrainer,
-    TCNTrainer,
     LightGBMTrainer,
-    LSTMTrainer,
 )
 
 # How many seconds before midnight (UTC) to fire the daily report.
 _DAILY_REPORT_OFFSET_S: int = 600  # 23:50 UTC
 
 # All expiry keys train on M1 bars — the Labeler's lookahead_bars is always
-# measured in M1 minutes (expiry_seconds // 60), so M5/M15 bars would give
-# wrong labels (5 M5 bars = 25 min, not 5 min for a 5_MIN trade).
-_TIMEFRAME_MAP = {"1_MIN": "M1", "5_MIN": "M1", "15_MIN": "M1"}
+# measured in M1 minutes (expiry_seconds // 60)
+_TIMEFRAME_MAP = {"1_MIN": "M1"}
 
 
 logger = logging.getLogger(__name__)
 
 # ── Module Constants ──────────────────────────────────────────────────────────
 
-# Bars pre-fetched in Stage 3 warmup verification.
-# Must be >= _MIN_BARS_REQUIRED in live.py (30). 100 gives safe headroom.
-_WARMUP_BARS: int = 100
-
 # How often the retrain scheduler wakes to check if the interval has elapsed.
 # Actual retraining only fires when model_retrain_interval seconds have passed.
 # First-boot retrain is immediate regardless of this interval (is_first_run guard).
 _RETRAIN_CHECK_INTERVAL_S: int = 3600
 
-# Canonical mapping of expiry key to seconds.
-# Must stay in sync with _EXPIRY_SECONDS in labeler.py — the assert in
-# labeler.py will catch any drift at import time.
-_EXPIRY_KEY_MAP: dict[str, int] = {
-    "1_MIN": 60,
-    "5_MIN": 300,
-    "15_MIN": 900,
-}
-
 # Inverse map: seconds -> expiry key. Derived once at module load.
-_SECONDS_TO_EXPIRY_KEY: dict[int, str] = {v: k for k, v in _EXPIRY_KEY_MAP.items()}
+_SECONDS_TO_EXPIRY_KEY: dict[int, str] = {v: k for k, v in _EXPIRY_SECONDS.items()}
 
 # Active trainers pulled from Blob and used during retraining.
 # RandomForest excluded: produces multi-GiB artifacts that break container boot.
@@ -409,7 +395,8 @@ class Pipeline:
         if storage is None:
             return None
 
-        bars_df = storage.get_bars(symbol, timeframe="M1")
+        max_bars = self._settings.backfill_years * 365 * 24 * 60  # rceiling for M1
+        bars_df = storage.get_bars(symbol, timeframe="M1", max_rows=max_bars)
         if bars_df is None or bars_df.empty:
             return None
 
@@ -472,27 +459,13 @@ class Pipeline:
         Remove gaps that are tiny (<=5 bars) or coincide with
         weekend/holiday market closures.
         """
-        from data.forex_calendar import is_forex_closed
-
-        _MAX_FFILL_BARS: int = 5
-
-        def _is_market_closed(dt: datetime) -> bool:
-            dow = dt.weekday()
-            hour = dt.hour
-            if dow == 5:
-                return True
-            if dow == 6 and hour < 21:
-                return True
-            if dow == 4 and hour >= 21:
-                return True
-            return is_forex_closed(dt)
 
         unexpected: list[tuple[datetime, datetime, int]] = []
         for gap_start, gap_end, gap_size in gaps:
-            if gap_size <= _MAX_FFILL_BARS + 1:
+            if gap_size <= _MAX_FFILL_BARS:
                 continue
             mid_point = gap_start + (gap_end - gap_start) / 2
-            if _is_market_closed(mid_point):
+            if is_forex_closed(mid_point):
                 continue
             unexpected.append((gap_start, gap_end, gap_size))
 
@@ -572,7 +545,7 @@ class Pipeline:
         """
         Verify that each trading pair has enough bars for feature engineering.
 
-        Checks that at least 30 M1 bars exist (the MACD slow span minimum)
+        Checks that at least MIN_BARS_REQUIRED M1 bars exist
         and runs a single transform() smoke-test to confirm the bar data
         schema is valid. This is a READ-ONLY check — no data is stored in
         memory. The LiveEngine loads bars fresh from storage on each tick.
@@ -591,21 +564,30 @@ class Pipeline:
         results: dict[str, int] = {}
 
         for symbol in self._settings.pairs:
-            bars_df = storage.get_bars(symbol, timeframe="M1", max_rows=_WARMUP_BARS)
+            bars_df = storage.get_bars(
+                symbol, timeframe="M1", max_rows=MIN_BARS_REQUIRED
+            )
             bar_count: int = len(bars_df) if bars_df is not None else 0
 
-            if bar_count < 30:
+            if bar_count < MIN_BARS_REQUIRED:
                 raise PipelineError(
-                    f"Insufficient bars for {symbol}: {bar_count}/30 required",
+                    f"Insufficient bars for {symbol}: {bar_count}/{MIN_BARS_REQUIRED} required",
                     stage="feature_warmup",
                 )
 
             try:
-                # Smoke-test: transform the most recent 30 bars.
-                # If the bar data schema is broken this raises immediately
-                # rather than silently at the first live tick.
-                assert bars_df is not None  # guaranteed: bar_count >= 30 above
-                _ = engineer.transform(bars_df.tail(30))
+                # Smoke-test: transform the loaded bars. If the bar data schema
+                # is broken this raises immediately rather than silently at the
+                # first live tick. An empty result means MIN_BARS_REQUIRED is
+                # too low for the current feature config.
+                assert bars_df is not None
+                fe_df = engineer.transform(bars_df)
+                if fe_df.empty:
+                    raise PipelineError(
+                        f"Feature warmup produced empty DataFrame for {symbol} — "
+                        f"{MIN_BARS_REQUIRED} bars insufficient for current feature config",
+                        stage="feature_warmup",
+                    )
                 results[symbol] = bar_count
 
             except FeatureEngineerError as exc:
@@ -694,13 +676,19 @@ class Pipeline:
             Pairs with no available model are absent from the dict.
         """
         model_map: dict[tuple[str, str], Any] = {}
+        expiry_key = _SECONDS_TO_EXPIRY_KEY.get(self._settings.expiry_seconds)
+        if expiry_key is None:
+            raise PipelineError(
+                f"EXPIRY_SECONDS={self._settings.expiry_seconds} has no expiry_key mapping. "
+                f"Valid values: {sorted(_SECONDS_TO_EXPIRY_KEY.keys())}",
+                stage="model_load",
+            )
 
         for symbol in self._settings.pairs:
-            for expiry_key in _EXPIRY_KEY_MAP:
-                await self._pull_model_artifacts(symbol, expiry_key, manager)
-                result = self._load_best_model(symbol, expiry_key, manager)
-                if result is not None:
-                    model_map[(symbol, expiry_key)] = result
+            await self._pull_model_artifacts(symbol, expiry_key, manager)
+            result = self._load_best_model(symbol, expiry_key, manager)
+            if result is not None:
+                model_map[(symbol, expiry_key)] = result
 
         logger.info(
             {
@@ -977,14 +965,13 @@ class Pipeline:
             f"⏱ Expiry: <code>{self._settings.expiry_seconds}s</code>\n"
             f"🌯 Base threshold: <code>{self._settings.confidence_threshold:.0%}</code>\n"
             f"🛡 Max streak: <code>{self._settings.martingale_max_streak}</code>\n"
-            f"📡 Stream: <code>{'Quotex' if self._settings.use_quotex_streaming else 'TwelveData'}</code>"
         )
 
         # Telegram expects HTML; Discord gets a plain-text variant via
         # send_alert_async which handles its own formatting.
-        if hasattr(self._reporter, "_telegram") and self._reporter._telegram:
+        if self._reporter._telegram is not None:
             await self._reporter._telegram.send_message(message, parse_mode="HTML")
-        if hasattr(self._reporter, "_discord") and self._reporter._discord:
+        if self._reporter._discord is not None:
             plain = (
                 message.replace("<b>", "**")
                 .replace("</b>", "**")
@@ -1033,9 +1020,6 @@ class Pipeline:
         Pushes: connection status, account balance, session win/loss/draw
         counts (derived from get_history()), and pending trade count.
 
-        Only runs when USE_QUOTEX_STREAMING=True and at least one engine
-        has a connected QuotexDataStream stream. Silently skips non-Quotex
-        streams and disconnected clients.
         """
         connection_lost_logged: bool = False
         connection_restored_logged: bool = False
@@ -1222,7 +1206,6 @@ class Pipeline:
         symbol: str,
         expiry_key: str,
         manager: ModelManager,
-        storage: Storage,
         first_boot: bool,
     ) -> None:
         try:
@@ -1362,10 +1345,8 @@ class Pipeline:
 
             models_to_try = [
                 ("XGBoost", XGBoostTrainer(expiry_key=expiry_key)),
-                # ("RandomForest", RandomForestTrainer(expiry_key=expiry_key)),  # excluded: 4.67 GiB artifact breaks container boot
                 ("LightGBM", LightGBMTrainer(expiry_key=expiry_key)),
                 ("CatBoost", CatBoostTrainer(expiry_key=expiry_key)),
-                # TODO: LSTM/GRU/TCN need AUC-compatible training loop before re-enabling
             ]
 
             for model_name, trainer in models_to_try:
@@ -1376,7 +1357,6 @@ class Pipeline:
                     symbol,
                     expiry_key,
                     manager,
-                    storage,
                     first_boot,
                 )
 
@@ -1419,86 +1399,66 @@ class Pipeline:
                 f"Retrain failed for {symbol}: {exc}", event_type="kill"
             )
 
+    # ── Retrain Scheduler ─────────────────────────────────────────────────────
+
+    async def _run_retrain_cycle(
+        self,
+        storage: Storage,
+        manager: ModelManager,
+        engineer: Any,
+        is_first_run: bool,
+        now: datetime,
+        elapsed: float,
+    ) -> bool:
+        """Execute one retrain cycle. Returns updated is_first_run flag."""
+        if not is_first_run and elapsed < self._settings.model_retrain_interval:
+            return is_first_run
+
+        if is_first_run:
+            logger.info(
+                {
+                    "event": "RETRAIN_FIRST_BOOT",
+                    "message": "Checking for missing models",
+                }
+            )
+            first_boot = True
+        else:
+            logger.info(
+                {"event": "RETRAIN_CYCLE_STARTED", "elapsed_seconds": round(elapsed, 1)}
+            )
+            status_store.add_event("Retrain cycle started", event_type="info")
+            first_boot = False
+
+        for expiry_key in _EXPIRY_SECONDS:
+            for symbol in self._settings.pairs:
+                await self._retrain_symbol(
+                    symbol, expiry_key, storage, manager, engineer, first_boot
+                )
+
+        self._last_retrain_time = now
+        logger.info(
+            {
+                "event": "RETRAIN_CYCLE_COMPLETE",
+                "timestamp": now.isoformat(),
+                "symbols": self._settings.pairs,
+                "next_interval_seconds": self._settings.model_retrain_interval,
+            }
+        )
+        return False  # after first run, is_first_run is always False
+
     async def _retrain_scheduler(self, storage: Storage, manager: ModelManager) -> None:
-        """
-        Background loop that triggers periodic model retraining.
-
-        Wakes every _RETRAIN_CHECK_INTERVAL_S seconds and checks whether
-        model_retrain_interval has elapsed since the last retrain. If so,
-        runs a full training cycle for each symbol, saves the
-        artifact, and hot-reloads each matching LiveEngine.
-
-        Uses the shared Stage 1 Storage and pipeline ModelManager — does not
-        construct additional instances.
-
-        Individual symbol failures are caught and logged as warnings. The
-        scheduler continues to the next symbol and does not abort.
-
-        Args:
-            storage: Stage 1 Storage instance shared from run().
-            manager: Shared ModelManager instance owned by the pipeline.
-        """
         engineer = get_feature_engineer()
-        inv_map: dict[int, str] = _SECONDS_TO_EXPIRY_KEY
         is_first_run: bool = True
 
         while not self._shutdown_requested:
-            # First boot: run immediately without sleeping so missing models
-            # are trained as soon as engines are up. Subsequent cycles sleep
-            # for _RETRAIN_CHECK_INTERVAL_S (1 h) before re-checking.
             if not is_first_run:
                 await asyncio.sleep(_RETRAIN_CHECK_INTERVAL_S)
 
             if self._shutdown_requested:
                 break
 
-            now: datetime = datetime.now(timezone.utc)
-            elapsed: float = (now - self._last_retrain_time).total_seconds()
-
-            if not is_first_run and elapsed < self._settings.model_retrain_interval:
-                continue
-
-            first_boot = is_first_run
-            if is_first_run:
-                logger.info(
-                    {
-                        "event": "RETRAIN_FIRST_BOOT",
-                        "message": "Checking for missing models",
-                    }
-                )
-                is_first_run = False
-            else:
-                logger.info(
-                    {
-                        "event": "RETRAIN_CYCLE_STARTED",
-                        "elapsed_seconds": round(elapsed, 1),
-                    }
-                )
-                status_store.add_event("Retrain cycle started", event_type="info")
-
-            expiry_key: str | None = inv_map.get(self._settings.expiry_seconds)
-            if expiry_key is None:
-                logger.warning(
-                    {
-                        "event": "RETRAIN_SKIPPED",
-                        "reason": f"expiry_seconds={self._settings.expiry_seconds} has no key mapping",
-                    }
-                )
-                self._last_retrain_time = now
-                continue
-
-            for expiry_key in _EXPIRY_KEY_MAP:
-                for symbol in self._settings.pairs:
-                    await self._retrain_symbol(
-                        symbol, expiry_key, storage, manager, engineer, first_boot
-                    )
-
-            self._last_retrain_time = now
-            logger.info(
-                {
-                    "event": "RETRAIN_CYCLE_COMPLETE",
-                    "timestamp": now.isoformat(),
-                    "symbols": self._settings.pairs,
-                    "next_interval_seconds": self._settings.model_retrain_interval,
-                }
+            now = datetime.now(timezone.utc)
+            elapsed = (now - self._last_retrain_time).total_seconds()
+            is_first_run = await self._run_retrain_cycle(
+                storage, manager, engineer, is_first_run, now, elapsed
             )
