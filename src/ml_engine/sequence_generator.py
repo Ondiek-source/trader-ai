@@ -100,9 +100,7 @@ class SequenceGeneratorError(Exception):
         self.stage = stage
 
     def __repr__(self) -> str:  # pragma: no cover
-        return (
-            f"SequenceGeneratorError(stage={self.stage!r}, " f"message={str(self)!r})"
-        )
+        return f"SequenceGeneratorError(stage={self.stage!r}," f"message={str(self)!r})"
 
 
 # ── TimeSeriesDataset ────────────────────────────────────────────────────────

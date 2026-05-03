@@ -295,7 +295,6 @@ class Config:
     gpu_enabled: bool
 
     # ── Data source routing ──────────────────────────────────────────────
-    use_quotex_streaming: bool
     poll_interval: float
 
     # ──Infrastructure ───────────────────────────────────────────────────────
@@ -485,7 +484,6 @@ def load_config() -> Config:
         display_tz=_int("DISPLAY_TZ", 0),
         # Data source routing
         poll_interval=_parse_float("POLL_INTERVAL", default=1.0),
-        use_quotex_streaming=_bool("USE_QUOTEX_STREAMING", True),
         # Martingales
         martingale_max_streak=_int("MARTINGALE_MAX_STREAK", 4),
         martingale_step=_parse_float("MARTINGALE_STEP", default=0.02),

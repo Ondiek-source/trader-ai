@@ -1,13 +1,15 @@
 """
-engine/quotex_stream.py — Live tick stream + trade result tracking via Quotex.
+engine/quotex_stream.py — Trade execution + result tracking via Quotex.
 
-Provides the live price feed and closed-trade result matching for the
-LiveEngine. Connects to the Quotex WebSocket API via pyquotex and polls
-real-time prices at ~1 Hz. Result resolution uses balance-delta detection
-and trade history matching to reconcile executed signals with outcomes.
+Provides trade result matching for the LiveEngine. Quotex is used
+exclusively for trade execution (webhook firing, result tracking,
+balance monitoring) — NOT for price data.
+
+Price data comes from DukascopyLiveStream (engine/dukascopy_stream.py)
+which delivers complete M1 OHLCV bars with real tick volume.
 
 Classes:
-    QuotexDataStream — WebSocket connection, tick subscription, result tracking.
+    QuotexDataStream — Trade execution, result tracking, balance monitoring.
 
     Result detection strategies (tried in order):
         1. Balance-delta: monitor account balance; change at expiry = trade result.
@@ -21,7 +23,6 @@ import logging
 
 
 from typing import Any
-from ml_engine.model import Tick
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,11 @@ from pyquotex.stable_api import Quotex as _QuotexClient  # noqa: F401
 
 class QuotexDataStream:
     """
-    Connects to Quotex WebSocket and reads closed trade results.
+    Trade execution and result tracking via Quotex WebSocket.
+
+    Handles webhook firing, trade result resolution, balance monitoring,
+    and connection management. Does NOT handle price data — that comes
+    from DukascopyLiveStream.
 
     Detection strategies (tried in order):
         A) Balance-delta: fast, no API calls, reliable signal that *some* trade closed.
@@ -683,103 +688,6 @@ class QuotexDataStream:
             "pending_signals": len(self._pending),
             "result_queue_size": self._result_queue.qsize(),
         }
-
-    # ── Subscribe for LiveEngine ─────────────────────────────────────────────
-
-    def _build_tick(self, price_point: dict) -> Tick:
-        price = float(price_point["price"])
-        return Tick(
-            timestamp=datetime.fromtimestamp(price_point["time"], tz=timezone.utc),
-            symbol=self.symbol,
-            bid=price,
-            ask=price,
-            source="QUOTEX",
-        )
-
-    def _check_realtime_capability(self, asset: str, state: str) -> str:
-        """Log a one-time error if start_realtime_price is unavailable. Returns new state."""
-        if state != "degraded":
-            logger.error({"event": "STREAM_REALTIME_UNAVAILABLE", "symbol": asset})
-        return "degraded"
-
-    def _extract_price_points(self, result: Any, asset: str) -> list | None:
-        """Return price_points list from a start_realtime_price result, or None."""
-        if result and isinstance(result, dict):
-            return result.get(asset)
-        return None
-
-    def _handle_price_points(self, asset: str, state: str) -> str:
-        """Log stream-up transition. Returns updated state."""
-        if state == "degraded":
-            logger.info({"event": "STREAM_UP", "symbol": asset})
-            state = "ok"
-        return state
-
-    async def _poll_once(self, asset: str, state: str) -> tuple[str, list[Tick]]:
-        """
-        One polling iteration. Handles all sleeps internally so the caller
-        (subscribe) stays a thin generator loop with no branching.
-        Returns (updated_state, ticks_to_yield).
-        """
-        try:
-            if not hasattr(self._client, "start_realtime_price"):
-                state = self._check_realtime_capability(asset, state)
-                await asyncio.sleep(1)
-                return state, []
-
-            result = await self._client.start_realtime_price(asset, 1)
-            price_points = self._extract_price_points(result, asset)
-
-            if price_points:
-                state = self._handle_price_points(asset, state)
-                ticks = [self._build_tick(pp) for pp in price_points]
-                await asyncio.sleep(1)
-                return state, ticks
-
-            if state != "degraded":
-                logger.warning({"event": "STREAM_OFFLINE", "symbol": asset})
-                state = "degraded"
-            await asyncio.sleep(4)
-            return state, []
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            if state != "degraded":
-                logger.error(
-                    {
-                        "event": "STREAM_ERROR",
-                        "symbol": asset,
-                        "error_type": type(e).__name__,
-                        "error": str(e),
-                    }
-                )
-                state = "degraded"
-            if not self._connected:
-                logger.info({"event": "quotex_stream_reconnecting", "symbol": asset})
-                await self._reconnect()
-                if self._connected:
-                    state = "ok"
-                    logger.info({"event": "quotex_stream_reconnected", "symbol": asset})
-            await asyncio.sleep(1)
-            return state, []
-
-    async def subscribe(self):
-        """
-        Async generator that yields real-time price ticks for Quotex Pairs.
-        Since pyquotex doesn't support a real price stream, this method polls
-        the latest price every 1000 ms using start_realtime_price() with batch_size=1.
-        """
-        asset = self.symbol
-        state = "ok"
-
-        while self._connected:
-            state, ticks = await self._poll_once(asset, state)
-            for tick in ticks:
-                yield tick
-
-        if hasattr(self._client, "stop_candles_stream"):
-            self._client.stop_candles_stream(asset)
 
     # ── Reconnection ──────────────────────────────────────────────────────────
 

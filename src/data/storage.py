@@ -15,8 +15,6 @@ Design Document: docs/Core/Storage/Storage.md
 from __future__ import annotations
 
 
-import os
-import inspect
 import logging
 import threading
 import pandas as pd
@@ -190,7 +188,9 @@ class Storage:
                 failure. The underlying Azure SDK exception is logged before exit.
         """
         if self._settings.data_mode != "CLOUD":
-            logger.debug({"event": "AZURE_BLOB_SKIPPED", "mode": self._settings.data_mode})
+            logger.debug(
+                {"event": "AZURE_BLOB_SKIPPED", "mode": self._settings.data_mode}
+            )
             return None
         try:
             service: BlobServiceClient = BlobServiceClient.from_connection_string(
@@ -442,12 +442,24 @@ class Storage:
                 f"Each batch must contain ticks for a single symbol only."
             )
 
-        logger.debug({"event": "STORAGE_TICK_BATCH_COMMIT", "symbol": symbol, "count": len(ticks)})
+        logger.debug(
+            {
+                "event": "STORAGE_TICK_BATCH_COMMIT",
+                "symbol": symbol,
+                "count": len(ticks),
+            }
+        )
 
         with self._get_file_lock(file_path):
             self._atomic_upsert(file_path, new_data)
 
-        logger.info({"event": "STORAGE_TICK_BATCH_COMMITTED", "symbol": symbol, "count": len(ticks)})
+        logger.info(
+            {
+                "event": "STORAGE_TICK_BATCH_COMMITTED",
+                "symbol": symbol,
+                "count": len(ticks),
+            }
+        )
         # Sync to Azure if in CLOUD mode, but do not fail the write if the upload fails — the local file is the source of truth and can be re-synced later if needed.
         if self._container_client is not None:
             blob_name = f"raw/{symbol}_ticks.parquet"
@@ -455,9 +467,18 @@ class Storage:
                 blob_client = self._container_client.get_blob_client(blob_name)
                 with open(file_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
-                logger.debug({"event": "STORAGE_AZURE_SYNC", "blob": blob_name, "symbol": symbol})
+                logger.debug(
+                    {"event": "STORAGE_AZURE_SYNC", "blob": blob_name, "symbol": symbol}
+                )
             except Exception as e:
-                logger.warning({"event": "STORAGE_AZURE_SYNC_FAILED", "blob": blob_name, "symbol": symbol, "error": str(e)})
+                logger.warning(
+                    {
+                        "event": "STORAGE_AZURE_SYNC_FAILED",
+                        "blob": blob_name,
+                        "symbol": symbol,
+                        "error": str(e),
+                    }
+                )
         return True
 
     def save_bar(self, bar: Bar) -> bool:
@@ -489,14 +510,32 @@ class Storage:
         file_path: Path = self._processed_path(bar.symbol, bar.timeframe.value)
         new_data: pd.DataFrame = pd.DataFrame([bar.to_dict()])
         if not bar.is_complete:
-            logger.warning({"event": "STORAGE_INCOMPLETE_BAR", "symbol": bar.symbol, "timeframe": bar.timeframe.value})
+            logger.warning(
+                {
+                    "event": "STORAGE_INCOMPLETE_BAR",
+                    "symbol": bar.symbol,
+                    "timeframe": bar.timeframe.value,
+                }
+            )
             return False
-        logger.debug({"event": "STORAGE_BAR_COMMIT", "symbol": bar.symbol, "timeframe": bar.timeframe.value})
+        logger.debug(
+            {
+                "event": "STORAGE_BAR_COMMIT",
+                "symbol": bar.symbol,
+                "timeframe": bar.timeframe.value,
+            }
+        )
 
         with self._get_file_lock(file_path):
             self._atomic_upsert(file_path, new_data)
 
-        logger.info({"event": "STORAGE_BAR_COMMITTED", "symbol": bar.symbol, "timeframe": bar.timeframe.value})
+        logger.info(
+            {
+                "event": "STORAGE_BAR_COMMITTED",
+                "symbol": bar.symbol,
+                "timeframe": bar.timeframe.value,
+            }
+        )
         return True
 
     # ── Public: Azure Sync ────────────────────────────────────────────────────
@@ -534,11 +573,19 @@ class Storage:
             return False
 
         if not local_path.exists():
-            logger.error({"event": "STORAGE_AZURE_SYNC_FILE_MISSING", "path": str(local_path)})
+            logger.error(
+                {"event": "STORAGE_AZURE_SYNC_FILE_MISSING", "path": str(local_path)}
+            )
 
         target_blob: str = blob_name or local_path.name
         try:
-            logger.info({"event": "STORAGE_AZURE_SYNC_START", "local": local_path.name, "blob": target_blob})
+            logger.info(
+                {
+                    "event": "STORAGE_AZURE_SYNC_START",
+                    "local": local_path.name,
+                    "blob": target_blob,
+                }
+            )
             blob_client = self._container_client.get_blob_client(target_blob)
             with open(local_path, "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
@@ -546,7 +593,13 @@ class Storage:
             return True
 
         except Exception as e:
-            logger.error({"event": "STORAGE_AZURE_SYNC_FAILED", "blob": target_blob, "error": str(e)})
+            logger.error(
+                {
+                    "event": "STORAGE_AZURE_SYNC_FAILED",
+                    "blob": target_blob,
+                    "error": str(e),
+                }
+            )
             return False
 
     def pull_from_azure(self, blob_name: str, local_path: Path) -> bool:
@@ -592,7 +645,13 @@ class Storage:
             return True
 
         except Exception as e:
-            logger.error({"event": "STORAGE_AZURE_PULL_FAILED", "blob": blob_name, "error": str(e)})
+            logger.error(
+                {
+                    "event": "STORAGE_AZURE_PULL_FAILED",
+                    "blob": blob_name,
+                    "error": str(e),
+                }
+            )
             return False
 
     # ── Public: Model Persistence ─────────────────────────────────────────────
@@ -632,13 +691,24 @@ class Storage:
         """
         if self._container_client is None:
             if not Storage._local_mode_warned:
-                logger.warning({"event": "STORAGE_SAVE_MODEL_DISABLED", "mode": "LOCAL", "message": "Running in LOCAL mode — model uploads disabled for this session"})
+                logger.warning(
+                    {
+                        "event": "STORAGE_SAVE_MODEL_DISABLED",
+                        "mode": "LOCAL",
+                        "message": "Running in LOCAL mode — model uploads disabled for this session",
+                    }
+                )
                 Storage._local_mode_warned = True
             return False
 
         for local_path in (artifact_path, metadata_path):
             if not local_path.exists():
-                logger.error({"event": "STORAGE_SAVE_MODEL_FILE_MISSING", "path": str(local_path)})
+                logger.error(
+                    {
+                        "event": "STORAGE_SAVE_MODEL_FILE_MISSING",
+                        "path": str(local_path),
+                    }
+                )
                 return False
 
         try:
@@ -649,11 +719,19 @@ class Storage:
                 with open(local_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
 
-            logger.info({"event": "STORAGE_SAVE_MODEL_COMPLETE", "artifact": artifact_path.name})
+            logger.info(
+                {"event": "STORAGE_SAVE_MODEL_COMPLETE", "artifact": artifact_path.name}
+            )
             return True
 
         except Exception as e:
-            logger.error({"event": "STORAGE_SAVE_MODEL_FAILED", "artifact": artifact_path.name, "error": str(e)})
+            logger.error(
+                {
+                    "event": "STORAGE_SAVE_MODEL_FAILED",
+                    "artifact": artifact_path.name,
+                    "error": str(e),
+                }
+            )
             return False
 
     def load_model(
@@ -717,11 +795,19 @@ class Storage:
                     download_file.write(blob_client.download_blob().readall())
 
             local_artifact: Path = dest_dir / artifact_filename
-            logger.info({"event": "STORAGE_LOAD_MODEL_COMPLETE", "artifact": artifact_filename})
+            logger.info(
+                {"event": "STORAGE_LOAD_MODEL_COMPLETE", "artifact": artifact_filename}
+            )
             return local_artifact
 
         except Exception as e:
-            logger.error({"event": "STORAGE_LOAD_MODEL_FAILED", "artifact": artifact_filename, "error": str(e)})
+            logger.error(
+                {
+                    "event": "STORAGE_LOAD_MODEL_FAILED",
+                    "artifact": artifact_filename,
+                    "error": str(e),
+                }
+            )
             return None
 
     def save_processed_features(
@@ -763,25 +849,53 @@ class Storage:
             True
         """
         if self._container_client is None:
-            logger.warning({"event": "STORAGE_FEATURES_UPLOAD_DISABLED", "mode": "LOCAL"})
+            logger.warning(
+                {"event": "STORAGE_FEATURES_UPLOAD_DISABLED", "mode": "LOCAL"}
+            )
             return False
 
         if not local_path.exists():
-            logger.error({"event": "STORAGE_FEATURES_UPLOAD_FILE_MISSING", "symbol": symbol, "expiry_key": expiry_key})
+            logger.error(
+                {
+                    "event": "STORAGE_FEATURES_UPLOAD_FILE_MISSING",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                }
+            )
             return False
 
         blob_name = f"processed/{symbol}_{expiry_key}_features.parquet"
         try:
-            logger.info({"event": "STORAGE_FEATURES_UPLOAD_START", "symbol": symbol, "expiry_key": expiry_key, "blob": blob_name})
+            logger.info(
+                {
+                    "event": "STORAGE_FEATURES_UPLOAD_START",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "blob": blob_name,
+                }
+            )
             blob_client = self._container_client.get_blob_client(blob_name)
             with open(local_path, "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
 
-            logger.info({"event": "STORAGE_FEATURES_UPLOAD_COMPLETE", "symbol": symbol, "expiry_key": expiry_key})
+            logger.info(
+                {
+                    "event": "STORAGE_FEATURES_UPLOAD_COMPLETE",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                }
+            )
             return True
 
         except Exception as e:
-            logger.error({"event": "STORAGE_FEATURES_UPLOAD_FAILED", "symbol": symbol, "expiry_key": expiry_key, "error": str(e)})
+            logger.error(
+                {
+                    "event": "STORAGE_FEATURES_UPLOAD_FAILED",
+                    "symbol": symbol,
+                    "expiry_key": expiry_key,
+                    "error": str(e),
+                }
+            )
             return False
 
     # ── Public: Read / Query Operations ──────────────────────────────────────
@@ -1034,19 +1148,39 @@ class Storage:
                 df = self._read_bar_df(pf, symbol, timeframe, max_rows)
 
                 if df.empty:
-                    logger.warning({"event": "STORAGE_EMPTY_BAR_DATAFRAME", "symbol": symbol, "timeframe": timeframe})
+                    logger.warning(
+                        {
+                            "event": "STORAGE_EMPTY_BAR_DATAFRAME",
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                        }
+                    )
                     return None
 
                 df = self._validate_and_index_bar_df(
                     df, symbol, timeframe, file_path, max_rows
                 )
-                logger.info({"event": "STORAGE_BARS_LOADED", "symbol": symbol, "timeframe": timeframe, "count": len(df)})
+                logger.info(
+                    {
+                        "event": "STORAGE_BARS_LOADED",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "count": len(df),
+                    }
+                )
                 return df
 
             except StorageError:
                 raise
             except Exception as e:
-                logger.error({"event": "STORAGE_BAR_FILE_CORRUPTED", "symbol": symbol, "timeframe": timeframe, "error": str(e)})
+                logger.error(
+                    {
+                        "event": "STORAGE_BAR_FILE_CORRUPTED",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "error": str(e),
+                    }
+                )
                 raise StorageError(
                     f"Bar file for {symbol} [{timeframe}] is corrupted and cannot be read.",
                     symbol=symbol,
@@ -1090,7 +1224,12 @@ class Storage:
         # Guard: single symbol per batch (mirrors save_tick_batch contract)
         symbols_in_batch: set[str] = {b.symbol for b in bars}
         if len(symbols_in_batch) > 1:
-            logger.error({"event": "STORAGE_MIXED_SYMBOLS_BAR_BATCH", "symbols": list(symbols_in_batch)})
+            logger.error(
+                {
+                    "event": "STORAGE_MIXED_SYMBOLS_BAR_BATCH",
+                    "symbols": list(symbols_in_batch),
+                }
+            )
             raise ValueError(
                 f"save_bar_batch received mixed symbols: {symbols_in_batch}. "
                 f"Each batch must contain bars for a single symbol only."
@@ -1099,7 +1238,12 @@ class Storage:
         # Guard: single timeframe per batch (one file per symbol+timeframe)
         timeframes_in_batch: set[str] = {b.timeframe.value for b in bars}
         if len(timeframes_in_batch) > 1:
-            logger.error({"event": "STORAGE_MIXED_TIMEFRAMES_BAR_BATCH", "timeframes": list(timeframes_in_batch)})
+            logger.error(
+                {
+                    "event": "STORAGE_MIXED_TIMEFRAMES_BAR_BATCH",
+                    "timeframes": list(timeframes_in_batch),
+                }
+            )
             raise ValueError(
                 f"save_bar_batch received mixed timeframes: {timeframes_in_batch}. "
                 f"Each batch must contain bars for a single timeframe only."
@@ -1109,12 +1253,26 @@ class Storage:
         timeframe: str = bars[0].timeframe.value
         file_path: Path = self._processed_path(symbol, timeframe)
         new_data: pd.DataFrame = pd.DataFrame([b.to_dict() for b in bars])
-        logger.debug({"event": "STORAGE_BAR_BATCH_COMMIT", "symbol": symbol, "timeframe": timeframe, "count": len(bars)})
+        logger.debug(
+            {
+                "event": "STORAGE_BAR_BATCH_COMMIT",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": len(bars),
+            }
+        )
 
         with self._get_file_lock(file_path):
             self._atomic_upsert(file_path, new_data)
 
-        logger.info({"event": "STORAGE_BAR_BATCH_COMMITTED", "symbol": symbol, "timeframe": timeframe, "count": len(bars)})
+        logger.info(
+            {
+                "event": "STORAGE_BAR_BATCH_COMMITTED",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": len(bars),
+            }
+        )
 
         if self._container_client is not None:
             blob_name = f"processed/{symbol}_{timeframe}.parquet"
@@ -1122,9 +1280,17 @@ class Storage:
                 blob_client = self._container_client.get_blob_client(blob_name)
                 with open(file_path, "rb") as data:
                     blob_client.upload_blob(data, overwrite=True)
-                logger.info({"event": "STORAGE_BAR_BATCH_AZURE_SYNC", "blob": blob_name})
+                logger.info(
+                    {"event": "STORAGE_BAR_BATCH_AZURE_SYNC", "blob": blob_name}
+                )
             except Exception as e:
-                logger.warning({"event": "STORAGE_BAR_BATCH_AZURE_SYNC_FAILED", "blob": blob_name, "error": str(e)})
+                logger.warning(
+                    {
+                        "event": "STORAGE_BAR_BATCH_AZURE_SYNC_FAILED",
+                        "blob": blob_name,
+                        "error": str(e),
+                    }
+                )
 
         return True
 

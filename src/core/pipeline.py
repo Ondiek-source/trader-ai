@@ -12,6 +12,10 @@ constructs one Pipeline instance and calls await pipeline.run(). Everything
 else — Storage, Historian, FeatureEngineer, ModelManager, LiveEngine,
 retrain scheduling — is owned and orchestrated from here.
 
+Each LiveEngine owns two streams:
+  - DukascopyLiveStream (price): live M1 bars with real tick volume
+  - QuotexDataStream (trade): trade execution + result tracking only
+
 Boot sequence
 -------------
 The five stages execute in strict dependency order. Any failure in Stages
@@ -218,8 +222,10 @@ class Pipeline:
         )
 
         for engine in self._engines:
-            if hasattr(engine._stream, "disconnect"):
-                await engine._stream.disconnect()
+            if hasattr(engine, "_price_stream"):
+                engine._price_stream.disconnect()          # sync
+            if hasattr(engine, "_trade_stream"):
+                await engine._trade_stream.disconnect()     # async
             engine.stop()
 
         for task in self._tasks:
@@ -1020,20 +1026,17 @@ class Pipeline:
         Pushes: connection status, account balance, session win/loss/draw
         counts (derived from get_history()), and pending trade count.
 
+        Quotex is always the trade stream — no config check needed.
         """
         connection_lost_logged: bool = False
         connection_restored_logged: bool = False
-
-        if not self._settings.use_quotex_streaming:
-            logger.info({"event": "QUOTEX_STATUS_DISABLED"})
-            return
 
         # Give QuotexDataStream time to connect before first poll.
         await asyncio.sleep(30)
 
         while not self._shutdown_requested:
             try:
-                stream = self._engines[0]._stream if self._engines else None
+                stream = self._engines[0]._trade_stream if self._engines else None
                 if stream is None or not hasattr(stream, "_connected"):
                     await asyncio.sleep(30)
                     continue

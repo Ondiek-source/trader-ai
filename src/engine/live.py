@@ -17,8 +17,9 @@ SignalGenerator, WebhookSender, Reporter, and Journal.
 
 Stream routing
 --------------
-Live ticks are sourced exclusively from Quotex via QuotexDataStream.
-Symbol translation (EUR_USD -> EURUSD) is done by config.quotex_symbols.
+Two streams run in parallel:
+  - DukascopyLiveStream (price): live M1 bars with real tick volume
+  - QuotexDataStream (trade): trade execution + result tracking only
 
 Cold-start
 ----------
@@ -47,7 +48,7 @@ columns = ~40KB per call. This is negligible. The risk is transform()
 being called on a large DataFrame unnecessarily — we cap at _BAR_WINDOW
 and transform() runs on that capped frame, not the full history.
 
-Feature DataFrames are local to _process_tick() and are garbage
+Feature DataFrames are local to _process_bar() and are garbage
 collected after each bar. No feature data accumulates in memory across
 ticks.
 
@@ -57,11 +58,11 @@ Storage owns its own threading.Lock and serialises all Parquet I/O.
 FeatureEngineer is stateless and thread-safe by design (documented in
 features.py). SignalGenerator holds mutable state (_model, _record) and
 must not be called concurrently — the asyncio single-threaded event loop
-guarantees this since _process_tick() is awaited sequentially.
+guarantees this since _process_bar() is awaited sequentially.
 
 reload_model() is the one unsafe operation: it mutates SignalGenerator
 state while the loop may be between ticks. pipeline.py must call it
-only when the loop is between _process_tick() calls, which is guaranteed
+only when the loop is between _process_bar() calls, which is guaranteed
 if it is called from another asyncio task (the event loop serialises
 coroutines). Do NOT call reload_model() from a separate OS thread.
 
@@ -103,8 +104,8 @@ from ml_engine.features import (
     get_feature_engineer,
     MIN_BARS_REQUIRED,
 )
-from engine.bar_builder import LiveBarBuilder
-from ml_engine.model import Bar, Tick as ModelTick
+from ml_engine.model import Bar
+from engine.dukascopy_stream import DukascopyLiveStream
 from ml_engine.model_manager import ModelManager
 from engine.quotex_stream import QuotexDataStream
 from trading.signals import SignalGenerator, SignalGeneratorError, TradeSignal
@@ -209,16 +210,10 @@ class LiveEngine:
         self._ticks_processed: int = 0
         self._signals_fired: int = 0
 
-        # M1 bar-close gate: only run inference when the UTC minute advances.
-        # -1 ensures the very first tick of a session is always processed.
-        self._last_processed_minute: int = -1
 
-        # Live bar builder: accumulates ticks into a completed M1 OHLCV bar so
-        # every inference cycle runs on fresh price data rather than static Parquet.
-        self._bar_builder: LiveBarBuilder = LiveBarBuilder(symbol=self.symbol)
 
         # Reload lock: prevents reload_model() from mutating SignalGenerator
-        # state while _process_tick() is mid-inference. Both the asyncio
+        # state while _process_bar() is mid-inference. Both the asyncio
         # event loop and any pipeline.py coroutine use this.
         self._reload_lock: asyncio.Lock = asyncio.Lock()
         # Inter-trade cooldown: minimum seconds between executed signals.
@@ -239,8 +234,9 @@ class LiveEngine:
         # Stateless and thread-safe — shared across all LiveEngine instances.
         self._engineer: FeatureEngineer = get_feature_engineer()
 
-        # ── 3. Stream (fail-hard) ─────────────────────────────────────────
-        self._stream: Any = self._init_stream()
+        # ── 3. Streams (fail-hard) ────────────────────────────────────────
+        self._price_stream: DukascopyLiveStream = self._init_price_stream()
+        self._trade_stream: Any = self._init_trade_stream()
 
         # ── 4. Model Manager + cold-start ─────────────────────────────────
         # Use injected instance when available so the whole pipeline shares
@@ -284,7 +280,8 @@ class LiveEngine:
                 "event": "LIVE_ENGINE_READY",
                 "symbol": self.symbol,
                 "expiry_key": self.expiry_key,
-                "stream": type(self._stream).__name__,
+                "price_stream": type(self._price_stream).__name__,
+                "trade_stream": type(self._trade_stream).__name__,
                 "model": (
                     "LOADED" if self._signal_gen._model is not None else "SKIP_MODE"
                 ),
@@ -319,13 +316,13 @@ class LiveEngine:
         # Create instance (__init__ does NOT call _cold_start)
         engine = cls(symbol, expiry_key, model_manager=model_manager)
 
-        # Connect the stream if it's QuotexDataStream
-        if hasattr(engine._stream, "connect"):
-            connected = await engine._stream.connect()
-            if not connected:
-                raise LiveEngineError(
-                    f"Failed initial connection to Quotex for {symbol}"
-                )
+        # Connect both streams
+        engine._price_stream.connect()                      # sync
+        connected = await engine._trade_stream.connect()     # async
+        if not connected:
+            raise LiveEngineError(
+                f"Failed initial connection to Quotex for {symbol}"
+            )
 
         # Now await the async cold start to pull the model artifact before the inference loop starts.
         await engine._cold_start()
@@ -337,24 +334,46 @@ class LiveEngine:
 
         return engine
 
-    def _init_stream(self) -> QuotexDataStream:
+    def _init_price_stream(self) -> DukascopyLiveStream:
         """
-        Construct the correct live tick stream from config.
-
-        Quotex is used for live ticks when USE_QUOTEX_STREAMING=True.
+        Construct the Dukascopy live bar stream for price data.
 
         Returns:
-            Stream instance with a subscribe() async generator method.
+            DukascopyLiveStream instance.
 
         Raises:
-            LiveEngineError: If the stream cannot be constructed. This is
-                fatal — the engine cannot run without a tick source.
+            LiveEngineError: If the stream cannot be constructed.
+        """
+        try:
+            logger.info(
+                {
+                    "event": "PRICE_STREAM_INITIALIZED",
+                    "symbol": self.symbol,
+                    "type": "DukascopyLiveStream",
+                }
+            )
+            return DukascopyLiveStream(symbol=self.symbol)
+        except Exception as exc:
+            raise LiveEngineError(
+                f"Dukascopy stream construction failed for {self.symbol}: {exc}",
+                stage="init_price_stream",
+            ) from exc
+
+    def _init_trade_stream(self) -> QuotexDataStream:
+        """
+        Construct the Quotex trade execution stream.
+
+        Returns:
+            QuotexDataStream instance.
+
+        Raises:
+            LiveEngineError: If the stream cannot be constructed.
         """
         try:
             symbol: str = self._settings.quotex_symbols[self.symbol]
             logger.info(
                 {
-                    "event": "STREAM_INITIALIZED",
+                    "event": "TRADE_STREAM_INITIALIZED",
                     "symbol": self.symbol,
                     "type": "QuotexDataStream",
                 }
@@ -367,8 +386,8 @@ class LiveEngine:
             )
         except Exception as exc:
             raise LiveEngineError(
-                f"Stream construction failed for {self.symbol}: {exc}",
-                stage="init_stream",
+                f"Quotex stream construction failed for {self.symbol}: {exc}",
+                stage="init_trade_stream",
             ) from exc
 
     async def _cold_start(self) -> None:
@@ -494,9 +513,9 @@ class LiveEngine:
 
         Subscribes to the tick stream and processes each tick through the
         full pipeline. Runs until stop() is called, _MAX_CONSECUTIVE_ERRORS
-        is exceeded, or a fatal StorageError propagates from _process_tick().
+        is exceeded, or a fatal StorageError propagates from _process_bar().
 
-        Per-bar recoverable errors are caught inside _process_tick() and
+        Per-bar recoverable errors are caught inside _process_bar() and
         increment self._consecutive_errors. If _MAX_CONSECUTIVE_ERRORS is
         reached, the engine self-terminates to prevent a silent infinite
         loop of failures.
@@ -514,7 +533,8 @@ class LiveEngine:
                 "event": "LIVE_ENGINE_STARTING",
                 "symbol": self.symbol,
                 "expiry_key": self.expiry_key,
-                "stream": type(self._stream).__name__,
+                "price_stream": type(self._price_stream).__name__,
+                "trade_stream": type(self._trade_stream).__name__,
             }
         )
         self.is_running = True
@@ -528,7 +548,7 @@ class LiveEngine:
 
         # Start result consumer task (only for Quotex)
         result_task = None
-        if hasattr(self._stream, "get_result"):
+        if hasattr(self._trade_stream, "get_result"):
             result_task = asyncio.create_task(self._consume_results())
             logger.info(
                 {
@@ -537,8 +557,8 @@ class LiveEngine:
             )
         # Start result producer task (only for Quotex) — resolves pending signals
         result_producer_task = None
-        if hasattr(self._stream, "poll_results"):
-            result_producer_task = asyncio.create_task(self._stream.poll_results())
+        if hasattr(self._trade_stream, "poll_results"):
+            result_producer_task = asyncio.create_task(self._trade_stream.poll_results())
             logger.info(
                 {
                     "event": "LIVE_ENGINE_RESULT_PRODUCER_STARTED",
@@ -549,11 +569,11 @@ class LiveEngine:
         midnight_task = asyncio.create_task(self._midnight_reset_loop())
 
         try:
-            async for tick in self._stream.subscribe():
+            async for bar in self._price_stream.subscribe():
                 if not self.is_running:
                     break
 
-                await self._process_tick(tick)
+                await self._process_bar(bar)
 
                 # Self-termination guard: if too many consecutive errors
                 # have accumulated, something is structurally wrong.
@@ -602,25 +622,18 @@ class LiveEngine:
                 }
             )
 
-    async def _process_tick(self, tick: Any) -> None:
+    async def _process_bar(self, bar: Bar) -> None:
         """
-        Process a single tick through the full inference pipeline.
+        Process a single completed M1 bar through the full inference pipeline.
+
+        The bar arrives complete from Dukascopy — no tick accumulation,
+        no minute gating, no live bar builder needed.
 
         All per-bar recoverable errors are caught here, logged with a
-        warning_block, and the method returns early. The caller (run())
-        continues on the next tick. Fatal StorageError propagates.
-
-        OOM note: bars_df and fe_df are local to this method and are
-        garbage collected after each call. No feature data accumulates
-        across ticks.
-
-        Thread safety note: _signal_gen.generate() is called sequentially
-        in the asyncio event loop. The asyncio.Lock in reload_model()
-        prevents reload_model() from mutating _signal_gen state while
-        this method is between awaits.
+        warning, and the method returns early. Fatal StorageError propagates.
 
         Args:
-            tick: Tick object from the stream. Type varies by stream.
+            bar: Complete M1 Bar from DukascopyLiveStream.
         """
         self._ticks_processed += 1
 
@@ -628,83 +641,26 @@ class LiveEngine:
         if self._halted_until_tomorrow:
             return
 
-        # ── Accumulate tick into the live bar builder ─────────────────────
-        # Every tick updates the in-progress M1 OHLCV bar so that when the
-        # minute gate fires, the bar is built from real price data rather than
-        # being absent entirely.  Ticks that arrive before a valid ModelTick
-        # can be constructed (e.g. from streams that pass raw dicts) are skipped.
-        if isinstance(tick, ModelTick):
-            self._bar_builder.add_tick(tick)
-
-        # ── M1 bar-close gate ─────────────────────────────────────────────
-        # QuotexDataStream polls every ~1 s. Without this guard the full feature
-        # engineering + model inference pipeline fires ~60× per minute.
-        # We run inference exactly once per UTC minute (i.e. once per M1 bar).
-        _now_minute = datetime.now(timezone.utc).minute
-        if _now_minute == self._last_processed_minute:
-            return
-        self._last_processed_minute = _now_minute
-        self._reporter.push_dashboard(self._build_context("tick"))
-
-        # ── 1. Load recent bars (capped at _BAR_WINDOW - 1) ──────────────
-        # We reserve one slot for the live bar built from this minute's ticks.
-        # StorageError propagates to run() as a fatal failure.
+        # ── 1. Load recent bars from storage (reserve 1 slot for live bar) ──
         bars_df: pd.DataFrame | None = self._storage.get_bars(
             symbol=self.symbol,
             timeframe=_TIMEFRAME_MAP.get(self.expiry_key, "M1"),
             max_rows=_BAR_WINDOW - 1,
         )
-
         if bars_df is None or bars_df.empty:
-            logger.debug(
-                {
-                    "event": "TICK_PROCESSING_NO_BARS",
-                    "symbol": self.symbol,
-                    "message": f"No M1 bars for {self.symbol} - awaiting first bar",
-                }
-            )
-            self._bar_builder.close_and_reset(pd.DatetimeIndex([]))
+            self._storage.save_bar(bar)
             return
 
-        # Narrow from DataFrame | None to DataFrame for the rest of this scope.
-        hist_bars: pd.DataFrame = bars_df
+        # ── 2. Save the live bar to storage ──────────────────────────────
+        self._storage.save_bar(bar)
 
-        # ── 2. Close the live bar and append it to the historical window ──
-        # close_and_reset() finalises the bar built from this minute's ticks and
-        # returns the ticks DataFrame for micro-structure feature engineering.
-        live_bar_df, ticks_df = self._bar_builder.close_and_reset(
-            pd.DatetimeIndex(hist_bars.index)
-        )
-        if live_bar_df is not None:
-            merged: pd.DataFrame = pd.concat([hist_bars, live_bar_df])
-            # Drop duplicate timestamps if historian already wrote this bar.
-            deduped: pd.DataFrame = merged.loc[~merged.index.duplicated(keep="last")]
-            hist_bars = deduped.sort_index()
-            # Write to disk so the next minute's get_bars() returns a rolling window.
-            try:
-                _row = live_bar_df.iloc[0]
-                _bar_ts: pd.Timestamp = pd.DatetimeIndex(live_bar_df.index)[0]  # type: ignore[assignment]
-                self._storage.save_bar(
-                    Bar(
-                        timestamp=_bar_ts,
-                        symbol=self.symbol,
-                        open=float(_row["open"]),
-                        high=float(_row["high"]),
-                        low=float(_row["low"]),
-                        close=float(_row["close"]),
-                        volume=float(_row["volume"]),
-                    )
-                )
-            except Exception as _exc:
-                logger.debug(
-                    {
-                        "event": "LIVE_BAR_PERSIST_FAILED",
-                        "symbol": self.symbol,
-                        "error": str(_exc),
-                    }
-                )
+        # ── 3. Append live bar to historical window ──────────────────────
+        bar_row = pd.DataFrame([bar.to_dict()]).set_index("timestamp")
+        hist_bars = pd.concat([bars_df, bar_row])
+        hist_bars = hist_bars[~hist_bars.index.duplicated(keep="last")]
+        hist_bars = hist_bars.sort_index()
 
-        # ── 3. Minimum bars warmup guard ──────────────────────────────────
+        # ── 4. Warmup guard ──────────────────────────────────────────────
         if len(hist_bars) < MIN_BARS_REQUIRED:
             logger.debug(
                 {
@@ -712,13 +668,13 @@ class LiveEngine:
                     "bars_loaded": len(hist_bars),
                     "bars_required": MIN_BARS_REQUIRED,
                     "symbol": self.symbol,
-                    "message": f"Warmup {len(hist_bars)}/{MIN_BARS_REQUIRED} bars for {self.symbol}",
                 }
             )
             return
 
-        # ── 4. Feature engineering ────────────────────────────────────────
+        self._reporter.push_dashboard(self._build_context("tick"))
 
+        # ── 5. Feature engineering ────────────────────────────────────────
         try:
             fv = self._engineer.get_latest(
                 hist_bars,
@@ -729,19 +685,17 @@ class LiveEngine:
                 {
                     "event": "FEATURE_ENGINEERING_FAILED",
                     "symbol": self.symbol,
-                    "bars_loaded": len(bars_df),
+                    "bars_loaded": len(hist_bars),
                     "error": str(exc),
                 }
             )
             self._consecutive_errors += 1
             return
 
-        # ── 4. Signal generation (gate check + model inference) ───────────
+        # ── 6. Signal generation ──────────────────────────────────────────
         try:
             async with self._reload_lock:
-                signal: TradeSignal = self._signal_gen.generate(
-                    fv=fv,
-                )
+                signal: TradeSignal = self._signal_gen.generate(fv=fv)
         except SignalGeneratorError as exc:
             logger.warning(
                 {
@@ -754,25 +708,22 @@ class LiveEngine:
             self._consecutive_errors += 1
             return
 
-        # Reset consecutive error counter on a successful inference.
         self._consecutive_errors = 0
+
         if signal.direction != "SKIP":
             self._reporter.push_dashboard(self._build_context("signal", signal=signal))
         else:
             self._reporter.push_dashboard(self._build_context("skip", signal=signal))
 
-        # ── 5. Journal every signal (including SKIP) ──────────────────────
+        # ── 7. Journal every signal (including SKIP) ──────────────────────
         self._write_journal(signal)
 
-        # ── 6. Kill switch gate ───────────────────────────────────────────
+        # ── 8. Kill switch gate ───────────────────────────────────────────
         if self._threshold_mgr.is_halted():
             self._on_kill_switch_activated()
             return
 
-        # ── 7. Execute only if signal is actionable ───────────────────────
-        # is_executable() checks direction != SKIP only — the model's
-        # confidence threshold is the sole filter; no redundant gate check.
-        # Inter-trade cooldown prevents firing before the previous trade settles.
+        # ── 9. Execute only if signal is actionable ───────────────────────
         if signal.is_executable():
             now = datetime.now(timezone.utc)
             if (
@@ -852,10 +803,10 @@ class LiveEngine:
             ) from exc
 
         # Register signal for result tracking via Quotex history matching
-        if hasattr(self._stream, "register_pending"):
+        if hasattr(self._trade_stream, "register_pending"):
             expiry_seconds = _EXPIRY_SECONDS.get(signal.expiry_key, 60)
             expiry_time = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
-            self._stream.register_pending(
+            self._trade_stream.register_pending(
                 signal_id=f"{signal.symbol}_{int(datetime.now(timezone.utc).timestamp())}",
                 signal={
                     "pair": signal.symbol,
@@ -922,7 +873,7 @@ class LiveEngine:
 
         Called when ThresholdManager.is_halted() returns True, either
         because consume_result() just crossed the max_streak threshold or
-        because _process_tick() detected the halted state after a tick.
+        because _process_bar() detected the halted state after a tick.
         """
         logger.critical(
             {
@@ -955,10 +906,10 @@ class LiveEngine:
         Returns:
             Flat dict with all fields Reporter.push_dashboard() needs.
         """
-        connected = bool(getattr(self._stream, "_connected", True))
-        balance = float(getattr(self._stream, "_balance", 0.0))
+        connected = bool(getattr(self._trade_stream, "_connected", True))
+        balance = float(getattr(self._trade_stream, "_balance", 0.0))
 
-        pending_count = len(getattr(self._stream, "_pending", {}))
+        pending_count = len(getattr(self._trade_stream, "_pending", {}))
 
         return {
             "event_type": event_type,
@@ -1126,13 +1077,13 @@ class LiveEngine:
         """Background task to consume trade results from QuotexDataStream."""
         while self.is_running:
             try:
-                if not hasattr(self._stream, "get_result"):
+                if not hasattr(self._trade_stream, "get_result"):
                     await asyncio.sleep(1)
                     continue
 
                 try:
                     async with asyncio.timeout(0.5):
-                        result: dict[str, Any] | None = await self._stream.get_result()
+                        result: dict[str, Any] | None = await self._trade_stream.get_result()
                 except TimeoutError:
                     result = None
                 if result:
@@ -1164,7 +1115,7 @@ class LiveEngine:
 
         Sets is_running=False which is checked at the top of the async for
         loop in run(). The loop exits cleanly after the current
-        _process_tick() call returns. Does not cancel the asyncio task —
+        _process_bar() call returns. Does not cancel the asyncio task —
         call task.cancel() from pipeline.py for immediate termination.
         """
         logger.info(
@@ -1182,7 +1133,7 @@ class LiveEngine:
 
         Called by pipeline.py after a retraining run completes. Acquires
         the asyncio reload lock before mutating SignalGenerator state to
-        prevent a race with _process_tick() which also holds the lock
+        prevent a race with _process_bar() which also holds the lock
         during generate(). Safe to call from any asyncio coroutine.
 
         DO NOT call this from a separate OS thread — use asyncio.run_coroutine_threadsafe()
@@ -1226,6 +1177,7 @@ class LiveEngine:
             f"symbol={self.symbol!r}, "
             f"expiry={self.expiry_key!r}, "
             f"running={self.is_running}, "
-            f"stream={type(self._stream).__name__!r}, "
+            f"price_stream={type(self._price_stream).__name__!r}, "
+            f"trade_stream={type(self._trade_stream).__name__!r}, "
             f"errors={self._consecutive_errors})"
         )

@@ -62,12 +62,6 @@ _ISO_DATETIME_FORMAT: str = "%Y-%m-%dT%H:%M:%S"
 _SECONDS_IN_DAY: int = 86400
 
 # ── Dukascopy Configuration ────────────────────────────────────────────────────
-# Dukascopy provides tick volume (real market activity) - essential for ATR
-# Twelve Data will be removed entirely due to volume=0 corrupting features
-
-# ── Dukascopy Configuration ────────────────────────────────────────────────────
-# Check if Dukascopy is available (truthy check using sys.modules)
-DUKASCOPY_AVAILABLE = True
 # Map our symbol format to Dukascopy instruments
 _DUKASCOPY_INSTRUMENTS = {
     "EUR_USD": INSTRUMENT_FX_MAJORS_EUR_USD,
@@ -90,33 +84,21 @@ _MAX_CONSECUTIVE_STORAGE_FAILURES: int = 3
 # ── Historian ─────────────────────────────────────────────────────────────────
 class Historian:
     """
-    Historical M1 bar backfill engine using the Twelve Data REST API.
+    Historical M1 bar backfill engine using Dukascopy.
 
-    Fetches OHLCV bars for one or more currency pairs and persists them to
-    the processed Parquet store via :class:`~data.storage.Storage`. Implements
-    the gap-detection pattern from the Storage design document:
-
+    Fetches OHLCV bars for currency pairs and persists them to the
+    processed Parquet store via Storage. Implements gap-detection:
         1. Query Storage for the last known bar timestamp.
         2. If none exists, start from (now - BACKFILL_YEARS).
-        3. Walk forward in 7-day chunks, fetching and saving each chunk.
+        3. Walk forward in 3-day chunks, fetching and saving each chunk.
         4. Stop when the current UTC time is reached.
 
-    Rate Limiting:
-        TwelveData free tier allows 8 requests/minute (800/day). An 8-second
-        inter-request delay is enforced via :meth:`_enforce_rate_limit` before
-        every API call. A 2-year backfill of a single pair (~100 requests)
-        completes in roughly 15 minutes.
-
-    Chunking:
-        Each API call covers a 7-calendar-day window with up to 5000 M1 bars.
-        Bars are persisted to the processed Parquet store immediately after
-        each chunk is received — the system is crash-safe at chunk boundaries.
+    Dukascopy provides real tick volume with no rate limits. Chunking is
+    preserved for memory efficiency and crash safety.
 
     Attributes:
         _settings:          Validated frozen :class:`~core.config.Config`.
         _storage:           :class:`~data.storage.Storage` instance for I/O.
-        _last_request_time: Monotonic clock time of the last API call.
-                            Used by :meth:`_enforce_rate_limit`.
 
     Example:
         >>> historian = Historian()
@@ -159,7 +141,7 @@ class Historian:
         return instrument
 
     def _df_row_to_bar(self, symbol: str, idx, row) -> Bar:
-        """Convert a DataFrame row to a Bar object. Returns None if invalid."""
+        """Convert a DataFrame row to a Bar object. Raises HistorianError on failure."""
         try:
             timestamp = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
             if timestamp.tzinfo is None:
@@ -253,24 +235,8 @@ class Historian:
             return []
         # Step 4: Convert each row to Bar (raises on parse error)
         bars = []
-        skipped = 0
-
         for idx, row in df.iterrows():
-            bar = self._df_row_to_bar(symbol, idx, row)
-            if bar:
-                bars.append(bar)
-            else:
-                skipped += 1
-
-        if skipped:
-            logger.warning(
-                {
-                    "event": "DUKASCOPY_BARS_SKIPPED",
-                    "symbol": symbol,
-                    "skipped": skipped,
-                    "total": len(df),
-                }
-            )
+            bars.append(self._df_row_to_bar(symbol, idx, row))
 
         logger.debug(
             {
@@ -599,9 +565,8 @@ class Historian:
 # your application entry point (pipeline.py or main.py) to trigger construction.
 # This keeps imports safe for testing, linting, and doc generation.
 #
-# Using a singleton ensures that _last_request_time is shared across all callers
-# in the same process. Multiple independent Historian instances would not share
-# rate-limit state and could fire back-to-back API requests under 8 seconds.
+# Using a singleton ensures a single Storage and Config instance is shared
+# across all callers in the same process.
 _historian: Historian | None = None
 
 
