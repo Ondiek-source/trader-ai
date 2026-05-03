@@ -470,6 +470,11 @@ class Pipeline:
         for gap_start, gap_end, gap_size in gaps:
             if gap_size <= _MAX_FFILL_BARS:
                 continue
+            # Weekend check: bar timestamps sit at the boundary of the closed
+            # window (Fri 20:59 → Sun 21:00), so is_forex_closed() returns False
+            # for both. Check if the gap spans Friday→Sunday instead.
+            if self._is_weekend_gap(gap_start, gap_end):
+                continue
             if is_forex_closed(gap_start) or is_forex_closed(gap_end):
                 continue
             unexpected.append((gap_start, gap_end, gap_size))
@@ -483,6 +488,23 @@ class Pipeline:
                 }
             )
         return unexpected
+
+    @staticmethod
+    def _is_weekend_gap(start: datetime, end: datetime) -> bool:
+        """Detect forex weekend gaps by day-of-week of the boundary bars."""
+        # Standard pattern: last bar Friday → first bar Sunday
+        if start.weekday() == 4 and end.weekday() == 6:
+            return True
+        # Friday → Saturday (partial weekend, e.g. gap in Saturday data)
+        if start.weekday() == 4 and end.weekday() == 5:
+            return True
+        # Saturday → Sunday
+        if start.weekday() == 5 and end.weekday() == 6:
+            return True
+        # Pure Saturday gap
+        if start.weekday() == 5 and end.weekday() == 5:
+            return True
+        return False
 
     async def _fetch_gap_bars(
         self,

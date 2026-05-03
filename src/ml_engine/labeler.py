@@ -56,7 +56,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ml_engine.features import BINARY_EXPIRY_RULES, _VERSION
+from ml_engine.features import BINARY_EXPIRY_RULES, _VERSION, _ATR_PERIOD
 from core.exceptions import LabelerError
 
 logger = logging.getLogger(__name__)
@@ -224,13 +224,19 @@ class Labeler:
             logger.debug(f"Standard labels: {len(labels):,} rows")
             return labels
 
-        # --- Magnitude filtering ---
-        # Requires ATR column
         if "ATR" not in df.columns:
-            raise ValueError(
-                f"atr_threshold={self.atr_threshold} requires 'ATR' column. "
-                "Run feature engineering before labeling."
-            )
+            tr = pd.concat(
+                [
+                    df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs(),
+                ],
+                axis=1,
+            ).max(axis=1)
+            df = df.copy()
+            df["ATR"] = tr.ewm(
+                alpha=1 / _ATR_PERIOD, min_periods=_ATR_PERIOD, adjust=False
+            ).mean()
 
         # Calculate move magnitude (absolute price change)
         move_magnitude = (future_close - df["close"]).abs()

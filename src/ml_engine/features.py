@@ -93,9 +93,6 @@ _REGIME_SMA_PERIODS: list[int] = [20, 50, 200]
 _LAGGED_FEATURES: list[str] = ["CLOSE_POSITION_IN_CANDLE", "RETURN_1", "RSI"]
 _LAGGED_PERIODS: list[int] = [1, 2, 3, 5]
 
-# Rolling statistics
-_ROLLING_WINDOWS: list[int] = [5, 10]
-
 # Momentum
 _RSI_PERIOD: int = 5  # Wilder RSI look-back
 _CCI_PERIOD: int = 10  # Commodity Channel Index look-back
@@ -123,7 +120,7 @@ _MINUTES_TO_NEWS_PLACEHOLDER: int = 90  # Default until economic calendar API is
 # Minimum M1 bars required for transform() to produce a non-empty DataFrame.
 # Derived from the longest rolling window (_MACD_SLOW) plus lag periods and
 # multi-timeframe resample headroom. Pipeline reads this for warmup validation.
-MIN_BARS_REQUIRED: int = 26  # _MACD_SLOW (18) + max lag (5) + resample safety (3)
+MIN_BARS_REQUIRED: int = 250  # _MACD_SLOW (18) + max lag (5) + resample safety (3)
 
 
 # ── Feature Schema ──────────────────────────────────────────────────────────

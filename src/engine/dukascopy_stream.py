@@ -81,6 +81,7 @@ class DukascopyLiveStream:
         self._bars_since_reconnect: int = 0
         self._reset_reconnect_after: int = 60
         self._last_bar_time: datetime | None = None
+        self._ready = threading.Event()
 
     # ── Connection ─────────────────────────────────────────────────────────
     async def _handle_thread_failure(self) -> None:
@@ -118,10 +119,23 @@ class DukascopyLiveStream:
             self._thread.start()
 
     def connect(self) -> bool:
-        """Start the background fetch thread."""
+        """Start the background fetch thread. Raises if market is closed."""
         self._stop.clear()
+        self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_fetch_loop, daemon=True)
         self._thread.start()
+
+        # Wait up to 10s for the fetch loop to either deliver a bar or exit.
+        self._ready.wait(timeout=10)
+
+        with self._error_lock:
+            err = self._error
+        if err is not None:
+            self._stop.set()
+            raise RuntimeError(
+                f"Dukascopy stream failed to connect for {self.symbol}: {err}"
+            )
+
         logger.info({"event": "DUKASCOPY_LIVE_CONNECTED", "symbol": self.symbol})
         return True
 
@@ -167,6 +181,7 @@ class DukascopyLiveStream:
                     break
                 if df is not None and not df.empty:
                     self._process_dataframe(df)
+                    self._ready.set()  # ← NEW: signal first bar delivered
         except Exception as exc:
             with self._error_lock:
                 self._error = exc
@@ -178,6 +193,7 @@ class DukascopyLiveStream:
                 }
             )
         finally:
+            self._ready.set()  # ← NEW: signal loop exited
             if not self._stop.is_set():
                 with self._error_lock:
                     if self._error is None:
