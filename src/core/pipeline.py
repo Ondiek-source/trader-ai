@@ -223,9 +223,9 @@ class Pipeline:
 
         for engine in self._engines:
             if hasattr(engine, "_price_stream"):
-                engine._price_stream.disconnect()          # sync
+                engine._price_stream.disconnect()  # sync
             if hasattr(engine, "_trade_stream"):
-                await engine._trade_stream.disconnect()     # async
+                await engine._trade_stream.disconnect()  # async
             engine.stop()
 
         for task in self._tasks:
@@ -470,8 +470,7 @@ class Pipeline:
         for gap_start, gap_end, gap_size in gaps:
             if gap_size <= _MAX_FFILL_BARS:
                 continue
-            mid_point = gap_start + (gap_end - gap_start) / 2
-            if is_forex_closed(mid_point):
+            if is_forex_closed(gap_start) or is_forex_closed(gap_end):
                 continue
             unexpected.append((gap_start, gap_end, gap_size))
 
@@ -571,7 +570,7 @@ class Pipeline:
 
         for symbol in self._settings.pairs:
             bars_df = storage.get_bars(
-                symbol, timeframe="M1", max_rows=MIN_BARS_REQUIRED
+                symbol, timeframe="M1", max_rows=MIN_BARS_REQUIRED * 3
             )
             bar_count: int = len(bars_df) if bars_df is not None else 0
 
